@@ -81,7 +81,7 @@ class Installation:
             except BlockingIOError as e:
                 raise InstallError('Engage or another installer is already running.') from e
             try:
-                yield
+                yield f.fileno()
             finally:
                 fcntl.flock(f, fcntl.LOCK_UN)
 

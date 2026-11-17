@@ -27,8 +27,8 @@ del final del capítulo. Añade:
 
 Las fuentes ya contienen estas adaptaciones. Los scripts `enable_*` documentan
 transformaciones sobre la base previa y no deben volver a ejecutarse sobre esta
-fuente parcheada. El instalador ejecuta únicamente la generación del juego y
-los pasos indicados en `tools/build-game.sh`.
+fuente parcheada. La distribución AppImage genera el juego mediante
+`tools/engage_generate.py` y lo compila mediante `tools/linux/engage_build.py`.
 
 Referencia para los cinco parches de ritmo:
 [engage-pc-recomp](https://gitlab.com/engage-pc-recomp/engage-pc-recomp), commit

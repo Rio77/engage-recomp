@@ -5,6 +5,8 @@ The runtime, generator and compiler are separate components. Each keeps its own 
 | Component | Origin / license information |
 |---|---|
 | FE3H Recomp / LASRecomp code | MIT; root LICENSE retains upstream copyrights |
+| Engage timing patch sites | Valiantsin Dzerakh / engage-pc-recomp, MIT; revision in UPSTREAM.md and notice in LICENSE |
+| Inherited LAS randomizer source | Owen_Splat, MIT; third_party/LAS-Randomizer/LICENSE.txt; not enabled for Engage |
 | Ryujinx audio-derived reverb and auxiliary processing | MIT; third_party/ryujinx/LICENSE.txt |
 | AMD FidelityFX Super Resolution 1 retained shader helpers | MIT; third_party/fsr/LICENSE.txt; no new opt5 FSR features enabled |
 | Dear ImGui | MIT; third_party/imgui/LICENSE.txt |
@@ -25,5 +27,11 @@ The generator is frozen from the project's Python sources using `tools/linux/gen
 The complete corresponding-source TAR.GZ is distributed separately beside the installer and AppImage in the same public release. It includes the project sources, FFmpeg and Unicorn archives and their checksum manifest. Keep those sources available alongside the binaries, and retain the installer’s `licenses/` notices. These files contain no game data. The project's own generator sources and build scripts are included too. No private source-download credentials are required.
 
 Users may rebuild or replace components. For a modified AppImage, regenerate the local release checksum manifest before using the installer; there is no signature lock or remote authorization service. An AppImage can also be extracted to inspect its files and notices. The bundled shared FFmpeg libraries can be replaced in a rebuilt AppDir.
+
+The frozen generator combines the project's MIT-compatible Python sources with
+Unicorn and is conveyed subject to the applicable GPLv2 requirements. Its full
+project sources, build scripts and the Unicorn core sources accompany the
+release. This does not add a license restriction to the user's game files or
+locally generated output. The native runtime is a separate process/component.
 
 The application icon was supplied by the maintainer for use in this distribution and repository. The code license does not grant rights to the characters or emblems depicted in that image. Nintendo fonts, extracted game artwork, game libraries, game shaders, movies and game data are not included. Optional console fonts and the launcher background are obtained locally from the user's own files.

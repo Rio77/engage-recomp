@@ -1,5 +1,5 @@
 """Local game-library build inside an extracted or mounted Engage AppImage."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import os
 import shutil
@@ -35,12 +35,18 @@ def build(bundle: Path, workspace: Path, exefs: Path):
     headers = bundle / 'gamelib-src'
     for file in headers.iterdir():
         if file.is_file(): shutil.copy2(file, source / file.name)
-    environment = dict(os.environ, LARECOMP_CHEATS=os.devnull)
-    subprocess.run([str(bundle / 'engagegen/engagegen'), '--workspace', str(workspace),
-        '--exefs', str(exefs), '--hle', str(source / 'hle_symbols.txt')], env=environment, check=True)
+    environment = dict(os.environ, LARECOMP_CHEATS=os.devnull,
+        ZIG_GLOBAL_CACHE_DIR=str(workspace / 'zig-cache/global'),
+        ZIG_LOCAL_CACHE_DIR=str(workspace / 'zig-cache/local'))
     compiler = [str(bundle / 'zig/zig'), 'cc', '-target', 'x86_64-linux-gnu',
         '-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label',
-        '-fvisibility=hidden', '-march=x86-64-v3', '-fPIC', '-I' + str(source)]
+        '-fvisibility=hidden', '-mcpu=x86_64_v3', '-fPIC', '-I' + str(source)]
+    # Check the shipped compiler before spending time on the full translation.
+    probe = workspace / 'compiler-probe.c'
+    probe.write_text('#include "cpu.h"\nint engage_compiler_probe(void) { return sizeof(Cpu)>0; }\n')
+    subprocess.run(compiler + ['-c', str(probe), '-o', str(workspace / 'compiler-probe.o')], env=environment, check=True)
+    subprocess.run([str(bundle / 'engagegen/engagegen'), '--workspace', str(workspace),
+        '--exefs', str(exefs), '--hle', str(source / 'hle_symbols.txt')], env=environment, check=True)
     objects = []
     jobs = []
     for module in ('main', 'sdk', 'subsdk0'):
@@ -60,7 +66,12 @@ def build(bundle: Path, workspace: Path, exefs: Path):
         subprocess.run(compiler + flags + ['-c', str(file), '-o', str(temporary)], env=environment, check=True)
         temporary.replace(target)
     with ThreadPoolExecutor(max_workers=min(3, os.cpu_count() or 1)) as pool:
-        for result in pool.map(compile_one, jobs): pass
+        futures = [pool.submit(compile_one, pair) for pair in jobs]
+        try:
+            for future in as_completed(futures): future.result()
+        except BaseException:
+            for future in futures: future.cancel()
+            raise
     output = workspace / 'engagegame.so'
     temporary = output.with_suffix('.so.tmp')
     response = workspace / 'objects.rsp'

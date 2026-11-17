@@ -17,7 +17,9 @@ BUNDLE = Path(__file__).resolve().parents[2] / 'bin'
 ES = os.environ.get('LANG', '').startswith('es')
 def tr(es, en): return es if ES else en
 def dialog(*args):
-    return subprocess.run(['kdialog', '--title', 'Engage Recomp', *map(str, args)], text=True, stdout=subprocess.PIPE)
+    environment = dict(os.environ, QT_SCALE_FACTOR='1', QT_AUTO_SCREEN_SCALE_FACTOR='0')
+    return subprocess.run(['kdialog', '--title', 'Engage Recomp', '--icon', str(BUNDLE / 'icon.png'),
+        *map(str, args)], text=True, stdout=subprocess.PIPE, env=environment)
 def choose(text, default):
     result = dialog('--getexistingdirectory', default, '--caption', text)
     if result.returncode: raise KeyboardInterrupt
@@ -78,11 +80,18 @@ def install(args):
             if not args.noninteractive:
                 progress = dialog('--progressbar', tr('Preparando y compilando. Puede tardar bastante. Registro: ',
                     'Preparing and compiling. This can take a long time. Log: ') + str(log), '0').stdout.strip()
+                if progress and qdbus:
+                    subprocess.run([qdbus, *shlex.split(progress), 'showCancelButton', 'true'], capture_output=True)
             try:
                 while process.poll() is None:
                     if progress and qdbus:
                         cancelled = subprocess.run([qdbus, *shlex.split(progress), 'wasCancelled'], capture_output=True, text=True)
-                        if cancelled.returncode == 0 and cancelled.stdout.strip() == 'true': raise KeyboardInterrupt
+                        if cancelled.returncode or cancelled.stdout.strip() == 'true': raise KeyboardInterrupt
+                        with log.open('rb') as tail:
+                            tail.seek(max(0, log.stat().st_size - 1024))
+                            lines = tail.read().decode(errors='replace').splitlines()
+                        label = (lines[-1][:240] if lines else tr('Copiando archivos…', 'Copying files…'))
+                        subprocess.run([qdbus, *shlex.split(progress), 'setLabelText', label + '\n' + str(log)], capture_output=True)
                     import time
                     time.sleep(1)
                 if process.returncode: raise RuntimeError('Compilation failed. See ' + str(log))
@@ -105,20 +114,26 @@ def main():
     args = parser.parse_args()
     if args.worker:
         staged = args.worker / 'data/extracted'
+        print('Copying ExeFS', flush=True)
         shutil.copytree(args.exefs, staged / 'exefs')
+        print('Copying RomFS', flush=True)
         shutil.copytree(args.romfs, staged / 'romfs')
+        print('Generating and compiling game library', flush=True)
         output = build(BUNDLE, args.worker / 'compile', staged / 'exefs')
         shutil.copy2(output, staged / output.name)
         shutil.copy2(output.with_suffix('.so.id'), staged / 'engagegame.so.id')
         return
     if args.install or not (args.play or args.settings): return install(args)
     installation = Installation(args.root or Path.home() / 'Games/Engage-Recomp')
-    with installation.lock():
+    with installation.lock() as lock_fd:
         installation.recover()
         fps_file = installation.root / 'engage-fps'
         if args.settings:
-            result = dialog('--combobox', tr('Límite de FPS', 'FPS limit'), '30', '60')
-            if result.returncode == 0 and result.stdout.strip() in ('30', '60'): fps_file.write_text(result.stdout.strip() + '\n')
+            result = dialog('--menu', tr('Límite de FPS', 'FPS limit'), '60', '60 FPS', '30', '30 FPS')
+            if result.returncode == 0 and result.stdout.strip() in ('30', '60'):
+                temporary = fps_file.with_suffix('.tmp')
+                temporary.write_text(result.stdout.strip() + '\n')
+                temporary.replace(fps_file)
             return
         extracted = installation.root / 'extracted'
         fps = fps_file.read_text().strip() if fps_file.exists() else '60'
@@ -126,8 +141,18 @@ def main():
         env = dict(os.environ, LARECOMP_DATA_ROOT=str(installation.root),
             LARECOMP_GAME_LIB=str(extracted / 'engagegame.so'), ENGAGE_FPS=fps,
             ENGAGE_COMPLETE_FRAMES='1', LARECOMP_PACE='0', SDL_APP_ID='engage-recomp')
-        subprocess.run([str(BUNDLE / 'engage-recomp'), str(extracted), '--play'],
-            cwd=installation.root, env=env, check=True)
+        (installation.root / 'cache/preparation.txt').unlink(missing_ok=True)
+        process = subprocess.Popen([str(BUNDLE / 'engage-recomp'), str(extracted), '--play'],
+            cwd=installation.root, env=env, pass_fds=(lock_fd,))
+        progress = subprocess.Popen([sys.executable, str(Path(__file__).with_name('preparation_window.py')),
+            str(installation.root), str(process.pid), str(BUNDLE / 'icon.png')],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            status = process.wait()
+            if status: raise subprocess.CalledProcessError(status, 'engage-recomp')
+        finally:
+            if progress.poll() is None: progress.terminate()
+            progress.wait()
 if __name__ == '__main__':
     try: main()
     except KeyboardInterrupt: sys.exit(130)

@@ -15,6 +15,7 @@ cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gameli
 cp docs/icon/engage.png "$A/usr/bin/icon.png"
 cp third_party/fonts/Baloo2/Baloo2-SemiBold.ttf third_party/fonts/EBGaramond/EBGaramond12-Regular.ttf "$A/usr/bin/"
 cp tools/linux/app.py tools/linux/engage_build.py tools/linux/install_core.py tools/linux/processes.py "$A/usr/share/engage/"
+cp tools/linux/preparation_window.py "$A/usr/share/engage/"
 cp tools/linux/Engage-AppRun "$A/AppRun"
 chmod +x "$A/AppRun"
 cp docs/icon/engage.png "$A/engage-recomp.png"
@@ -55,4 +56,5 @@ fetch() {
 fetch https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 appimagetool-x86_64.AppImage
 fetch https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d runtime-x86_64
 chmod +x build/linux/src/appimagetool-x86_64.AppImage
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 build/linux/src/appimagetool-x86_64.AppImage --no-appstream --runtime-file build/linux/src/runtime-x86_64 "$A" build/dist/Engage-Recomp-0.1.0-linux-x86_64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 build/linux/src/appimagetool-x86_64.AppImage --no-appstream --runtime-file build/linux/src/runtime-x86_64 "$A" build/dist/Engage-Recomp-0.1.0-linux-x86_64.new.AppImage
+mv -f build/dist/Engage-Recomp-0.1.0-linux-x86_64.new.AppImage build/dist/Engage-Recomp-0.1.0-linux-x86_64.AppImage

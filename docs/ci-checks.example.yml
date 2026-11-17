@@ -9,5 +9,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 tools/linux/audit_engage.py .
       - run: python3 tools/linux/test_installation.py
+      - run: python3 tools/linux/test_processes.py
+      - run: python3 tools/linux/test_guest_link.py
       - run: python3 -m py_compile tools/linux/app.py tools/linux/engage_build.py tools/engage_generate.py
       - run: bash -n tools/linux/build_appimage.sh tools/linux/package_engage.sh tools/linux/Install.sh
