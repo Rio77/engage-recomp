@@ -91,16 +91,22 @@ typedef struct NvnSync {
     volatile uint64_t seq;  // GPU submission this fence belongs to (renderer_fence_seq), 0 = none
 } NvnSync;
 
-// ---- command recording (stored in guest command memory)
+// ---- command recording (host storage; guest memory supplies allocation budgets)
 typedef struct {
-    uint64_t mem;    // current command memory chunk (guest address)
+    uint64_t mem;    // current guest command-memory budget (never written)
     uint64_t size;   // chunk size
     uint64_t used;   // bytes used in chunk
-    uint64_t start;  // first record of the list being recorded
     uint64_t callback, callback_data;
     bool recording;
     uint64_t guest;  // the guest NVNcommandBuffer*
+    uint8_t *records;
+    uint64_t records_used, records_cap;
+    uint64_t control, control_size, control_used;
 } NvnCmdBuf;
+
+const void *nvn_command_acquire(uint64_t handle, uint64_t *size);
+void nvn_command_release(uint64_t handle);
+void nvn_command_finalize(uint64_t handle);
 
 // One recorded command: header, the call's integer and float arguments, then copied data.
 typedef struct {
@@ -127,6 +133,8 @@ enum {
     CMD_BARRIER, CMD_SIGNAL_EVENT, CMD_WAIT_EVENT, CMD_REPORT_COUNTER, CMD_DISCARD_COLOR,
     CMD_DISCARD_DEPTH_STENCIL, CMD_SET_COPY_STRIDES, CMD_DRAW_TEXTURE, CMD_RESOLVE_DEPTH,
     CMD_BIND_SEPARATE_TEXTURES, CMD_BIND_SEPARATE_SAMPLERS,
+    CMD_BIND_TEXTURES_DEFERRED, CMD_BIND_IMAGES_DEFERRED,
+    CMD_BIND_SEPARATE_TEXTURES_DEFERRED, CMD_BIND_SEPARATE_SAMPLERS_DEFERRED,
     CMD_COUNT
 };
 

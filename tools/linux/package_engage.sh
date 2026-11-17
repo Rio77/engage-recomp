@@ -17,6 +17,16 @@ cp third_party/fonts/Baloo2/Baloo2-SemiBold.ttf third_party/fonts/EBGaramond/EBG
 cp tools/linux/app.py tools/linux/engage_build.py tools/linux/install_core.py tools/linux/processes.py "$A/usr/share/engage/"
 cp tools/linux/preparation_window.py "$A/usr/share/engage/"
 cp tools/linux/run_appimage.py "$A/usr/share/engage/"
+python3 - "$A/usr/share/engage" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+root = Path(sys.argv[1]).resolve(strict=True)
+for path in root.rglob('__pycache__'):
+    if path.is_symlink() or not path.resolve().is_relative_to(root):
+        raise SystemExit('Unsafe frontend bytecode cache path')
+    shutil.rmtree(path)
+PY
 cp tools/linux/Engage-AppRun "$A/AppRun"
 chmod +x "$A/AppRun"
 cp docs/icon/engage.png "$A/engage-recomp.png"

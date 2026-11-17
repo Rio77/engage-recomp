@@ -34,9 +34,12 @@ def main():
         shutil.copy2(image, kit / image.name)
         for name in ('Install.sh', 'Install.desktop', 'run_appimage.py'):
             shutil.copy2(ROOT / 'tools/linux' / name, kit / name)
-        for name in ('README.md', 'LEEME.md', 'LICENSE', 'THIRD_PARTY.md', 'UPSTREAM.md', 'VALIDATION.md'):
+        for name in ('README.md', 'LEEME.md', 'LICENSE', 'THIRD_PARTY.md', 'UPSTREAM.md',
+                     'VALIDATION.md', 'PREVIOUS-VALIDATION.md', 'CHANGES.md'):
             shutil.copy2(ROOT / name, kit / name)
         shutil.copy2(ROOT / 'docs/icon/engage.png', kit / 'engage.png')
+        (kit / 'docs').mkdir()
+        shutil.copy2(ROOT / 'docs/KNOWN-PORTRAIT-ISSUE.md', kit / 'docs/KNOWN-PORTRAIT-ISSUE.md')
         shutil.copytree(BASE / 'licenses', kit / 'licenses')
         for name in ('Install.sh', 'Install.desktop', image.name): (kit / name).chmod(0o755)
         checksums(kit)

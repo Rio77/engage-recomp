@@ -2459,13 +2459,19 @@ static void exec_list(uint64_t handle, int depth) {
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
                 memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
             break;
+        case CMD_BIND_TEXTURES_DEFERRED: x = (void *)(uintptr_t)r->x[3];
+            // fall through
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
-                memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                if (x) memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                else st.tex[r->x[0]][r->x[1] + i] = 0;
             break;
+        case CMD_BIND_IMAGES_DEFERRED: x = (void *)(uintptr_t)r->x[3];
+            // fall through
         case CMD_BIND_IMAGES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)
-                memcpy(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                if (x) memcpy(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                else st.img[r->x[0]][r->x[1] + i] = 0;
             break;
         case CMD_SET_TEXTURE_POOL: st.tpool = (NvnDescPool *)(uintptr_t)r->x[0]; break;
         case CMD_SET_SAMPLER_POOL: st.spool = (NvnDescPool *)(uintptr_t)r->x[0]; break;
@@ -2692,10 +2698,13 @@ void renderer_reset(void) {
 
 void backend_execute(uint64_t handle) {
     @autoreleasepool {
-        exec_list(handle, 0);
+        const void *commands = nvn_command_acquire(handle, NULL);
+        if (!commands) FATAL("nvn: submitted an expired command handle\n");
+        exec_list((uintptr_t)commands, 0);
         static int sync_submit = -1;
         if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
         if (sync_submit) renderer_flush();  // old behaviour: finish the GPU work before returning
         else renderer_submit();  // the guest fences (nvnSyncWait) before reusing memory the GPU reads
+        nvn_command_release(handle);
     }
 }

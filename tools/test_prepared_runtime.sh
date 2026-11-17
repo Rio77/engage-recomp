@@ -8,7 +8,7 @@ common=(-O2 -ffunction-sections -fdata-sections -Iruntime -I${DEPS:-build/linux/
 link=(-Wl,--gc-sections -pthread -lm)
 clang "${common[@]}" tools/test_texture_identity.c "${link[@]}" -o build/prepared-tests/identity
 build/prepared-tests/identity
-for test in program_reupload program_cache_identity command_argument_snapshot; do
+for test in program_reupload program_cache_identity command_argument_snapshot command_lifetime; do
     clang "${common[@]}" tools/test_${test}.c "${link[@]}" -o build/prepared-tests/${test}
     build/prepared-tests/${test}
 done

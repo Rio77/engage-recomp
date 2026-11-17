@@ -2,4 +2,5 @@
 set -eu
 APPDIR=${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
 export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PYTHONDONTWRITEBYTECODE=1
 exec python3 "$APPDIR/usr/share/engage/app.py" "$@"

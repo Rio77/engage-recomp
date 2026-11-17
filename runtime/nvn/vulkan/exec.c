@@ -5005,21 +5005,33 @@ static void exec_list(uint64_t handle, int depth) {
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
                 memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
             break;
+        case CMD_BIND_TEXTURES_DEFERRED: x = (void *)(uintptr_t)r->x[3];
+            // fall through: deferred arrays are read at submit, not at record
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
-                memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                if (x) memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                else st.tex[r->x[0]][r->x[1] + i] = 0;
             break;
+        case CMD_BIND_SEPARATE_TEXTURES_DEFERRED: x = (void *)(uintptr_t)r->x[3];
+            // fall through
         case CMD_BIND_SEPARATE_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 128 && r->x[0] < 6; i++)
-                memcpy(&st.separate_tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                if (x) memcpy(&st.separate_tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                else st.separate_tex[r->x[0]][r->x[1] + i] = 0;
             break;
+        case CMD_BIND_SEPARATE_SAMPLERS_DEFERRED: x = (void *)(uintptr_t)r->x[3];
+            // fall through
         case CMD_BIND_SEPARATE_SAMPLERS:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
-                memcpy(&st.separate_sampler[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                if (x) memcpy(&st.separate_sampler[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                else st.separate_sampler[r->x[0]][r->x[1] + i] = 0;
             break;
+        case CMD_BIND_IMAGES_DEFERRED: x = (void *)(uintptr_t)r->x[3];
+            // fall through
         case CMD_BIND_IMAGES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)
-                memcpy(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                if (x) memcpy(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+                else st.img[r->x[0]][r->x[1] + i] = 0;
             break;
         case CMD_SET_TEXTURE_POOL: st.tpool = (NvnDescPool *)(uintptr_t)r->x[0]; break;
         case CMD_SET_SAMPLER_POOL: st.spool = (NvnDescPool *)(uintptr_t)r->x[0]; break;
@@ -5211,13 +5223,16 @@ static void exec_list(uint64_t handle, int depth) {
 
 void backend_execute(uint64_t handle) {
     vk_backend_lock();
+    const void *commands = nvn_command_acquire(handle, NULL);
+    if (!commands) FATAL("nvn: submitted an expired command handle\n");
     PROF_T0();
-    exec_list(handle, 0);
+    exec_list((uintptr_t)commands, 0);
     PROF_ADD(prof_exec);
     if (prof) cum_exec += SDL_GetTicksNS() - prof_t0_;
     static int sync_submit = -1;
     if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
     if (sync_submit) renderer_flush();
     else if (!getenv("FE3H_BATCH_SUBMITS")) renderer_submit();
+    nvn_command_release(handle);
     vk_backend_unlock();
 }

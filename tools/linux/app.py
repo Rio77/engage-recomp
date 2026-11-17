@@ -55,6 +55,12 @@ def launchers(root, app):
         def esc(value): return str(value).replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
         desktop.write_text('[Desktop Entry]\nType=Application\nName=' + name + '\nExec="' + esc(script) +
             '"\nIcon=' + str(icon) + '\nTerminal=false\nCategories=Game;\n')
+    # Wayland compositors resolve a window icon through its application ID;
+    # SDL_SetWindowIcon alone is insufficient there. Match SDL_APP_ID below.
+    applications = Path.home() / '.local/share/applications'
+    applications.mkdir(parents=True, exist_ok=True)
+    registered = applications / 'engage-recomp.desktop'
+    registered.write_text((root / 'Engage-Recomp.desktop').read_text() + 'StartupWMClass=engage-recomp\n')
 def install(args):
     root = args.root or Path.home() / 'Games/Engage-Recomp'
     if not args.exefs:

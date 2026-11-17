@@ -24,6 +24,12 @@ del final del capítulo. Añade:
   necesita volver al juego para pedir memoria. Las listas se copian antes de
   esa llamada; los enlaces nulos se inicializan a cero en lugar de conservar
   bytes anteriores de la memoria de comandos.
+- Grabación de comandos en memoria propia del host, con copias independientes
+  al finalizar y al componer listas. Reciclar memoria de control retira sus
+  identificadores, conservando una lista mientras el ejecutor la está leyendo.
+  Los descriptores de programa usados por comandos grabados sobreviven a la
+  finalización del objeto del juego. Los enlaces explícitamente diferidos
+  conservan su lectura al enviar los comandos.
 - Recuperación verificada del switch local de formatos de textura al regenerar
   las funciones, para conservar también esa corrección en instalaciones nuevas.
 - Identidades verificadas de texturas NVN copiadas por valor. Las consultas de

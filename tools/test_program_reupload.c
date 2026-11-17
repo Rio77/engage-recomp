@@ -21,9 +21,13 @@ int main(void) {
     fragment[32] = 123; // different code uploaded to exactly the same address
     cpu.x[0] = (uintptr_t)guest; cpu.x[1] = 2; cpu.x[2] = (uintptr_t)data;
     hle_nvnProgramSetShaders(&cpu);
-    assert(program->stages[1].code_addr == (uintptr_t)fragment);
-    assert(program->stages[1].revision != first);
+    NvnProgram *updated = HOST(NvnProgram, (uintptr_t)guest);
+    assert(updated != program && program->stages[1].revision == first);
+    assert(updated->stages[1].code_addr == (uintptr_t)fragment);
+    assert(updated->stages[1].revision != first);
     cpu.x[0] = (uintptr_t)guest;
     hle_nvnProgramFinalize(&cpu);
+    assert(updated->stages[1].code_addr == (uintptr_t)fragment && program->stages[1].revision == first);
+    program_identities_reset();
     puts("PASS: shader reuploads receive new revisions at reused addresses");
 }

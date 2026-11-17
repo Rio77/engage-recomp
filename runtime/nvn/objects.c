@@ -136,7 +136,7 @@ NVN(nvnDeviceRegisterFastClearColori) { RET(1); }
 NVN(nvnDeviceRegisterFastClearColorui) { RET(1); }
 NVN(nvnDeviceRegisterFastClearDepth) { RET(1); }
 NVN(nvnDeviceApplyDeferredFinalizes) { (void)c; }
-NVN(nvnDeviceFinalizeCommandHandle) { (void)c; }
+NVN(nvnDeviceFinalizeCommandHandle) { nvn_command_finalize(A(1)); }
 NVN(nvnDeviceIsExternalDebuggerAttached) { RET(0); }
 NVN(nvnDeviceWalkDebugDatabase) { (void)c; }
 
@@ -727,15 +727,35 @@ NvnDescPool *nvn_find_pool(NvnDescPool **reg, uint64_t guest_pool) {
 }
 
 // ================================================================== programs
-NVN(nvnProgramInitialize) { SET_HOST(A(0), calloc(1, sizeof(NvnProgram))); RET(1); }
-NVN(nvnProgramFinalize) { free(HOST(NvnProgram, A(0))); SET_HOST(A(0), 0); }
+// Recorded BindProgram commands keep these descriptors, not the guest object's
+// storage. Uploads create immutable revisions, retained until the renderer stops.
+typedef struct ProgramIdentity { NvnProgram program; struct ProgramIdentity *next; } ProgramIdentity;
+static ProgramIdentity *program_identities;
+static pthread_mutex_t program_identity_lock = PTHREAD_MUTEX_INITIALIZER;
+static NvnProgram *program_new(void) {
+    ProgramIdentity *entry = calloc(1, sizeof *entry);
+    if (!entry) FATAL("nvn: program descriptor allocation failed\n");
+    pthread_mutex_lock(&program_identity_lock);
+    entry->next = program_identities; program_identities = entry;
+    pthread_mutex_unlock(&program_identity_lock);
+    return &entry->program;
+}
+RT_ON_RESET(program_identities_reset) {
+    while (program_identities) {
+        ProgramIdentity *entry = program_identities;
+        program_identities = entry->next; free(entry);
+    }
+}
+NVN(nvnProgramInitialize) { SET_HOST(A(0), program_new()); RET(1); }
+NVN(nvnProgramFinalize) { SET_HOST(A(0), 0); }
 NVN(nvnProgramSetDebugLabel) { (void)c; }
 NVN(nvnProgramSetSampleShading) { (void)c; }
 NVN(nvnProgramSetSubroutineLinkage) { RET(1); }
 static void set_shaders(Cpu *c, int stride) {
     static _Atomic uint64_t revisions;
     uint64_t revision = atomic_fetch_add_explicit(&revisions, 1, memory_order_relaxed) + 1;
-    NvnProgram *p = HOST(NvnProgram, A(0));
+    NvnProgram *p = program_new();
+    SET_HOST(A(0), p);
     int n = (int)A(1);
     const uint8_t *data = AP(2);  // NVNshaderData[n] = {u64 data (GPU addr), const void* control}
     memset(p->stages, 0, sizeof p->stages);

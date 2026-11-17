@@ -32,11 +32,11 @@ mode, so FUSE is not required. Other Linux distributions are not yet validated.
 
 ## State and limitations
 
-Battle-end progression and prepared saves have been tested in the development
-build. Required shaders/pipelines finish before drawing, and known pipelines
+Battle-end progression and new saves have been tested using the packaged
+runtime. Required shaders/pipelines finish before drawing, and known pipelines
 are prepared on later launches. Unknown resources can still pause on first use.
-60 FPS is a selectable target, **not a promise of stable 60 FPS**. A controlled
-map scene in the preceding build measured approximately 47 FPS.
+60 FPS is a selectable target, **not a promise of stable 60 FPS**. See the
+validation report for the measured scene and its limitations.
 
 Known issues: intermittent monochrome opening movie; Additional Content can
 freeze while music continues; DLC is not comprehensively validated. Initial
@@ -68,3 +68,5 @@ private game build directories must never be used as the source export.
 The application icon was supplied by the maintainer; the MIT code license does
 not grant rights to the depicted emblem. Independent, unofficial project, not
 affiliated with Nintendo. Development used AI assistance.
+
+The victory portrait can intermittently remain dark. This remains a known issue in 0.1.0; see [investigation notes](docs/KNOWN-PORTRAIT-ISSUE.md).

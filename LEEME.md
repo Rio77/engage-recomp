@@ -35,3 +35,5 @@ Código heredado bajo MIT y dependencias con sus licencias propias. `THIRD_PARTY
 y `UPSTREAM.md` detallan autores, referencias y fuentes correspondientes. La
 imagen del icono es independiente de la licencia del código. Proyecto no oficial,
 sin afiliación con Nintendo, desarrollado con asistencia de IA.
+
+El retrato de victoria puede permanecer oscuro de forma intermitente. Este fallo sigue pendiente en 0.1.0.

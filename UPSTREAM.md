@@ -15,6 +15,10 @@ not an unmodified checkout of any reference project.
   `5e0ce98f120bd669cb79d3b365d0da1d6d54145b`,
   `recomp/patches-engage-v200.txt`:
   https://gitlab.com/engage-pc-recomp/engage-pc-recomp .
+- Command recording lifetime, control-memory retirement and deferred-handle
+  design reference: the same engage-pc-recomp revision, `runtime/nvn_api_cmd.c`,
+  which credits MacNativeGames / d2r-mobile, jhaizhou (MIT). Adapted to our own
+  CmdRec layout, callback budget and pinned synchronous replay.
 - uDPRE (https://github.com/u2-bot/uDPRE) and totk-pc-recomp
   (https://github.com/valentderah/totk-pc-recomp) were architectural references;
   they do not supply Engage game code to this distribution.
