@@ -106,8 +106,24 @@ static CmdRec *record(Cpu *c, uint32_t op, uint32_t extra, Snap *s) {
 // record with a copy of `len` bytes from the guest pointer in argument `arg`
 static CmdRec *record_copy(Cpu *c, uint32_t op, int arg, uint32_t len) {
     Snap s = snap(c);
+    // Growing command memory re-enters guest code. Preserve pointed-to data as
+    // well as registers before that callback can reuse the caller's scratch
+    // arrays (notably postprocessing texture handles). The ordinary fast path
+    // has enough room and still makes just one copy.
+    NvnCmdBuf *cb = cb_of(s.x[0]);
+    uint64_t needed = (sizeof(CmdRec) + (uint64_t)len + 7) & ~7ull;
+    void *saved = NULL;
+    if (s.x[arg] && len && (!cb->mem || cb->used + needed + JUMP_RESERVE > cb->size)) {
+        saved = malloc(len);
+        if (!saved) FATAL("nvn: command argument snapshot allocation failed\n");
+        memcpy(saved, (const void *)(uintptr_t)s.x[arg], len);
+    }
     CmdRec *r = record(c, op, len, &s);
-    if (s.x[arg] && len) memcpy(r->extra, (void *)(uintptr_t)s.x[arg], len);
+    if (len) {
+        if (s.x[arg]) memcpy(r->extra, saved ? saved : (const void *)(uintptr_t)s.x[arg], len);
+        else memset(r->extra, 0, len);
+    }
+    free(saved);
     return r;
 }
 #define PLAIN(name, op) NVN(name) { Snap s = snap(c); record(c, op, 0, &s); }

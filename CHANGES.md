@@ -16,6 +16,14 @@ del final del capítulo. Añade:
   vSync, velocidad, giro, aceleración y desaceleración del desplazamiento.
   Se desactiva la heurística de ritmo heredada de otro juego.
 - Icono junto al ejecutable, además de los accesos.
+- Identidad por revisión de carga para shaders gráficos, de cómputo y etapas
+  combinadas: reutilizar una dirección no debe recuperar el programa anterior.
+  Se conservan las cachés por contenido entre sesiones. También se comprueban
+  las actualizaciones pendientes antes de reutilizar una vista de textura.
+- Conservación de las listas de argumentos cuando la grabación de comandos
+  necesita volver al juego para pedir memoria. Las listas se copian antes de
+  esa llamada; los enlaces nulos se inicializan a cero en lugar de conservar
+  bytes anteriores de la memoria de comandos.
 - Recuperación verificada del switch local de formatos de textura al regenerar
   las funciones, para conservar también esa corrección en instalaciones nuevas.
 - Identidades verificadas de texturas NVN copiadas por valor. Las consultas de

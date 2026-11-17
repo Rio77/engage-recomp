@@ -1,5 +1,6 @@
 // NVN objects, builders, and state objects (everything except command recording).
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -732,6 +733,8 @@ NVN(nvnProgramSetDebugLabel) { (void)c; }
 NVN(nvnProgramSetSampleShading) { (void)c; }
 NVN(nvnProgramSetSubroutineLinkage) { RET(1); }
 static void set_shaders(Cpu *c, int stride) {
+    static _Atomic uint64_t revisions;
+    uint64_t revision = atomic_fetch_add_explicit(&revisions, 1, memory_order_relaxed) + 1;
     NvnProgram *p = HOST(NvnProgram, A(0));
     int n = (int)A(1);
     const uint8_t *data = AP(2);  // NVNshaderData[n] = {u64 data (GPU addr), const void* control}
@@ -755,6 +758,7 @@ static void set_shaders(Cpu *c, int stride) {
         if (*(uint32_t *)(uintptr_t)code != 0x12345678) stage = 5;
         p->stages[stage].stage = stage;
         p->stages[stage].code_addr = code;
+        p->stages[stage].revision = revision;
         p->stages[stage].control = control;
         p->stages[stage].const_offset = *(const uint32_t *)(control + 0x700);
         p->stages[stage].const_size = *(const uint32_t *)(control + 0x6FC);

@@ -1049,7 +1049,7 @@ const char *renderer_stats(void) {
 // one bound (a fragment-only program) was used for every stage and its draws were skipped. When the bound stages come
 // from more than one program, draws use a combined program, made once per set of shader code addresses.
 #define MERGED_TAB 4096
-static struct { uint64_t code[6]; NvnProgram *prog; } merged_tab[MERGED_TAB];
+static struct { uint64_t code[12]; NvnProgram *prog; } merged_tab[MERGED_TAB];
 static NvnProgram *combined_program(void) {
     NvnProgram *one = NULL;
     bool same = true;
@@ -1060,10 +1060,11 @@ static NvnProgram *combined_program(void) {
         else if (p != one) same = false;
     }
     if (same) return one;  // (the usual case: the program as bound, its backend caches intact)
-    uint64_t code[6], h = 1469598103934665603ull;
+    uint64_t code[12], h = 1469598103934665603ull;
     for (int i = 0; i < 6; i++) {
-        code[i] = st.stage_prog[i] ? st.stage_prog[i]->stages[i].code_addr : 0;
-        h = (h ^ code[i]) * 1099511628211ull;
+        code[2*i] = st.stage_prog[i] ? st.stage_prog[i]->stages[i].code_addr : 0;
+        code[2*i+1] = st.stage_prog[i] ? st.stage_prog[i]->stages[i].revision : 0;
+        h = ((h ^ code[2*i]) * 1099511628211ull ^ code[2*i+1]) * 1099511628211ull;
     }
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (MERGED_TAB - 1);
     for (int n = 0; n < MERGED_TAB; n++, slot = (slot + 1) & (MERGED_TAB - 1)) {
@@ -1727,11 +1728,10 @@ static uint32_t buffer_texture_mask(int stage, const ShaderInfo *si) {
 
 static Prog *warm_find(NvnProgram *np, const ShaderKey *vkey, const ShaderKey *fkey);
 static void warm_start(void);
-static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
-    if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
-    warm_start();
+static uint64_t program_key(NvnProgram *np, const ShaderKey *vkey, const ShaderKey *fkey) {
     uint64_t h = 0xcbf29ce484222325ull;
     for (int i = 0; i < 2; i++) { uint64_t a = np->stages[i].code_addr; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }
+    for (int i = 0; i < 2; i++) { uint64_t a = np->stages[i].revision; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
@@ -1739,7 +1739,12 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
         uint32_t m = key_buf_mask(fkey);
         for (int i = 0; i < 4; i++) { h ^= (m >> (i * 8)) & 0xFF; h *= 0x100000001B3ull; }
     }
-    if (!h) h = 1;
+    return h ? h : 1;
+}
+static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
+    if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
+    warm_start();
+    uint64_t h = program_key(np, vkey, fkey);
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
     if (prog_tab[slot].key) {
@@ -3216,11 +3221,11 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             // pixel uploads and checks/recreates the backing image. Memoize only
             // the view calculation, never those resource-visibility side effects.
             NvnTexture *resolved = naliases ? alias_read(e->tex) : e->tex;
-            TexBackend *backing = vk_tex(resolved, false);
             extern uint32_t vk_view_gen;
             extern uint64_t vk_frame_counter(void);
             static int nomemo = -1;
             if (nomemo < 0) nomemo = getenv("LARECOMP_VK_NO_TEX_MEMO") != NULL;
+            TexBackend *backing = vk_tex(resolved, false);
             static struct { NvnTexture *tex; VkImage image; uint64_t vh, frame; uint32_t gen, swizzle; uint8_t type, has_view; VkImageView view; } memo[1024];
             uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
             uint32_t swizzle;
@@ -3537,7 +3542,7 @@ static CsProg *warm_cs_find(uint64_t xh, const uint32_t local[3]) {
     return w->cp;
 }
 
-static struct CsEnt { uint64_t addr; uint32_t bufmask; CsProg *cp; } g_cs_tab[256];  // compute programs by code address
+static struct CsEnt { uint64_t addr, revision; uint32_t bufmask; CsProg *cp; } g_cs_tab[256];
 
 // bufmask: texture slots bound to buffer textures (a variant reading them from the heap, see buffer_texture_mask)
 static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
@@ -3545,9 +3550,9 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
     if (!ss->code_addr) return NULL;
     struct CsEnt *tab = g_cs_tab;
     int n = g_cs_n;
-    for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr && tab[i].bufmask == bufmask) return tab[i].cp;
+    for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr && tab[i].revision == ss->revision && tab[i].bufmask == bufmask) return tab[i].cp;
     CsProg *cp = calloc(1, sizeof *cp);
-    if (n < 256) { tab[n].addr = ss->code_addr; tab[n].bufmask = bufmask; tab[n].cp = cp; g_cs_n = n + 1; }
+    if (n < 256) { tab[n].addr = ss->code_addr; tab[n].revision = ss->revision; tab[n].bufmask = bufmask; tab[n].cp = cp; g_cs_n = n + 1; }
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     ShaderKey k = {0};
@@ -3742,10 +3747,11 @@ static void draw_(CmdRec *r, bool indexed) {
         }
     }
     {   // fragment-shader hash: interior backdrop detection (widescreen), skip lists, item twinkle (renderer.m)
-        static uint64_t last_fs, last_hash;
+        static uint64_t last_fs, last_revision, last_hash;
         uint64_t fs = st.program->stages[1].code_addr;
-        if (fs != last_fs) {
+        if (fs != last_fs || st.program->stages[1].revision != last_revision) {
             last_fs = fs;
+            last_revision = st.program->stages[1].revision;
             last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
         }
         static uint64_t skip[16];
@@ -4311,7 +4317,7 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             if (!((pr->fi->cbuf_mask >> c) & 1) || !st.ubuf[1][c].addr) continue;
             const float *u = (const float *)(uintptr_t)st.ubuf[1][c].addr;
             LOG("[draw]   fcb%d %llx size %u:", c, (unsigned long long)st.ubuf[1][c].addr, (unsigned)st.ubuf[1][c].size);
-            for (int k = 0; k < 96 && k * 4 < (int)st.ubuf[1][c].size; k++) LOG(" %.6g", u[k]);
+            for (int k = 0; k < 256 && k * 4 < (int)st.ubuf[1][c].size; k++) LOG(" %.6g", u[k]);
             LOG("\n");
         }
     }
@@ -4321,6 +4327,10 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         if (!t) { LOG("[draw]   tex%d: none\n", i); continue; }
         LOG("[draw]   tex%d: %p %ux%u f%#x lv %u -> %ux%u scale %.4f %.4f%s\n", i, (void *)t, t->width, t->height, t->format,
             b ? b->levels : 0, b ? b->width : 0, b ? b->height : 0, b ? b->sx : 0, b ? b->sy : 0, b && b->scalable ? " scalable" : "");
+        uint64_t handle = shader_texture_handle(1, pr->fi->tex[i].handle_offset, pr->fi->tex[i].bindless_offset);
+        LOG("[draw]   texbind%d: handle %llx offset %#x sampler %#x pool %llx addr %llx flags %#x\n", i,
+            (unsigned long long)handle, pr->fi->tex[i].handle_offset, pr->fi->tex[i].bindless_offset,
+            (unsigned long long)(st.tpool ? st.tpool->addr : 0), (unsigned long long)t->addr, t->flags);
     }
     // LARECOMP_DUMP_TEX=<fs hash>[,...] and/or min:<n> (any fragment shader sampling at least n textures): with F9, save
     // the textures the draw samples as build/tex_<hash>_<i>.png (depth as _d / _s; level 0, first layer, clamped to 0..1)
