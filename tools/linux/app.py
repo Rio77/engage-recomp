@@ -41,12 +41,14 @@ def validate(exefs, romfs):
 def launchers(root, app):
     icon = root / 'engage.png'
     shutil.copy2(BUNDLE / 'icon.png', icon)
+    wrapper = root / 'run_appimage.py'
+    shutil.copy2(Path(__file__).with_name('run_appimage.py'), wrapper)
     for name, mode in [('Engage Recomp', '--play'), ('Engage Recomp Settings', '--settings')]:
         # Shell arguments are quoted independently; paths with spaces remain intact.
         import shlex
         script = root / (name.replace(' ', '-') + '.sh')
         script.write_text('#!/bin/sh\nexport APPIMAGE_EXTRACT_AND_RUN=1\nexec ' +
-            shlex.join([str(app), '--root', str(root), mode]) + '\n')
+            shlex.join(['python3', str(wrapper), str(app), '--root', str(root), mode]) + '\n')
         script.chmod(0o755)
         desktop = root / (name.replace(' ', '-') + '.desktop')
         def esc(value): return str(value).replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
