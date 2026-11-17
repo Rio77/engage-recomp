@@ -34,6 +34,8 @@ def validate(exefs, romfs):
     if not romfs.is_dir() or not any(romfs.iterdir()): raise ValueError('Empty RomFS')
     for name in ('Data/Managed', 'Data/StreamingAssets'):
         if not (romfs / name).is_dir(): raise ValueError('Expected complete Engage RomFS: ' + name)
+    for name in ('Data/data.unity3d', 'Data/Managed/Metadata/global-metadata.dat'):
+        if not (romfs / name).is_file(): raise ValueError('Missing base game data: ' + name)
     for root in (exefs, romfs):
         if any(p.is_symlink() for p in root.rglob('*')): raise ValueError('Game dump must not contain symbolic links')
 def launchers(root, app):
@@ -61,6 +63,13 @@ def install(args):
     exefs = args.exefs or choose('ExeFS — Engage 2.0.0', Path.home())
     romfs = args.romfs or choose('RomFS — Engage 2.0.0', exefs.parent)
     validate(exefs, romfs)
+    if any(root.resolve().is_relative_to(folder.resolve()) for folder in (exefs, romfs)):
+        raise ValueError('The installation folder must be outside your source dump')
+    parent = next(path for path in (root, *root.parents) if path.exists())
+    required = sum(p.stat().st_size for folder in (exefs, romfs) for p in folder.rglob('*') if p.is_file()) + 8 * 1024**3
+    if shutil.disk_usage(parent).free < required:
+        raise ValueError(tr('Espacio libre insuficiente para copiar y compilar: ',
+            'Insufficient free space to copy and compile: ') + str(round(required / 1024**3, 1)) + ' GiB')
     app = Path(os.environ.get('APPIMAGE') or args.appimage or '').resolve()
     if not app.is_file(): raise ValueError('Run the packaged AppImage to install')
     installation = Installation(root)
@@ -129,13 +138,17 @@ def main():
         installation.recover()
         fps_file = installation.root / 'engage-fps'
         if args.settings:
-            result = dialog('--menu', tr('Límite de FPS', 'FPS limit'), '60', '60 FPS', '30', '30 FPS')
+            choices = ['60', '60 FPS', '30', '30 FPS']
+            if fps_file.exists() and fps_file.read_text().strip() == '30': choices = choices[2:] + choices[:2]
+            result = dialog('--menu', tr('Límite de FPS', 'FPS limit'), *choices)
             if result.returncode == 0 and result.stdout.strip() in ('30', '60'):
                 temporary = fps_file.with_suffix('.tmp')
                 temporary.write_text(result.stdout.strip() + '\n')
                 temporary.replace(fps_file)
             return
         extracted = installation.root / 'extracted'
+        if not (extracted / 'engagegame.so').is_file():
+            raise ValueError(tr('Primero ejecutá el instalador para esta carpeta.', 'Run the installer for this folder first.'))
         fps = fps_file.read_text().strip() if fps_file.exists() else '60'
         if fps not in ('30', '60'): fps = '60'
         env = dict(os.environ, LARECOMP_DATA_ROOT=str(installation.root),
