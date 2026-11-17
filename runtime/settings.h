@@ -36,6 +36,7 @@ typedef struct {
     bool reverb;         // room reverb effect
     bool movie_audio;
     bool show_fps;
+    int engage_fps;      // 30/60 FPS, selected live from the in-game Display menu
     bool dpad_move;      // the d-pad (and arrow keys) move Link like the stick
     int mouse_cam;       // MOUSE_CAM_*: the mouse turns the camera (the right stick): off, while the right button is
                          // held, or always (cursor hidden; left / right click = A / B)

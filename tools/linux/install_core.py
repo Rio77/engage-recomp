@@ -151,6 +151,16 @@ class Installation:
                 (staged / 'mods').symlink_to(os.readlink(current / 'mods'))
             else:
                 shutil.copytree(current / 'mods', staged / 'mods', symlinks=True)
+        # Declining a new DLC import never removes already installed add-ons.
+        # A selected title replaces that whole title; unrelated titles remain.
+        if (current / 'dlc').exists():
+            old_dlc = current / 'dlc'
+            if old_dlc.is_symlink(): raise InstallError('Installed DLC directory must not be a symbolic link.')
+            for title in old_dlc.iterdir():
+                target = staged / 'dlc' / title.name
+                if target.exists(): continue
+                if title.is_symlink() or not title.is_dir(): raise InstallError('Invalid installed DLC title directory.')
+                shutil.copytree(title, target, symlinks=True)
         marker = staged / '.install-id'
         with marker.open('w', encoding='ascii') as f:
             f.write(token)

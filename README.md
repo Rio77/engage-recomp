@@ -1,7 +1,7 @@
 # Engage Recomp
 
 Experimental native Linux recompilation of **Fire Emblem Engage 2.0.0**, aimed
-at Steam Deck. Version **0.1.0** is an experimental prerelease. It uses static
+at Steam Deck. Version **0.1.0** is a release of an experimental port. It uses static
 ARM64-to-C translation and a Vulkan runtime derived from
 [FE3H Recomp](https://gitlab.com/onerag90/fe3h-recomp) and
 [LASRecomp](https://github.com/peiikai/LASRecomp).
@@ -14,7 +14,7 @@ recompiled game library, saves or shader cache are distributed.
 
 1. Download and extract the installer kit from Releases in Desktop mode.
 2. Run `Install.desktop` (or `Install.sh`). Select the installation folder and
-   your ExeFS/RomFS folders when asked. Spanish and English follow the desktop
+   your ExeFS/RomFS folders, then optionally an extracted DLC folder, when asked. Spanish and English follow the desktop
    language. Default destination: `~/Games/Engage-Recomp`.
 3. Wait for local generation and compilation. This first optimized build can
    take hours on the Deck. Progress details go to `installation.log`; cancellation
@@ -22,7 +22,12 @@ recompiled game library, saves or shader cache are distributed.
    generated sources, compiler objects and the recovery copy on upgrades.
 4. Add `Engage-Recomp.sh` in the installation folder to Steam as a non-Steam
    game. It runs natively: **do not enable Proton**. Use the supplied PNG for
-   Steam artwork if desired. `Engage-Recomp-Settings.sh` selects 30 or 60 FPS.
+   Steam artwork if desired. Choose 30 or 60 FPS while playing in **F1 → Video → Frame rate**.
+
+DLC imports accept `<title-id>/romfs/...` or `<title-id>/...` (direct extracted
+RomFS payload). Select the parent folder containing the Engage DLC title IDs.
+Encrypted NSP/XCI/NCA files are not accepted. Declining new DLC preserves any
+already installed add-ons on reinstall. DLC gameplay remains experimental.
 
 The AppImage contains the compiler, frozen generator and runtime dependencies.
 No Podman, pip installation or SteamOS system modification is required to

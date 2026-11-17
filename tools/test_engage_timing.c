@@ -4,6 +4,9 @@
 #include <string.h>
 #include <time.h>
 #include "engage_timing.h"
+#include "settings.h"
+Settings g_settings = {.engage_fps = 60};
+void guest_call(Cpu *c, uint64_t address) { (void)c; (void)address; }
 
 void rt_fatal_trace(void) { exit(99); }
 

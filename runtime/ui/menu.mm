@@ -28,6 +28,7 @@ extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.c
 extern "C" {
 #include "../hle.h"
 #include "../settings.h"
+#include "../engage_timing.h"
 #include "menu.h"
 void input_reset(void);
 void save_editor_draw(float scale);  // save_editor.mm
@@ -464,6 +465,14 @@ static void tab_display(void) {
         g_want_fullscreen_apply.store(true);
     }
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
+    const char *rates[] = {"30 FPS", "60 FPS"};
+    int rate = engage_timing_fps() == 30 ? 0 : 1;
+    if (opt_choice("Frame rate", &rate, rates, 2, 1,
+        "Changes game timing and presentation to 30 or 60 FPS while playing. Saved for the next launch.")) {
+        g_settings.engage_fps = rate == 0 ? 30 : 60;
+        engage_timing_set_fps(g_settings.engage_fps);
+        settings_save();
+    }
 
     opt_section("Rendering");
     // display order -> RES_* (the ini / enum order predates the menu order)

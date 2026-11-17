@@ -36,6 +36,7 @@ Settings g_settings = {
     .mouse_sens = 1.0f,
     .movie_audio = true,
     .show_fps = false,
+    .engage_fps = 60,
     .pad_menu_combo = true,
     .inv_keys = true,
     .tracker = true,
@@ -102,6 +103,13 @@ void settings_load(void) {
     static bool loaded;
     if (loaded) return;
     loaded = true;
+    // Migrate the old external selector only when the new INI key is absent.
+    FILE *legacy = fopen("engage-fps", "r");
+    int old_fps;
+    if (legacy) {
+        if (fscanf(legacy, "%d", &old_fps) == 1 && (old_fps == 30 || old_fps == 60)) g_settings.engage_fps = old_fps;
+        fclose(legacy);
+    }
     FILE *f = fopen(SETTINGS_FILE, "r");
     if (!f) { fe3h_settings(); return; }
     char line[256];
@@ -121,6 +129,7 @@ void settings_load(void) {
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
+        else if (!strcmp(key, "engage_fps")) g_settings.engage_fps = atoi(val) == 30 ? 30 : 60;
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
             g_settings.res_mode = !strcmp(val, "900p") ? RES_900 : !strcmp(val, "dynamic") ? RES_DYNAMIC : (!strcmp(val, "75%") || !strcmp(val, "67%")) ? RES_Q75 :
@@ -189,6 +198,7 @@ void settings_save(void) {
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
+    fprintf(f, "engage_fps = %d\n", g_settings.engage_fps == 30 ? 30 : 60);
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
     static const char *const waits[] = {"off", "balanced", "full"};

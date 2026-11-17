@@ -7,12 +7,14 @@ Necesitás tus propios archivos **ExeFS y RomFS del juego base con la actualizac
 1. En modo Escritorio, extraé el paquete del release y abrí `Install.desktop`
    o ejecutá `sh Install.sh` desde esa carpeta.
 2. Elegí dónde instalarlo (por defecto `~/Games/Engage-Recomp`) y seleccioná
-   las carpetas `exefs` y `romfs` de tu copia.
+   las carpetas `exefs` y `romfs` de tu copia. Después elegí si querés importar DLC,
+   antes de iniciar la compilación. Seleccioná la carpeta con subcarpetas ID/romfs
+   o ID/contenido extraído. No se admiten contenedores NSP/XCI/NCA cifrados.
 3. Esperá la generación y compilación inicial. Puede tardar horas; el detalle
    queda en `installation.log`. No requiere Podman ni instalar paquetes en SteamOS.
 4. Añadí `Engage-Recomp.sh`, dentro de la instalación, como juego externo a Steam.
-   **No actives Proton**. `Engage-Recomp-Settings.sh` permite elegir 30 o 60 FPS;
-   el cambio se aplica en la próxima sesión.
+   **No actives Proton**. Elegí 30 o 60 FPS mientras jugás desde
+   **F1 → Video → Frame rate**. La elección se conserva al cerrar.
 
 La AppImage también se puede ejecutar directamente, dándole permiso de ejecución.
 El kit usa extracción automática para no depender de FUSE. Se necesitan Python

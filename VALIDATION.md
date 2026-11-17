@@ -7,6 +7,27 @@ excluded from the repository and release assets.
 
 ## Installer and build
 
+### Updated installer and live FPS
+
+- Python frontend tests: 17 total, 15 passed and 2 platform/tool-dependent skips.
+  Coverage includes optional DLC selection, cancellation before a transaction,
+  DLC normalization, duplicate/wrong-game/link rejection and preservation on reinstall.
+- Imported both original Engage DLC folders into an isolated location and verified
+  file hashes. Empty entitlement marker files are accepted. This checks import,
+  not complete DLC gameplay; the known Additional Content freeze is unresolved.
+- Native fixed 30/60 and repeated live-transition tests passed. On the actual Deck,
+  F1 → Video → Frame rate changed 30→60→30→60 during the opening movie without a
+  fatal/dispatch error, and the final rate was saved in the INI. Battle animation
+  speed under repeated live switching still needs manual acceptance testing.
+- The packaged optional DLC dialog was displayed and interrupted before compilation;
+  no install transaction or compiler was created. Existing installations and original
+  saves retained their verified hashes throughout isolated testing.
+- The complete fresh game-library build below was performed before these runtime
+  and frontend updates. It was not repeated for this installer update; the generator
+  and game-library ABI are unchanged.
+
+### Original build validation
+
 - Built runtime and frozen three-module generator in the Ubuntu 22.04 container.
 - Completed a fresh end-to-end AppImage installation from the user's own dump:
   1,463 generated C units plus the entry unit; Zig O1, three compilation workers;
@@ -19,7 +40,8 @@ excluded from the repository and release assets.
 - Process cancellation preserved an unrelated process and terminated the private
   worker's compiler descendants. The real graphical progress window also passed
   cancellation: no activation and no worker left running.
-- Packaged Settings window opened and saved 60 FPS. Progress and settings windows
+- Before this update, the packaged external Settings window opened and saved 60 FPS.
+  It is superseded by the in-game Video menu in the updated installer. Progress and settings windows
   fitted the Deck desktop display. Full controller-only Gaming-mode interaction
   remains a manual acceptance check.
 - The real folder chooser accepted the selected input directory; its 629 x 415

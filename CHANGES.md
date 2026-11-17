@@ -1,4 +1,20 @@
-# Candidata con preparación gráfica y ritmo 30/60
+# Engage Recomp 0.1.0
+
+## Actualización del instalador y configuración
+
+- Selección opcional de DLC antes de copiar o compilar, con comprobación de IDs
+  de Engage, contenido extraído y duplicados. Admite `ID/romfs` y `ID/contenido`;
+  conserva los DLC existentes al reinstalar sin seleccionar otros nuevos.
+- Selección persistente de 30/60 FPS desde **F1 → Video → Frame rate**, aplicable
+  durante la sesión. Ajusta el ritmo del juego y de presentación; el selector
+  externo ya no se genera en instalaciones nuevas.
+- El release ofrece el instalador completo (con AppImage incluido), las fuentes
+  correspondientes y sus sumas SHA-256.
+- Probados los cambios 30→60→30→60 en la cinemática y la importación de ambos DLC
+  de prueba. Sigue pendiente validar el ritmo de batalla y el contenido de DLC
+  de forma completa; el bloqueo conocido de Contenido adicional no está resuelto.
+
+## Preparación gráfica y ritmo 30/60
 
 Esta revisión conserva la biblioteca optimizada a O1 y el arreglo de los saltos
 del final del capítulo. Añade:

@@ -850,6 +850,8 @@ NVN(nvnQueuePresentTexture) {
         NvnTexture *t = HOST(NvnTexture, w->textures[i]);
         memcpy(t->window_crop, w->crop, sizeof t->window_crop);
         extern void engage_present_pace(void);
+        extern void engage_timing_apply(Cpu *);
+        engage_timing_apply(c);
         engage_present_pace();
         backend_present(t);
     }
