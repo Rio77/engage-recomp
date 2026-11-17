@@ -686,6 +686,11 @@ static void backend_present_locked(NvnTexture *t) {
     static long debug_at = -1;
     if (debug_at < 0) { const char *e = getenv("LARECOMP_DEBUG_FRAME"); debug_at = e ? atol(e) : 0; }
     extern volatile int g_debug_frame_request;
+    const char *debug_request = getenv("ENGAGE_TEST_DEBUG_FRAME");
+    if (debug_request) {
+        FILE *request = fopen(debug_request, "rb");
+        if (request) { fclose(request); remove(debug_request); g_debug_frame_request = 1; }
+    }
     if (g_debug_frame_request) { g_debug_frame_request = 0; debug_at = (long)total_frames + 1; }
     // LARECOMP_DEBUG_FRAMES=<n> (with LARECOMP_DEBUG_FRAME / F9): dump n consecutive frames (build/pass_<frame>_NNN.png)
     static long debug_n = -1;

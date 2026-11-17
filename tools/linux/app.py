@@ -9,6 +9,7 @@ import subprocess
 import sys
 import traceback
 import shlex
+import textwrap
 from install_core import Installation, digest
 from engage_build import build
 
@@ -16,12 +17,12 @@ VERSION = '0.1.0'
 BUNDLE = Path(__file__).resolve().parents[2] / 'bin'
 ES = os.environ.get('LANG', '').startswith('es')
 def tr(es, en): return es if ES else en
-def dialog(*args):
+def dialog(*args, title='Engage Recomp'):
     environment = dict(os.environ, QT_SCALE_FACTOR='1', QT_AUTO_SCREEN_SCALE_FACTOR='0')
-    return subprocess.run(['kdialog', '--title', 'Engage Recomp', '--icon', str(BUNDLE / 'icon.png'),
+    return subprocess.run(['kdialog', '--title', title, '--icon', str(BUNDLE / 'icon.png'),
         *map(str, args)], text=True, stdout=subprocess.PIPE, env=environment)
 def choose(text, default):
-    result = dialog('--getexistingdirectory', default, '--caption', text)
+    result = dialog('--getexistingdirectory', default, title=text)
     if result.returncode: raise KeyboardInterrupt
     return Path(result.stdout.strip()).resolve()
 def validate(exefs, romfs):
@@ -89,8 +90,9 @@ def install(args):
             progress = None
             qdbus = shutil.which('qdbus6') or shutil.which('qdbus')
             if not args.noninteractive:
-                progress = dialog('--progressbar', tr('Preparando y compilando. Puede tardar bastante. Registro: ',
-                    'Preparing and compiling. This can take a long time. Log: ') + str(log), '0').stdout.strip()
+                message = tr('Preparando y compilando. Puede tardar bastante. Registro: ',
+                    'Preparing and compiling. This can take a long time. Log: ') + str(log)
+                progress = dialog('--progressbar', textwrap.fill(message, 72), '0').stdout.strip()
                 if progress and qdbus:
                     subprocess.run([qdbus, *shlex.split(progress), 'showCancelButton', 'true'], capture_output=True)
             try:
@@ -102,7 +104,8 @@ def install(args):
                             tail.seek(max(0, log.stat().st_size - 1024))
                             lines = tail.read().decode(errors='replace').splitlines()
                         label = (lines[-1][:240] if lines else tr('Copiando archivos…', 'Copying files…'))
-                        subprocess.run([qdbus, *shlex.split(progress), 'setLabelText', label + '\n' + str(log)], capture_output=True)
+                        subprocess.run([qdbus, *shlex.split(progress), 'setLabelText',
+                            textwrap.fill(label, 72) + '\n' + textwrap.fill(str(log), 72)], capture_output=True)
                     import time
                     time.sleep(1)
                 if process.returncode: raise RuntimeError('Compilation failed. See ' + str(log))

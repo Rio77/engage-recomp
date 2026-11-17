@@ -8,6 +8,8 @@ common=(-O2 -ffunction-sections -fdata-sections -Iruntime -I${DEPS:-build/linux/
 link=(-Wl,--gc-sections -pthread -lm)
 clang "${common[@]}" tools/test_texture_identity.c "${link[@]}" -o build/prepared-tests/identity
 build/prepared-tests/identity
+clang "${common[@]}" tools/test_texture_view_memo.c "${link[@]}" -o build/prepared-tests/view-memo
+build/prepared-tests/view-memo
 clang "${common[@]}" tools/test_complete_frames.c -L${DEPS:-build/linux/x86_64/deps}/lib -lSDL3 "${link[@]}" -o build/prepared-tests/complete
 build/prepared-tests/complete success
 expect_failure() {

@@ -60,6 +60,11 @@ archives and checksum manifests. See [THIRD_PARTY.md](THIRD_PARTY.md),
 [UPSTREAM.md](UPSTREAM.md) and [LICENSE](LICENSE). Dependencies keep their own
 licenses, including the generator's Unicorn GPLv2 component. Preserve all notices.
 
+Release maintainers can export the tracked project with `git archive` and pass
+that source-only TAR.GZ to `python3 tools/linux/release_kit.py` after building the
+AppImage. It assembles the installer, corresponding-source bundle and checksums;
+private game build directories must never be used as the source export.
+
 The application icon was supplied by the maintainer; the MIT code license does
 not grant rights to the depicted emblem. Independent, unofficial project, not
 affiliated with Nintendo. Development used AI assistance.

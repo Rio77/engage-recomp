@@ -49,6 +49,7 @@ python3 tools/linux/fetch_corresponding_sources.py x86_64
 "$L/gen-venv/bin/python" tools/linux/collect_licenses.py x86_64
 cp -a "$L/licenses/." "$A/usr/share/licenses/engage-recomp/"
 cp LICENSE THIRD_PARTY.md UPSTREAM.md "$A/usr/share/licenses/engage-recomp/"
+python3 tools/linux/audit_engage.py "$A" --appdir
 mkdir -p build/linux/src build/dist
 fetch() {
  [ -f "build/linux/src/$3" ] || curl -fL --retry 3 -o "build/linux/src/$3" "$1"

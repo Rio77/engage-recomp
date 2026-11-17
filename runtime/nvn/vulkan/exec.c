@@ -3212,22 +3212,28 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
         NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
         if (e->tex) {
-            // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
-            // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
-            // destroyed (eviction, image re-created) bumps vk_view_gen. LARECOMP_VK_NO_TEX_MEMO=1 disables.
+            // Refresh first: vk_view is not a pure lookup. It also consumes pending
+            // pixel uploads and checks/recreates the backing image. Memoize only
+            // the view calculation, never those resource-visibility side effects.
+            NvnTexture *resolved = naliases ? alias_read(e->tex) : e->tex;
+            TexBackend *backing = vk_tex(resolved, false);
             extern uint32_t vk_view_gen;
             extern uint64_t vk_frame_counter(void);
             static int nomemo = -1;
             if (nomemo < 0) nomemo = getenv("LARECOMP_VK_NO_TEX_MEMO") != NULL;
-            static struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo[1024];
+            static struct { NvnTexture *tex; VkImage image; uint64_t vh, frame; uint32_t gen, swizzle; uint8_t type, has_view; VkImageView view; } memo[1024];
             uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
-            uint32_t ms = (uint32_t)((((uintptr_t)e->tex >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull) & 1023);
-            if (!nomemo && memo[ms].tex == e->tex && memo[ms].vh == vh && memo[ms].frame == frame && memo[ms].gen == vk_view_gen &&
+            uint32_t swizzle;
+            memcpy(&swizzle, resolved->swizzle, sizeof swizzle);
+            uint32_t ms = (uint32_t)((((uintptr_t)resolved >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull) & 1023);
+            if (!nomemo && memo[ms].tex == resolved && memo[ms].image == backing->image && memo[ms].swizzle == swizzle &&
+                memo[ms].vh == vh && memo[ms].frame == frame && memo[ms].gen == vk_view_gen &&
                 memo[ms].type == st_->type && memo[ms].has_view == e->has_view) {
                 view = memo[ms].view;
             } else {
-                view = vk_view(naliases ? alias_read(e->tex) : e->tex, &e->view, e->has_view, false, st_->type);
-                memo[ms].tex = e->tex; memo[ms].vh = vh; memo[ms].frame = frame; memo[ms].gen = vk_view_gen;
+                view = vk_view(resolved, &e->view, e->has_view, false, st_->type);
+                memo[ms].tex = resolved; memo[ms].image = backing->image; memo[ms].swizzle = swizzle;
+                memo[ms].vh = vh; memo[ms].frame = frame; memo[ms].gen = vk_view_gen;
                 memo[ms].type = (uint8_t)st_->type; memo[ms].has_view = e->has_view; memo[ms].view = view;
             }
             renderer_texture_scale(e->tex, &sc[0], &sc[1]);

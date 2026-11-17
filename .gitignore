@@ -20,3 +20,6 @@ cache/
 *.key
 *.pem
 hosts.yml
+core
+core.*
+*.core
