@@ -1,6 +1,7 @@
 <p align="center">
   <img src="docs/icon/engage.png" alt="Logo" width="300">
 </p>
+
 # Engage Recomp
 
 Experimental native Linux recompilation of **Fire Emblem Engage 2.0.0**, aimed
