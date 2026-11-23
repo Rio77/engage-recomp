@@ -63,11 +63,11 @@
 
 ### Clean installation with the corrected generator
 
-- The exact release kit installed from a fresh directory in 47 min 23 s.
-  Zig compiled 1,464 units at -O1 with five workers. Generation took
-  5 min 35 s, C compilation 36 min 13 s and linking 10 s. Offline shader
+- The candidate with the corrected generator installed from a fresh directory
+  in 47 min 23 s. Zig compiled 1,464 units at -O1 with five workers. Generation
+  took 5 min 35 s, C compilation 36 min 13 s and linking 10 s. Offline shader
   preparation took 2 min 52 s. The installed app and shader-preparation
-  records match the distributed AppImage's SHA-256.
+  records matched that candidate's SHA-256.
 - The installed launcher reached and played S01.webm in Steam Deck Desktop
   Mode, past the original missing-branch failure. The smoke run reached frame
   2,400 with zero skipped draws or NVN diagnostics and exited with code 0.
@@ -76,6 +76,16 @@
   cinematic, rendered over 5,200 frames and exited from the window close
   with code 0. The log recorded zero skipped draws and NVN diagnostics.
   This run used copies of the test saves.
+
+### Final kit upgrade and gameplay
+
+- The final kit updated the isolated 0.2.0 installation in 3 min 52 s. It
+  reused the game library, whose SHA-256 stayed identical. The activated
+  AppImage and shader-preparation records both matched the release AppImage.
+- The tester confirmed that Chapters 2 and 3 both started in Gaming Mode.
+- After the upgrade, the tester created a manual save in a new slot in
+  Gaming Mode and loaded it successfully. The runtime logged the save
+  commit and exited with code 0. The test used a separate copy of the saves.
 
 ## 0.1.0 validation
 
