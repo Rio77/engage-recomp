@@ -17,8 +17,8 @@
 - Admite decodificación de vídeo NV12 y YUV420P en la ruta de la cinemática
   inicial. La validación visual de cinemáticas se registra por separado.
 - Conserva por instalación la caché de Mesa y precalienta pipelines conocidos
-  con Graphics Pipeline Library cuando Vulkan lo admite. El lanzador espera
-  por defecto a los shaders y pipelines necesarios para dibujar.
+  en segundo plano con Graphics Pipeline Library cuando Vulkan lo admite.
+  La espera de fotogramas completos se activa mediante una opción de diagnóstico.
 - Usa seguimiento de escrituras por páginas con UFFD-WP y validación de la
   caché de vértices en sistemas compatibles. Reduce el trabajo en Vulkan con
   entrada de vértices dinámica y caché de descriptor sets por envío.

@@ -546,19 +546,24 @@ def main():
         env.update(LARECOMP_DATA_ROOT=str(installation.root),
             LARECOMP_GAME_LIB=str(extracted / 'engagegame.so'),
             LARECOMP_PACE='0', SDL_APP_ID='engage-recomp')
-        env['ENGAGE_COMPLETE_FRAMES'] = env.get('ENGAGE_COMPLETE_FRAMES') or '1'
-        (installation.root / 'cache/preparation.txt').unlink(missing_ok=True)
+        complete_frames = env.get('ENGAGE_COMPLETE_FRAMES') not in (None, '', '0')
+        if complete_frames:
+            (installation.root / 'cache/preparation.txt').unlink(missing_ok=True)
         process = subprocess.Popen([str(BUNDLE / 'engage-recomp'), str(extracted), '--play'],
             cwd=installation.root, env=env, pass_fds=(lock_fd,))
-        progress = subprocess.Popen([sys.executable, str(Path(__file__).with_name('preparation_window.py')),
-            str(installation.root), str(process.pid), str(BUNDLE / 'icon.png')],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        progress = None
         try:
+            if complete_frames:
+                progress = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).with_name('preparation_window.py')),
+                     str(installation.root), str(process.pid), str(BUNDLE / 'icon.png')],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             status = process.wait()
             if status: raise subprocess.CalledProcessError(status, 'engage-recomp')
         finally:
-            if progress.poll() is None: progress.terminate()
-            progress.wait()
+            if progress is not None:
+                if progress.poll() is None: progress.terminate()
+                progress.wait()
 
 
 if __name__ == '__main__':

@@ -29,9 +29,9 @@ quedan en `.installer-work`; con el juego y el instalador cerrados podés guarda
 el registro y retirar únicamente esos intentos. No borres `save` ni tu respaldo.
 
 La versión 0.2.0 corrige una traducción de shaders Maxwell que podía oscurecer
-el pasto durante el impacto de un ataque. El juego espera los recursos necesarios
-para dibujar el fotograma completo, incluso durante la primera carga.
-Los recursos todavía desconocidos pueden producir pausas. Elegir 60 FPS no
+el pasto durante el impacto de un ataque. El juego prepara en segundo plano los
+shaders y pipelines conocidos. Los recursos nuevos todavía pueden producir
+pausas u omisiones visuales breves durante su primera carga. Elegir 60 FPS no
 garantiza mantenerlos durante toda la campaña. Persisten el color intermitente
 en la cinemática inicial y un bloqueo en Contenido adicional; los DLC no están
 validados de forma completa. Consultá `VALIDATION.md` y `PREVIOUS-VALIDATION.md`.

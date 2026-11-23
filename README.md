@@ -44,9 +44,10 @@ mode, so FUSE is not required. Other Linux distributions are not yet validated.
 ## State and limitations
 
 Version 0.2.0 corrects a Maxwell shader translation that could darken grass
-when an attack landed. Battle-end progression and new saves have been tested using the packaged
-runtime. Required shaders/pipelines finish before drawing, and known pipelines
-are prepared on later launches. Unknown resources can still pause on first use.
+when an attack landed. Battle-end progression and new saves have been tested
+using the packaged runtime. Known shaders and pipelines are prepared in the
+background during gameplay startup. First use of new resources can still
+cause a pause or a temporary visual omission while they finish building.
 60 FPS is a selectable target, **not a promise of stable 60 FPS**. See the
 validation report for the measured scene and its limitations.
 

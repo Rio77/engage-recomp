@@ -19,10 +19,26 @@
   the lifecycle stress test.
 - The Maxwell regression test checks the conditional discard, output clear
   and exit pattern, preserving behavior for unmatched sequences. The launcher
-  regression test checks complete-frame rendering by default and the explicit
-  opt-out.
+  regression test checks normal startup without a progress window and
+  opt-in complete-frame rendering with a progress window.
 - Python suite: 26 passed in the build container. On SteamOS, 24 passed and
   two platform-dependent tests were skipped.
+
+### Asynchronous launcher validation
+
+- The 0.2.0 candidate enabled complete-frame waits at normal launch,
+  bringing back the shader progress window and long waits during gameplay.
+  The launcher now uses the previous background behavior by default.
+- The revised AppImage started in Desktop Mode and passed the opening
+  cinematic using both an exercised cache and a separate copy of the
+  cache prepared offline. The tester confirmed in Gaming Mode that performance felt
+  similar to the previous working version and the grass stayed correctly lit.
+  The session closed with exit code 0.
+- Across the two Gaming Mode sessions, the largest recorded shader wait
+  total per reporting interval went from 1,830 ms to 12 ms in the sampled
+  gameplay range. The second run reused a cache populated by the first.
+  The runtime logged transient skipped draws and some remaining slow
+  frames, including one during a large asset upload.
 
 ### Initial clean installation on Steam Deck
 

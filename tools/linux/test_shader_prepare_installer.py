@@ -103,11 +103,11 @@ prog.write_text('phase=done done=2 total=2 xlat_hits=0 xlat_new=2 xlat_fail=0 sp
 
 
 class ShaderPrepareInstallerTests(unittest.TestCase):
-    def test_play_waits_for_complete_frames_by_default(self):
+    def test_play_only_waits_for_complete_frames_when_requested(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _setup_fake_extracted(root)
-            for override, expected in ((None, '1'), ('0', '0')):
+            for override, expected in ((None, None), ('0', '0'), ('1', '1')):
                 with self.subTest(override=override):
                     env = {'ENGAGE_COMPLETE_FRAMES': override} if override is not None else {}
                     with mock.patch.dict(os.environ, env, clear=True), \
@@ -117,6 +117,7 @@ class ShaderPrepareInstallerTests(unittest.TestCase):
                         app.main()
                     launch_env = popen.call_args_list[0].kwargs['env']
                     self.assertEqual(launch_env.get('ENGAGE_COMPLETE_FRAMES'), expected)
+                    self.assertEqual(popen.call_count, 2 if override == '1' else 1)
 
     def test_end_to_end_skip_and_invalidation(self):
         with tempfile.TemporaryDirectory() as td:
