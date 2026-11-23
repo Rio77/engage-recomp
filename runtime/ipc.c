@@ -69,7 +69,9 @@ SERVICE("sm:", sm_handler) {
     case 1: {  // GetServiceHandle(name)
         char name[9] = {0};
         memcpy(name, req->data, 8);
-        LOG("[sm] GetService %s\n", name);
+        static int sm_audren_log;
+        if (strcmp(name, "audren:u") != 0 || sm_audren_log++ < 8 || getenv("ENGAGE_TRACE_IPC"))
+            LOG("[sm] GetService %s\n", name);
         ipc_return_object(resp, service_lookup(name));
         break;
     }
@@ -136,7 +138,10 @@ int ipc_handle_request(Cpu *c, uint32_t handle) {
     }
 
     if (req.type == 2 || req.type == 15) {  // CMIF / TIPC close
-        LOG("[ipc] close session %s (handle %x)\n", sess->svc->name, handle);
+        static int close_audren_log;
+        if ((strcmp(sess->svc->name, "audren:u") != 0 && strcmp(sess->svc->name, "IAudioDevice") != 0) ||
+            close_audren_log++ < 8 || trace_ipc)
+            LOG("[ipc] close session %s (handle %x)\n", sess->svc->name, handle);
         if (!sess->domain) service_release(sess->svc);  // (a domain's objects stay: closed one by one)
         return 0;
     }

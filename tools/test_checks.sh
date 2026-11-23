@@ -18,3 +18,7 @@ for i in range(1004):
 (Path('/tmp/romfs-opt4-fixture')).write_text(str(p))
 PY
 /tmp/test_romfs_opt4 "$(cat /tmp/romfs-opt4-fixture)"
+clang -std=gnu11 -O1 -Iruntime/nvn/maxwell tools/test_maxwell_kill.c \
+  runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/scf_*.c -lm -o /tmp/test_maxwell_kill
+/tmp/test_maxwell_kill
+make test-nvn

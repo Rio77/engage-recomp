@@ -34,9 +34,14 @@ const char *g_save_dir = "save";
 // folder isn't there.
 static RomfsLayout g_base;
 static bool g_base_open;
+static char g_base_dir[1100];
 static int g_base_fd = -1;  // (an older version's romfs.bin)
 static pthread_mutex_t g_base_lock = PTHREAD_MUTEX_INITIALIZER;
+#ifdef __APPLE__
 #define BASE_FDS 32  // files kept open (macOS allows 256 open files by default)
+#else
+#define BASE_FDS 256
+#endif
 static struct { int file, fd; uint64_t used; } g_base_fds[BASE_FDS];
 static uint64_t g_base_tick;
 
@@ -102,14 +107,19 @@ static void base_close(void) {
     romfs_layout_free(&g_base);
     if (g_base_fd >= 0) close(g_base_fd);
     g_base_fd = -1;
+    g_base_dir[0] = 0;
     g_base_open = false;
 }
 
 static void base_open(void) {
-    if (g_base_open) return;
+    if (g_base_open) {
+        if (g_base_fd < 0 && g_romfs_dir && !strcmp(g_base_dir, g_romfs_dir)) return;
+        base_close();
+    }
     char path[1100], why[256] = "";
     struct stat sb;
     if (stat(g_romfs_dir, &sb) == 0 && S_ISDIR(sb.st_mode) && romfs_layout(g_romfs_dir, &g_base, why, sizeof why)) {
+        snprintf(g_base_dir, sizeof g_base_dir, "%s", g_romfs_dir);
         LOG("[fs] romfs: %d files served from %s\n", g_base.nfiles, g_romfs_dir);
         // Delete only after a complete layout exists, and only our installed image.
         char parent[1100], *slash;
@@ -159,7 +169,8 @@ RT_ON_RESET(fs_reset) {
     ov_meta = NULL, ov_meta_off = ov_meta_size = ov_end = 0;
     npatches = 0;
     rom_files = NULL, rom_nfiles = 0, rom_data_off = 0;
-    base_close();
+    // Keep the immutable base RomFS layout cached across in-place reboots when the folder did not change.
+    if (g_base_fd >= 0 || !g_romfs_dir || strcmp(g_base_dir, g_romfs_dir) != 0) base_close();
     g_save_dir = "save";
 }
 

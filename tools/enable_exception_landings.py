@@ -5,7 +5,16 @@ import argparse
 import re
 import sys
 
-from reemit_main_functions import BASE, ROOT, Module, read_encoded, route_missing_calls, unwind_records, restore_texture_dispatch
+from reemit_main_functions import (
+    BASE,
+    ROOT,
+    Module,
+    prepare_texture_dispatch_labels,
+    read_encoded,
+    restore_texture_dispatch,
+    route_missing_calls,
+    unwind_records,
+)
 
 
 FRAMES = {
@@ -125,7 +134,7 @@ def protected_calls(module, frame, start, end):
         if call + length > end - start or landing >= end - start:
             raise ValueError(f"Invalid LSDA call or landing at {start:#x}")
         if landing:
-            yield BASE + start + call, BASE + start + call + length
+            yield BASE + start + call, BASE + start + call + length, BASE + start + landing
 
 
 def main():
@@ -143,7 +152,7 @@ def main():
     generated = ROOT / "generated/main"
     entries = {int(addr, 16) for addr in re.findall(
         r"^void f_([0-9a-f]+)\(Cpu \*c\);$", (generated / "main_table.c").read_text(), re.MULTILINE)}
-    definitions = re.compile(r"^void f_([0-9a-f]+)\(Cpu \*c\) \{", re.MULTILINE)
+    definitions = re.compile(r"^void(?: __attribute__\(\(optnone\)\))? f_([0-9a-f]+)\(Cpu \*c\) \{", re.MULTILINE)
     remaining = {BASE + addr for addr in selected}
     updates = {}
     for chunk in sorted(generated.glob("main_*.c")):
@@ -151,13 +160,15 @@ def main():
         for begin in sorted(remaining & {int(addr, 16) for addr in definitions.findall(source)}):
             end_offset, frame = selected[begin - BASE]
             end = BASE + end_offset
-            ranges = list(protected_calls(module, frame, begin - BASE, end_offset))
+            call_sites = list(protected_calls(module, frame, begin - BASE, end_offset))
+            ranges = [(lo, hi) for lo, hi, _ in call_sites]
+            landing_pads = {lp for _, _, lp in call_sites}
             labels, _, tables = module.scan(begin, end)
-            tables[0] = "all"  # Also make the landing pads addressable in the local dispatcher.
+            prepare_texture_dispatch_labels(module, begin, labels, tables)
             original_split = module.SPLIT_AT
             module.SPLIT_AT = max(original_split, end - begin + 1)
             try:
-                code = module.emit_function(begin, end, labels, tables, {})
+                code = module.emit_function(begin, end, labels, tables, {}, dispatch_targets=landing_pads)
             finally:
                 module.SPLIT_AT = original_split
             if module._parts:
@@ -172,7 +183,7 @@ def main():
                     calls += 1
             if not calls and begin - BASE in FRAMES:
                 raise ValueError(f"No call sites in exception frame {begin:#x}")
-            pattern = re.compile(rf"^void f_{begin:x}\(Cpu \*c\) \{{\n.*?^\}}", re.MULTILINE | re.DOTALL)
+            pattern = re.compile(rf"^void(?: __attribute__\(\(optnone\)\))? f_{begin:x}\(Cpu \*c\) \{{\n.*?^\}}", re.MULTILINE | re.DOTALL)
             prototypes = "".join(f"void f_{addr:x}(Cpu *c);\n" for addr in sorted(module._refs & entries))
             if "\n".join(code) != pattern.search(source).group():
                 source = pattern.sub(lambda _: prototypes + "\n".join(code), source, count=1)

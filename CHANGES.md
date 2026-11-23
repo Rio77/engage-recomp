@@ -1,4 +1,34 @@
-# Engage Recomp 0.1.0
+# Engage Recomp
+
+## 0.2.0
+
+- Corrige el oscurecimiento del pasto durante impactos físicos y mágicos. El
+  traductor Maxwell conserva los fragmentos auxiliares para las derivadas en
+  secuencias condicionales de descarte, limpieza de salidas y salida. La
+  corrección se aplica a los shaders que cumplen ese patrón.
+- Conserva una ruta de respaldo para saltos indirectos dentro de cada
+  función. Así, una tabla inferida parcialmente durante la generación no
+  deja destinos válidos fuera de la biblioteca de una instalación nueva.
+- Sincroniza el cierre de la ventana con el renderizado Vulkan para que la
+  salida desde el menú del juego vuelva a Steam en Modo Juego.
+- Ajusta las barreras entre pases Vulkan y las rutas de imágenes de
+  almacenamiento, sincronización NVN y texturas MSAA. La memoria invitada
+  admite una ventana de alias de 16 GiB y hasta 4096 regiones registradas.
+- Admite decodificación de vídeo NV12 y YUV420P en la ruta de la cinemática
+  inicial. La validación visual de cinemáticas se registra por separado.
+- Conserva por instalación la caché de Mesa y precalienta pipelines conocidos
+  con Graphics Pipeline Library cuando Vulkan lo admite. El lanzador espera
+  por defecto a los shaders y pipelines necesarios para dibujar.
+- Usa seguimiento de escrituras por páginas con UFFD-WP y validación de la
+  caché de vértices en sistemas compatibles. Reduce el trabajo en Vulkan con
+  entrada de vértices dinámica y caché de descriptor sets por envío.
+- Dirige los despertares del kernel emulado a los hilos que esperan el objeto
+  señalado. Amplía las comprobaciones de memoria invitada y del ciclo de vida NVN.
+- Mantiene la biblioteca del juego en `-O1` y compila primero las unidades
+  mayores (LPT). `ENGAGE_GAMELIB_RESUME=1` reutiliza los objetos que ya se
+  generaron en el mismo directorio de compilación.
+
+## 0.1.0
 
 ## Actualización del instalador y configuración
 
@@ -28,6 +58,12 @@ del final del capítulo. Añade:
   recursos aún desconocidos pueden requerir una pausa en su primer uso.
 - Comprobación de versión, dispositivo y UUID de la caché Vulkan. La caché de
   traducción ya distingue el contenido y la versión del traductor.
+- Preparación anticipada de shaders y pipelines integrada tras la instalación
+  (`--prepare-shaders` en el binario nativo y en el lanzador AppImage): extrae
+  localmente shaders desde ExeFS/RomFS usando inventarios de metadatos, genera
+  `cache/xlat/`, compila `cache/spirv/` y precalienta pipelines en `cache/warm.bin`
+  y `cache/vk_pipelines.bin` con journal de recuperación ante fallos del driver,
+  progreso en KDialog y cancelación segura sin afectar la instalación del juego.
 - Ajuste persistente 30/60 FPS. Cinco puntos verificados de Engage 2.0.0 ajustan
   vSync, velocidad, giro, aceleración y desaceleración del desplazamiento.
   Se desactiva la heurística de ritmo heredada de otro juego.

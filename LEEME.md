@@ -1,4 +1,4 @@
-# Engage Recomp 0.1.0
+# Engage Recomp 0.2.0
 
 Port nativo experimental de Fire Emblem Engage 2.0.0 para Linux y Steam Deck.
 Necesitás tus propios archivos **ExeFS y RomFS del juego base con la actualización
@@ -10,8 +10,8 @@ Necesitás tus propios archivos **ExeFS y RomFS del juego base con la actualizac
    las carpetas `exefs` y `romfs` de tu copia. Después elegí si querés importar DLC,
    antes de iniciar la compilación. Seleccioná la carpeta con subcarpetas ID/romfs
    o ID/contenido extraído. No se admiten contenedores NSP/XCI/NCA cifrados.
-3. Esperá la generación y compilación inicial. Puede tardar horas; el detalle
-   queda en `installation.log`. No requiere Podman ni instalar paquetes en SteamOS.
+3. Esperá la generación, la compilación local y la preparación de shaders.
+   El detalle queda en `installation.log`. No requiere Podman ni instalar paquetes en SteamOS.
 4. Añadí `Engage-Recomp.sh`, dentro de la instalación, como juego externo a Steam.
    **No actives Proton**. Elegí 30 o 60 FPS mientras jugás desde
    **F1 → Video → Frame rate**. La elección se conserva al cerrar.
@@ -20,6 +20,7 @@ La AppImage también se puede ejecutar directamente, dándole permiso de ejecuci
 El kit usa extracción automática para no depender de FUSE. Se necesitan Python
 3.10+, KDialog y soporte Vulkan, ya disponibles en SteamOS.
 
+Para actualizar, ejecutá el instalador nuevo y elegí la misma carpeta.
 Las partidas y la configuración quedan en la carpeta elegida. La instalación
 prepara el reemplazo aparte y conserva la anterior en `.recovery`. Si falla una
 compilación, consultá el registro y repetí el instalador. Si se interrumpe el
@@ -27,7 +28,9 @@ cambio final, volver a ejecutarlo recupera la instalación. Los intentos fallido
 quedan en `.installer-work`; con el juego y el instalador cerrados podés guardar
 el registro y retirar únicamente esos intentos. No borres `save` ni tu respaldo.
 
-Se prioriza dibujar con los recursos completos, aunque haya una espera inicial.
+La versión 0.2.0 corrige una traducción de shaders Maxwell que podía oscurecer
+el pasto durante el impacto de un ataque. El juego espera los recursos necesarios
+para dibujar el fotograma completo, incluso durante la primera carga.
 Los recursos todavía desconocidos pueden producir pausas. Elegir 60 FPS no
 garantiza mantenerlos durante toda la campaña. Persisten el color intermitente
 en la cinemática inicial y un bloqueo en Contenido adicional; los DLC no están
@@ -38,4 +41,4 @@ y `UPSTREAM.md` detallan autores, referencias y fuentes correspondientes. La
 imagen del icono es independiente de la licencia del código. Proyecto no oficial,
 sin afiliación con Nintendo, desarrollado con asistencia de IA.
 
-El retrato de victoria puede permanecer oscuro de forma intermitente. Este fallo sigue pendiente en 0.1.0.
+El retrato de victoria puede permanecer oscuro de forma intermitente.

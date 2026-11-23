@@ -104,6 +104,20 @@ def route_missing_calls(code, missing):
                                            f"c->pc = {addr:#x}ull; rt_dispatch(c);")
 
 
+def prepare_texture_dispatch_labels(module, begin, labels, tables):
+    """Ensure the 69-entry texture-format jump table targets are present in labels/tables."""
+    if begin != BASE + 0x7CE1C8:
+        return
+    site, first, table, count = 0x7CE480, 0x7CE484, 0x508EC5C, 69
+    if module.word(BASE + site) != 0xD61F0100:  # br x8
+        raise ValueError("Unexpected texture dispatch instruction")
+    targets = sorted({BASE + first + 4 * struct.unpack_from("<H", module.nso.image, table + 2*i)[0]
+                      for i in range(count)})
+    labels.add(BASE + site)
+    labels.update(targets)
+    tables[BASE + site] = targets
+
+
 def restore_texture_dispatch(module, begin, code):
     """Preserve the local 69-entry texture-format jump table in a clean build."""
     if begin != BASE + 0x7CE1C8:
@@ -142,19 +156,20 @@ def main():
         if not remaining <= switches.keys():
             raise ValueError("Requested address is not a verified split function")
     print(f"Discovered {len(remaining)} split functions with computed branches", flush=True)
-    definition = re.compile(r"^void f_([0-9a-f]+)\(Cpu \*c\) \{", re.MULTILINE)
+    definition = re.compile(r"^void(?: __attribute__\(\(optnone\)\))? f_([0-9a-f]+)\(Cpu \*c\) \{", re.MULTILINE)
     for chunk in sorted(generated.glob("main_*.c")):
         source = chunk.read_text()
         updated = source
         present = {int(match, 16) for match in definition.findall(source)}
         for begin in sorted(remaining & present):
             end = switches[begin]
-            pattern = re.compile(rf"^void f_{begin:x}\(Cpu \*c\) \{{\n.*?^\}}",
+            pattern = re.compile(rf"^void(?: __attribute__\(\(optnone\)\))? f_{begin:x}\(Cpu \*c\) \{{\n.*?^\}}",
                                  re.MULTILINE | re.DOTALL)
             match = pattern.search(updated)
             if not match:
                 continue
             labels, _, tables = module.scan(begin, end)
+            prepare_texture_dispatch_labels(module, begin, labels, tables)
             if not tables:
                 raise ValueError(f"No indirect jump table found at {begin:#x}")
             original_split = module.SPLIT_AT

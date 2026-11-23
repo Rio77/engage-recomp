@@ -6,7 +6,12 @@
 // endpoints for that partition only (as astcenc and the spec's LDR profile do).
 #include "astc.h"
 
+#include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <pthread.h>
+#include <stdatomic.h>
+#endif
 
 // Quantization levels QUANT_2 .. QUANT_256 (index 0..20): bits / trits / quints per level.
 static const uint8_t q_bits[21]   = {1, 0, 2, 0, 1, 3, 1, 2, 4, 2, 3, 5, 3, 4, 6, 4, 5, 7, 5, 6, 8};
@@ -502,23 +507,136 @@ error:
     return false;
 }
 
-void astc_decode_ldr(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh,
-                     bool srgb, uint8_t *rgba_out) {
-    if (bw < 4 || bh < 4 || bw > 12 || bh > 12) return;
-    uint32_t bx = (width + bw - 1) / bw, by = (height + bh - 1) / bh;
+static void astc_decode_row(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh,
+                            bool srgb, uint8_t *rgba_out, uint32_t bx, uint32_t j, uint8_t *row_buf) {
     uint8_t tmp[12 * 12 * 4];
-    for (uint32_t j = 0; j < by; j++) {
-        for (uint32_t i = 0; i < bx; i++) {
-            const uint8_t *src = blocks + 16 * ((size_t)j * bx + i);
-            uint32_t x0 = i * bw, y0 = j * bh;
-            uint32_t cw = width - x0 < bw ? width - x0 : bw, ch = height - y0 < bh ? height - y0 : bh;
-            // decode in place when the block's rows are contiguous in the output
-            uint8_t *dst = width == bw && ch == bh ? rgba_out + (size_t)y0 * width * 4 : tmp;
-            astc_decode_block(src, bw, bh, srgb, dst);
-            if (dst == tmp) {
-                for (uint32_t y = 0; y < ch; y++)
-                    memcpy(rgba_out + ((size_t)(y0 + y) * width + x0) * 4, tmp + y * bw * 4, cw * 4);
-            }
+    uint32_t y0 = j * bh;
+    uint32_t ch = height - y0 < bh ? height - y0 : bh;
+    size_t row_bytes = (size_t)width * 4;
+    for (uint32_t i = 0; i < bx; i++) {
+        const uint8_t *src = blocks + 16 * ((size_t)j * bx + i);
+        uint32_t x0 = i * bw;
+        uint32_t cw = width - x0 < bw ? width - x0 : bw;
+        astc_decode_block(src, bw, bh, srgb, tmp);
+        for (uint32_t y = 0; y < ch; y++) {
+            memcpy(row_buf + (size_t)y * row_bytes + (size_t)x0 * 4, tmp + y * bw * 4, (size_t)cw * 4);
         }
     }
+    // Single sequential contiguous write into (potentially write-combined) output memory.
+    memcpy(rgba_out + (size_t)y0 * row_bytes, row_buf, (size_t)ch * row_bytes);
+}
+
+#ifndef _WIN32
+#define ASTC_WORKERS 4
+typedef struct {
+    const uint8_t *blocks;
+    uint8_t *rgba_out;
+    uint32_t width, height, bw, bh, bx, by;
+    bool srgb;
+} AstcJob;
+
+static pthread_mutex_t g_astc_job_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_astc_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_astc_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_astc_done_cond = PTHREAD_COND_INITIALIZER;
+static pthread_once_t g_astc_once = PTHREAD_ONCE_INIT;
+static AstcJob g_astc_job;
+static uint64_t g_astc_gen;
+static int g_astc_pending;
+static _Atomic uint32_t g_astc_next_row;
+static bool g_astc_pool_ready;
+
+static void *astc_worker_fn(void *arg) {
+    (void)arg;
+    uint64_t seen = 0;
+    uint8_t *row_buf = NULL;
+    size_t row_cap = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_astc_mu);
+        while (g_astc_gen == seen) pthread_cond_wait(&g_astc_cond, &g_astc_mu);
+        seen = g_astc_gen;
+        AstcJob job = g_astc_job;
+        pthread_mutex_unlock(&g_astc_mu);
+
+        size_t need = (size_t)job.bh * job.width * 4;
+        if (need > row_cap) {
+            uint8_t *nb = realloc(row_buf, need);
+            if (nb) { row_buf = nb; row_cap = need; }
+        }
+        if (row_buf && row_cap >= need) {
+            for (;;) {
+                uint32_t j = atomic_fetch_add_explicit(&g_astc_next_row, 1, memory_order_relaxed);
+                if (j >= job.by) break;
+                astc_decode_row(job.blocks, job.width, job.height, job.bw, job.bh,
+                                job.srgb, job.rgba_out, job.bx, j, row_buf);
+            }
+        }
+
+        pthread_mutex_lock(&g_astc_mu);
+        if (--g_astc_pending == 0) pthread_cond_signal(&g_astc_done_cond);
+        pthread_mutex_unlock(&g_astc_mu);
+    }
+    return NULL;
+}
+
+static void astc_pool_init(void) {
+    const char *e = getenv("ENGAGE_ASTC_THREADS");
+    if (e && strcmp(e, "0") == 0) return;
+    int started = 0;
+    for (int i = 0; i < ASTC_WORKERS; i++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, astc_worker_fn, NULL) == 0) {
+            pthread_detach(th);
+            started++;
+        }
+    }
+    g_astc_pool_ready = (started == ASTC_WORKERS);
+}
+#endif
+
+void astc_decode_ldr(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh,
+                     bool srgb, uint8_t *rgba_out) {
+    if (bw < 4 || bh < 4 || bw > 12 || bh > 12 || !width || !height) return;
+    uint32_t bx = (width + bw - 1) / bw, by = (height + bh - 1) / bh;
+    size_t row_need = (size_t)bh * width * 4;
+    uint8_t stack_row[16384];
+    uint8_t *row_buf = row_need <= sizeof stack_row ? stack_row : malloc(row_need);
+    if (!row_buf) return;
+
+#ifndef _WIN32
+    if ((uint64_t)bx * by >= 256 && by >= 4) {
+        pthread_once(&g_astc_once, astc_pool_init);
+        if (g_astc_pool_ready && pthread_mutex_trylock(&g_astc_job_lock) == 0) {
+            pthread_mutex_lock(&g_astc_mu);
+            g_astc_job = (AstcJob){
+                .blocks = blocks, .rgba_out = rgba_out,
+                .width = width, .height = height, .bw = bw, .bh = bh, .bx = bx, .by = by,
+                .srgb = srgb,
+            };
+            atomic_store_explicit(&g_astc_next_row, 0, memory_order_relaxed);
+            g_astc_pending = ASTC_WORKERS;
+            g_astc_gen++;
+            pthread_cond_broadcast(&g_astc_cond);
+            pthread_mutex_unlock(&g_astc_mu);
+
+            for (;;) {
+                uint32_t j = atomic_fetch_add_explicit(&g_astc_next_row, 1, memory_order_relaxed);
+                if (j >= by) break;
+                astc_decode_row(blocks, width, height, bw, bh, srgb, rgba_out, bx, j, row_buf);
+            }
+
+            pthread_mutex_lock(&g_astc_mu);
+            while (g_astc_pending > 0) pthread_cond_wait(&g_astc_done_cond, &g_astc_mu);
+            pthread_mutex_unlock(&g_astc_mu);
+            pthread_mutex_unlock(&g_astc_job_lock);
+            if (row_buf != stack_row) free(row_buf);
+            return;
+        }
+    }
+#endif
+
+    for (uint32_t j = 0; j < by; j++) {
+        astc_decode_row(blocks, width, height, bw, bh, srgb, rgba_out, bx, j, row_buf);
+    }
+    if (row_buf != stack_row) free(row_buf);
 }

@@ -5,7 +5,7 @@
 # Engage Recomp
 
 Experimental native Linux recompilation of **Fire Emblem Engage 2.0.0**, aimed
-at Steam Deck. Version **0.1.0** is a release of an experimental port. It uses static
+at Steam Deck. Version **0.2.0** uses static
 ARM64-to-C translation and a Vulkan runtime derived from
 [FE3H Recomp](https://gitlab.com/onerag90/fe3h-recomp) and
 [LASRecomp](https://github.com/peiikai/LASRecomp).
@@ -20,13 +20,15 @@ recompiled game library, saves or shader cache are distributed.
 2. Run `Install.desktop` (or `Install.sh`). Select the installation folder and
    your ExeFS/RomFS folders, then optionally an extracted DLC folder, when asked. Spanish and English follow the desktop
    language. Default destination: `~/Games/Engage-Recomp`.
-3. Wait for local generation and compilation. This first optimized build can
-   take hours on the Deck. Progress details go to `installation.log`; cancellation
-   leaves the current installation usable. Keep ample free space for your dump,
-   generated sources, compiler objects and the recovery copy on upgrades.
+3. Wait for local generation, compilation and offline shader/pipeline preparation. A fresh installation
+   compiles the game library locally. Progress details go to `installation.log`; cancellation
+   leaves the current installation usable (and cancelling during shader prep leaves the compiled game playable with on-demand fallback). Keep ample free space for your dump,
+   generated sources, compiler objects, shader caches and the recovery copy on upgrades.
 4. Add `Engage-Recomp.sh` in the installation folder to Steam as a non-Steam
    game. It runs natively: **do not enable Proton**. Use the supplied PNG for
    Steam artwork if desired. Choose 30 or 60 FPS while playing in **F1 → Video → Frame rate**.
+   You can also re-run offline shader preparation anytime after an AppImage or GPU driver update via
+   `Engage-Recomp-<ver>.AppImage --prepare-shaders --root ~/Games/Engage-Recomp` (or pass `--no-shaders` during installation to skip it).
 
 DLC imports accept `<title-id>/romfs/...` or `<title-id>/...` (direct extracted
 RomFS payload). Select the parent folder containing the Engage DLC title IDs.
@@ -41,7 +43,8 @@ mode, so FUSE is not required. Other Linux distributions are not yet validated.
 
 ## State and limitations
 
-Battle-end progression and new saves have been tested using the packaged
+Version 0.2.0 corrects a Maxwell shader translation that could darken grass
+when an attack landed. Battle-end progression and new saves have been tested using the packaged
 runtime. Required shaders/pipelines finish before drawing, and known pipelines
 are prepared on later launches. Unknown resources can still pause on first use.
 60 FPS is a selectable target, **not a promise of stable 60 FPS**. See the
@@ -57,6 +60,7 @@ Saves and configuration live in the chosen installation root, separately from
 `extracted`. The installer stages a replacement before switching it into place.
 Previous extracted data remains in `.recovery`; failed builds remain under
 `.installer-work` for diagnosis. Do not delete these while installing or playing.
+For an update, run the new installer and select the same installation folder.
 Rerun the installer to recover an interrupted activation. Back up your saves
 before changing versions. No automatic update or cloud synchronization is installed.
 
@@ -78,4 +82,4 @@ The application icon was supplied by the maintainer; the MIT code license does
 not grant rights to the depicted emblem. Independent, unofficial project, not
 affiliated with Nintendo. Development used AI assistance.
 
-The victory portrait can intermittently remain dark. This remains a known issue in 0.1.0; see [investigation notes](docs/KNOWN-PORTRAIT-ISSUE.md).
+The victory portrait can intermittently remain dark. See the [investigation notes](docs/KNOWN-PORTRAIT-ISSUE.md).

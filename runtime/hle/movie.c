@@ -875,10 +875,20 @@ static bool emit_frame(Decoder *d, AVFrame *f, int64_t time, uint32_t flags) {
     } else if (d->video) {
         int h = d->height, w = d->width, uv_off = d->stride * h;
         for (int y = 0; y < h; y++) memcpy(o + y * d->stride, f->data[0] + y * f->linesize[0], w);
-        for (int y = 0; y < h / 2; y++) {  // interleave U and V into NV12
-            uint8_t *uv = o + uv_off + y * d->stride;
-            const uint8_t *u = f->data[1] + y * f->linesize[1], *v = f->data[2] + y * f->linesize[2];
-            for (int x = 0; x < w / 2; x++) { uv[2 * x] = u[x]; uv[2 * x + 1] = v[x]; }
+        if (f->format == AV_PIX_FMT_NV12) {
+            for (int y = 0; y < h / 2; y++)
+                memcpy(o + uv_off + y * d->stride, f->data[1] + y * f->linesize[1], w);
+        } else {
+            static bool warned_fmt = false;
+            if (!warned_fmt && f->format != AV_PIX_FMT_YUV420P) {
+                warned_fmt = true;
+                LOG("[movie] unexpected video pixel format %d (expected YUV420P/NV12)\n", f->format);
+            }
+            for (int y = 0; y < h / 2; y++) {  // interleave U and V into NV12
+                uint8_t *uv = o + uv_off + y * d->stride;
+                const uint8_t *u = f->data[1] + y * f->linesize[1], *v = f->data[2] + y * f->linesize[2];
+                for (int x = 0; x < w / 2; x++) { uv[2 * x] = u[x]; uv[2 * x + 1] = v[x]; }
+            }
         }
         size = (uint32_t)(uv_off + d->stride * (h / 2));
     } else {
@@ -994,7 +1004,16 @@ static void dec_get_output_buffer(Cpu *c) {
     }
     if (d->video && b->base && b->capacity == 8) {
         // texture output mode: the buffer points at the game's NVNtexture; write RGBA into it
-        NvnTexture *t = *(NvnTexture **)(uintptr_t)b->base;
+        extern NvnTexture *nvn_texture_host(uint64_t guest);
+        NvnTexture *t = nvn_texture_host(b->base);
+        if (!t) {
+            static int nbad;
+            if (nbad++ < 16)
+                LOG("[movie] video output target %llx is not a valid NVNtexture (lr=%llx)\n",
+                    (unsigned long long)b->base, (unsigned long long)c->x[30]);
+            c->x[0] = 0;
+            return;
+        }
         int w = d->width, h = d->height;
         if (!d->sws)
             d->sws = sws_getContext(w, h, AV_PIX_FMT_NV12, w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);

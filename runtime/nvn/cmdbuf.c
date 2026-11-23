@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "guest_mem.h"
 #include "nvn.h"
 
 #define JUMP_RESERVE (sizeof(CmdRec) + 8)
@@ -88,7 +89,9 @@ static CmdRec *raw_rec(uint64_t at, uint32_t op, uint32_t size) {
 
 NVN(nvnCommandBufferAddCommandMemory) {
     NvnCmdBuf *cb = cb_of(A(0));
-    uint64_t mem = HOST(NvnPool, A(1))->storage + A(2), size = A(3);
+    NvnPool *p = HOST(NvnPool, A(1));
+    if (!p) return;
+    uint64_t mem = p->storage + A(2), size = A(3);
     cb->mem = mem;
     cb->size = size;
     cb->used = 0;
@@ -148,6 +151,8 @@ NVN(nvnCommandBufferBeginRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
     cb->recording = true;
     cb->records_used = 0;
+    cb->copy_row_stride = 0;
+    cb->copy_image_stride = 0;
     rec(c, cb, CMD_BARRIER, 0);  // request the initial command-memory budget
 }
 NVN(nvnCommandBufferEndRecording) {
@@ -198,14 +203,17 @@ static CmdRec *record_copy(Cpu *c, uint32_t op, int arg, uint32_t len) {
     NvnCmdBuf *cb = cb_of(s.x[0]);
     uint64_t needed = (sizeof(CmdRec) + (uint64_t)len + 7) & ~7ull;
     void *saved = NULL;
-    if (s.x[arg] && len && (!cb->mem || cb->used + needed + JUMP_RESERVE > cb->size)) {
+    bool src_ok = s.x[arg] && len && guest_mem_validate_range(s.x[arg], len, 1, GMEM_PERM_R) == GMEM_OK;
+    if (src_ok && (!cb->mem || cb->used + needed + JUMP_RESERVE > cb->size)) {
         saved = malloc(len);
         if (!saved) FATAL("nvn: command argument snapshot allocation failed\n");
         memcpy(saved, (const void *)(uintptr_t)s.x[arg], len);
     }
     CmdRec *r = record(c, op, len, &s);
     if (len) {
-        if (s.x[arg]) memcpy(r->extra, saved ? saved : (const void *)(uintptr_t)s.x[arg], len);
+        if (saved) memcpy(r->extra, saved, len);
+        else if (s.x[arg] && guest_mem_validate_range(s.x[arg], len, 1, GMEM_PERM_R) == GMEM_OK)
+            memcpy(r->extra, (const void *)(uintptr_t)s.x[arg], len);
         else memset(r->extra, 0, len);
     }
     free(saved);
@@ -318,15 +326,25 @@ typedef struct {
 NVN(nvnCommandBufferSetRenderTargets) {
     Snap s = snap(c);
     int n = (int)s.x[1];
+    if (n < 0) n = 0;
     if (n > 8) n = 8;
     RtRec rt = {0};
-    const uint64_t *colors = (const uint64_t *)(uintptr_t)s.x[2], *views = (const uint64_t *)(uintptr_t)s.x[3];
+    const uint64_t *colors = (n > 0 && s.x[2] && guest_mem_validate_range(s.x[2], (uint64_t)n * 8, 8, GMEM_PERM_R) == GMEM_OK)
+                                 ? (const uint64_t *)(uintptr_t)s.x[2] : NULL;
+    const uint64_t *views = (n > 0 && s.x[3] && guest_mem_validate_range(s.x[3], (uint64_t)n * 8, 8, GMEM_PERM_R) == GMEM_OK)
+                                ? (const uint64_t *)(uintptr_t)s.x[3] : NULL;
     for (int i = 0; i < n; i++) {
         rt.tex[i] = colors && colors[i] ? (uint64_t)(uintptr_t)HOST(NvnTexture, colors[i]) : 0;
-        if (views && views[i]) { rt.has_view[i] = 1; memcpy(&rt.views[i], (void *)(uintptr_t)views[i], sizeof(NvnTextureView)); }
+        if (views && views[i] && guest_mem_validate_range(views[i], sizeof(NvnTextureView), 1, GMEM_PERM_R) == GMEM_OK) {
+            rt.has_view[i] = 1;
+            memcpy(&rt.views[i], (void *)(uintptr_t)views[i], sizeof(NvnTextureView));
+        }
     }
     rt.depth = s.x[4] ? (uint64_t)(uintptr_t)HOST(NvnTexture, s.x[4]) : 0;
-    if (s.x[5]) { rt.has_dview = 1; memcpy(&rt.dview, (void *)(uintptr_t)s.x[5], sizeof(NvnTextureView)); }
+    if (s.x[5] && guest_mem_validate_range(s.x[5], sizeof(NvnTextureView), 1, GMEM_PERM_R) == GMEM_OK) {
+        rt.has_dview = 1;
+        memcpy(&rt.dview, (void *)(uintptr_t)s.x[5], sizeof(NvnTextureView));
+    }
     CmdRec *r = record(c, CMD_SET_RENDER_TARGETS, sizeof rt, &s);
     r->x[0] = (uint64_t)n;
     memcpy(r->extra, &rt, sizeof rt);
@@ -388,22 +406,22 @@ NVN(nvnCommandBufferSetProgramSubroutines) { (void)c; }
 NVN(nvnCommandBufferSaveZCullData) { (void)c; }
 NVN(nvnCommandBufferRestoreZCullData) { (void)c; }
 
-static uint64_t copy_row_stride, copy_image_stride;
-RT_ON_RESET(cmdbuf_reset) { copy_row_stride = copy_image_stride = 0; }
 NVN(nvnCommandBufferSetCopyRowStride) {
     Snap s = snap(c);
-    copy_row_stride = s.x[1];
+    NvnCmdBuf *cb = cb_of(s.x[0]);
+    cb->copy_row_stride = s.x[1];
     CmdRec *r = record(c, CMD_SET_COPY_STRIDES, 0, &s);
-    r->x[0] = copy_row_stride; r->x[1] = copy_image_stride;
+    r->x[0] = cb->copy_row_stride; r->x[1] = cb->copy_image_stride;
 }
 NVN(nvnCommandBufferSetCopyImageStride) {
     Snap s = snap(c);
-    copy_image_stride = s.x[1];
+    NvnCmdBuf *cb = cb_of(s.x[0]);
+    cb->copy_image_stride = s.x[1];
     CmdRec *r = record(c, CMD_SET_COPY_STRIDES, 0, &s);
-    r->x[0] = copy_row_stride; r->x[1] = copy_image_stride;
+    r->x[0] = cb->copy_row_stride; r->x[1] = cb->copy_image_stride;
 }
-NVN(nvnCommandBufferGetCopyRowStride) { RET(copy_row_stride); }
-NVN(nvnCommandBufferGetCopyImageStride) { RET(copy_image_stride); }
+NVN(nvnCommandBufferGetCopyRowStride) { RET(cb_of(A(0))->copy_row_stride); }
+NVN(nvnCommandBufferGetCopyImageStride) { RET(cb_of(A(0))->copy_image_stride); }
 
 // ---- clears
 NVN(nvnCommandBufferClearColor) { record_copy(c, CMD_CLEAR_COLOR, 2, 16); }
@@ -416,9 +434,14 @@ static void clear_texture(Cpu *c, int kind) {
     Snap s = snap(c);
     ClearTexRec ct = {0};
     ct.tex = (uint64_t)(uintptr_t)HOST(NvnTexture, s.x[1]);
-    if (s.x[2]) { ct.has_view = 1; memcpy(&ct.view, (void *)(uintptr_t)s.x[2], sizeof ct.view); }
-    if (s.x[3]) memcpy(ct.region, (void *)(uintptr_t)s.x[3], sizeof ct.region);
-    if (s.x[4]) memcpy(ct.color, (void *)(uintptr_t)s.x[4], 16);
+    if (s.x[2] && guest_mem_validate_range(s.x[2], sizeof ct.view, 1, GMEM_PERM_R) == GMEM_OK) {
+        ct.has_view = 1;
+        memcpy(&ct.view, (void *)(uintptr_t)s.x[2], sizeof ct.view);
+    }
+    if (s.x[3] && guest_mem_validate_range(s.x[3], sizeof ct.region, 1, GMEM_PERM_R) == GMEM_OK)
+        memcpy(ct.region, (void *)(uintptr_t)s.x[3], sizeof ct.region);
+    if (s.x[4] && guest_mem_validate_range(s.x[4], 16, 1, GMEM_PERM_R) == GMEM_OK)
+        memcpy(ct.color, (void *)(uintptr_t)s.x[4], 16);
     CmdRec *r = record(c, CMD_CLEAR_TEXTURE, sizeof ct, &s);
     r->x[6] = (uint64_t)kind;
     memcpy(r->extra, &ct, sizeof ct);
@@ -494,8 +517,12 @@ NVN(nvnCommandBufferResumeTransformFeedback) { (void)c; }
 typedef struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; } TexRef;
 static void tex_ref(TexRef *t, uint64_t tex, uint64_t view, uint64_t region) {
     t->tex = tex ? (uint64_t)(uintptr_t)HOST(NvnTexture, tex) : 0;
-    if (view) { t->has_view = 1; memcpy(&t->view, (void *)(uintptr_t)view, sizeof t->view); }
-    if (region) memcpy(t->region, (void *)(uintptr_t)region, sizeof t->region);
+    if (view && guest_mem_validate_range(view, sizeof t->view, 1, GMEM_PERM_R) == GMEM_OK) {
+        t->has_view = 1;
+        memcpy(&t->view, (void *)(uintptr_t)view, sizeof t->view);
+    }
+    if (region && guest_mem_validate_range(region, sizeof t->region, 1, GMEM_PERM_R) == GMEM_OK)
+        memcpy(t->region, (void *)(uintptr_t)region, sizeof t->region);
 }
 NVN(nvnCommandBufferCopyBufferToTexture) {  // (cmd, src, dst, dstView, dstRegion, flags)
     Snap s = snap(c);
@@ -546,7 +573,8 @@ NVN(nvnCommandBufferUpdateUniformBuffer) { record_copy(c, CMD_UPDATE_UNIFORM_BUF
 NVN(nvnCommandBufferFenceSync) {
     // work executes at submit time, so the sync is satisfied once this list has run
     Snap s = snap(c);
-    record(c, CMD_FENCE_SYNC, 0, &s);
+    CmdRec *r = record(c, CMD_FENCE_SYNC, 0, &s);
+    if (r) nvn_sync_pack_handle(s.x[1], &r->x[4], &r->x[5]);
 }
 PLAIN(nvnCommandBufferWaitSync, CMD_WAIT_SYNC)
 PLAIN(nvnCommandBufferBarrier, CMD_BARRIER)
@@ -558,8 +586,9 @@ NVN(nvnCommandBufferResetCounter) { (void)c; }
 static void inline_commands(Cpu *c) {
     Snap s = snap(c);
     int count = (int)s.x[1];
-    if (count < 0 || count > 65536 || (count && !s.x[2])) FATAL("nvn: invalid command handle array\n");
-    if (!count) return;
+    if (count <= 0 || count > 65536 ||
+        guest_mem_validate_range(s.x[2], (uint64_t)count * sizeof(uint64_t), 8, GMEM_PERM_R) != GMEM_OK)
+        return;
     typedef struct { uint8_t *data; uint64_t size; } Part;
     Part *parts = calloc((size_t)count, sizeof *parts);
     if (!parts) FATAL("nvn: command inline allocation failed\n");
@@ -567,15 +596,21 @@ static void inline_commands(Cpu *c) {
     // memory, including a later handle in this same array.
     for (int i = 0; i < count; i++) {
         uint64_t handle; memcpy(&handle, (const uint8_t *)(uintptr_t)s.x[2] + 8*i, 8);
-        uint64_t size;
+        uint64_t size = 0;
         const void *source = nvn_command_acquire(handle, &size);
-        if (!source || size < sizeof(CmdRec)) FATAL("nvn: expired command handle during copy\n");
+        if (!source || size < sizeof(CmdRec)) {
+            if (source) nvn_command_release(handle);
+            static int nlog;
+            if (nlog++ < 16) LOG("[nvn-diag] skipped expired command handle %llx during inline copy\n", (unsigned long long)handle);
+            continue;
+        }
         parts[i].data = malloc(size); parts[i].size = size;
         if (!parts[i].data) FATAL("nvn: command inline snapshot failed\n");
         memcpy(parts[i].data, source, size);
         nvn_command_release(handle);
     }
     for (int i = 0; i < count; i++) {
+        if (!parts[i].data) continue;
         uint64_t offset = 0;
         while (offset + sizeof(CmdRec) <= parts[i].size) {
             const CmdRec *src = (const CmdRec *)(parts[i].data + offset);

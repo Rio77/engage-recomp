@@ -18,6 +18,7 @@
 
 #include "../nvn.h"
 #include "../maxwell/shader.h"
+#include "pipe_key.h"
 
 void vk_device_fault_report(void);
 void vk_guest_heap_prepare(void);
@@ -41,7 +42,10 @@ typedef struct {
     bool bias_unorm, bias_exact;
     bool storage_images;  // shaderStorageImageWriteWithoutFormat: compute shaders can store to images (SUST)
     bool cs_subgroup32;  // compute pipelines run with 32-lane subgroups (as the Switch's warps; VK 1.3 size control)
+    bool gpl, gpl_fast;  // VK_EXT_graphics_pipeline_library + fast linking (LARECOMP_VK_GPL=0: off)
+    bool dyn_vi;         // VK_EXT_vertex_input_dynamic_state (ENGAGE_NO_DYN_VI=1: off)
     PFN_vkCmdSetDepthBias2EXT set_bias2;
+    PFN_vkCmdSetVertexInputEXT set_vertex_input;
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
@@ -80,7 +84,8 @@ typedef struct TexBackend {
     uint32_t width, height, depth, layers, levels, samples;
     VkImageAspectFlags aspect;
     bool gpu_owned, uploaded, dynamic;
-    uint64_t data_hash, sample_hash, checked_frame, full_frame;
+    uint64_t data_hash, sample_hash, checked_frame, full_frame, created_frame;
+    int cpu_dirty;  // atomic flag set on explicit nvnTextureWriteTexels()
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented;
     bool native_storage;  // actual image-store target: preserve native texel coordinates
@@ -115,9 +120,31 @@ void vk_defer_view(VkImageView v);
 void vk_views_forget(TexBackend *b);  // drop (deferred) the cached views of an image being replaced
 uint64_t vk_frame_counter(void);
 
-// ---- shaders / pipelines (shaders.c)
+// ---- shaders / pipelines (shaders.c, exec.c)
 VkShaderModule vk_compile_glsl(const char *src, int stage, const char *name);  // NULL on failure (logged)
 VkShaderModule vk_builtin_shader(const char *name);  // internal shaders (clear, copy, present)
+ShaderInfo *vk_translate_cached(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key, uint64_t *hash);
+void vk_xlat_stats(uint64_t *hits, uint64_t *misses);
 
 // ---- device / window (device.c)
+bool vk_init_headless(void);
+void vk_shutdown_headless(void);
+void vk_pipeline_cache_save(void);
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
+
+// ---- offline pipeline prewarming (exec.c)
+typedef struct VkOfflineProg VkOfflineProg;
+void vk_warm_seed_begin(void);
+void vk_warm_seed_end(void);
+VkOfflineProg *vk_offline_prog_create(uint64_t vxh, uint64_t fxh, uint32_t vs_out_mask);
+void vk_offline_prog_destroy(VkOfflineProg *p);
+uint32_t vk_offline_prog_attr_mask(const VkOfflineProg *p);
+uint32_t vk_offline_prog_out_mask(const VkOfflineProg *p);
+bool vk_offline_build_graphics(VkOfflineProg *p, const PipeKey *k);
+bool vk_offline_build_compute(uint64_t cxh, const uint32_t local[3]);
+bool vk_gpl_supported(void);
+bool vk_offline_prebuild_vs_lib(uint64_t vxh, uint8_t poly_fill);
+bool vk_offline_prebuild_fs_lib(uint64_t fxh, uint32_t samples, uint8_t a2c);
+VkFormat vk_depth24_stencil8_format(void);
+VkFormat vk_vertex_format_supported(VkFormat f);
+bool vk_divisor_supported(void);

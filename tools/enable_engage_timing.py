@@ -55,7 +55,7 @@ def main():
         text = path.read_text()
         updated = text
         for begin in remaining.copy():
-            pattern = re.compile(rf"^void f_{begin:x}\(Cpu \*c\) \{{\n.*?^\}}", re.M | re.S)
+            pattern = re.compile(rf"^void(?: __attribute__\(\(optnone\)\))? f_{begin:x}\(Cpu \*c\) \{{\n.*?^\}}", re.M | re.S)
             match = pattern.search(updated)
             if match is None:
                 continue

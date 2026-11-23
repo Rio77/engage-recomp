@@ -5,25 +5,92 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <linux/fs.h>
+#include <linux/userfaultfd.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/ucontext.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "../paths.h"
 #include "../platform.h"
+#include "../rt.h"
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
+#ifndef UFFD_USER_MODE_ONLY
+#define UFFD_USER_MODE_ONLY 1
+#endif
+#ifndef UFFD_FEATURE_WP_ASYNC
+#define UFFD_FEATURE_WP_ASYNC (1 << 15)
+#endif
+#ifndef PAGEMAP_SCAN
+#define PAGEMAP_SCAN _IOWR('f', 16, struct pm_scan_arg)
+#define PAGE_IS_WPALLOWED  (1ULL << 0)
+#define PAGE_IS_WRITTEN    (1ULL << 1)
+#define PM_SCAN_WP_MATCHING   (1U << 0)
+#define PM_SCAN_CHECK_WPASYNC (1U << 1)
+struct page_region { uint64_t start, end, categories; };
+struct pm_scan_arg {
+    uint64_t size, flags, start, end, walk_end, vec, vec_len, max_pages;
+    uint64_t category_inverted, category_mask, category_anyof_mask, return_mask;
+};
+#endif
+
+// ---- Linux page write tracking via UFFD_FEATURE_WP_ASYNC + PAGEMAP_SCAN (Phase 5B)
+// Rollback: ENGAGE_WRITE_WATCH=0 disables tracking cleanly (plat_written_pages returns -1).
+static int g_uffd = -1;
+static int g_pmfd = -1;
+static bool g_watch_ready = false;
+static pthread_mutex_t g_watch_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool watch_enabled_env(void) {
+    const char *e = getenv("ENGAGE_WRITE_WATCH");
+    return !(e && strcmp(e, "0") == 0);
+}
+
+static void linux_watch_register(uint64_t lo, uint64_t hi) {
+    pthread_mutex_lock(&g_watch_lock);
+    g_watch_ready = false;
+    if (!watch_enabled_env()) { pthread_mutex_unlock(&g_watch_lock); return; }
+    if (g_uffd < 0) {
+        int fd = (int)syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+        if (fd < 0) { pthread_mutex_unlock(&g_watch_lock); return; }
+        struct uffdio_api api = {.api = UFFD_API, .features = UFFD_FEATURE_WP_ASYNC};
+        if (ioctl(fd, UFFDIO_API, &api) != 0 || !(api.features & UFFD_FEATURE_WP_ASYNC)) {
+            close(fd);
+            pthread_mutex_unlock(&g_watch_lock);
+            return;
+        }
+        g_uffd = fd;
+    }
+    if (g_pmfd < 0) {
+        g_pmfd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+        if (g_pmfd < 0) { pthread_mutex_unlock(&g_watch_lock); return; }
+    }
+    bool ok_alias = false, ok_heap = false;
+    if (ALIAS_BASE >= lo && ALIAS_BASE + ALIAS_SIZE <= hi) {
+        struct uffdio_register r = {.range = {ALIAS_BASE, ALIAS_SIZE}, .mode = UFFDIO_REGISTER_MODE_WP};
+        ok_alias = (ioctl(g_uffd, UFFDIO_REGISTER, &r) == 0);
+    }
+    if (HEAP_BASE >= lo && HEAP_BASE + HEAP_MAX <= hi) {
+        struct uffdio_register r = {.range = {HEAP_BASE, HEAP_MAX}, .mode = UFFDIO_REGISTER_MODE_WP};
+        ok_heap = (ioctl(g_uffd, UFFDIO_REGISTER, &r) == 0);
+    }
+    g_watch_ready = ok_alias && ok_heap;
+    pthread_mutex_unlock(&g_watch_lock);
+}
 
 // ---- guest address space
 // Everything readable/writable from the start, like macOS: the guest maps at 4K granularity, and untouched pages
@@ -33,20 +100,59 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
     if (p == MAP_FAILED) return false;
     if (p != (void *)(uintptr_t)lo) { munmap(p, hi - lo); return false; }  // (kernels before 4.17: just a hint)
+    linux_watch_register(lo, hi);
     return true;
 }
 
 // Fresh zero pages over the whole window (the old ones are released at once).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
-    return mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
-                -1, 0) == (void *)(uintptr_t)lo;
+    bool ok = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
+                   -1, 0) == (void *)(uintptr_t)lo;
+    if (ok) linux_watch_register(lo, hi);
+    return ok;
 }
 
 void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 
-int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {  // (no write tracking)
-    (void)addr; (void)size; (void)pages; (void)max; (void)page;
-    return -1;
+int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
+    if (!g_watch_ready || g_pmfd < 0 || !size || max <= 0) return -1;
+    uint64_t end = addr + size;
+    if (end < addr) return -1;
+    bool in_alias = (addr >= ALIAS_BASE && end <= ALIAS_BASE + ALIAS_SIZE);
+    bool in_heap = (addr >= HEAP_BASE && end <= HEAP_BASE + HEAP_MAX);
+    if (!in_alias && !in_heap) return -1;
+    uint64_t lo = addr & ~4095ull;
+    uint64_t hi = (end + 4095ull) & ~4095ull;
+    if (page) *page = 4096;
+
+    int total = 0;
+    uint64_t cur = lo;
+    struct page_region regs[256];
+    while (cur < hi) {
+        struct pm_scan_arg arg = {0};
+        arg.size = sizeof arg;
+        arg.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+        arg.start = cur;
+        arg.end = hi;
+        arg.vec = (uint64_t)(uintptr_t)regs;
+        arg.vec_len = 256;
+        arg.category_mask = PAGE_IS_WRITTEN;
+        arg.return_mask = PAGE_IS_WRITTEN;
+        int n = ioctl(g_pmfd, PAGEMAP_SCAN, &arg);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        for (int i = 0; i < n && total < max; i++) {
+            for (uint64_t p = regs[i].start; p < regs[i].end && total < max; p += 4096) {
+                if (pages) pages[total] = p;
+                total++;
+            }
+        }
+        if (arg.walk_end <= cur || arg.walk_end >= hi) break;
+        cur = arg.walk_end;
+    }
+    return total;
 }
 
 int plat_protect(uint64_t addr, uint64_t size, int prot) {
@@ -82,7 +188,7 @@ void plat_thread_realtime(uint64_t period_ns) {
 static char g_log_path[1024];
 
 static void log_to_file_without_terminal(void) {
-    if (isatty(STDERR_FILENO)) return;
+    if (isatty(STDERR_FILENO) || getenv("LARECOMP_STDIO")) return;
     char dir[900];
     const char *env = getenv("LARECOMP_DATA_ROOT"), *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
     struct stat st;

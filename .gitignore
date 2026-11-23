@@ -16,6 +16,7 @@ extracted/
 generated/
 save/
 cache/
+.cache/
 *.log
 *.key
 *.pem

@@ -94,6 +94,8 @@ typedef struct {
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     bool local_dynamic_store;
+    bool preserve_killed_helpers, uses_demote;
+    uint32_t helper_exit_pc;
     unsigned local_words; // highest statically writable local word + 1
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
     // (LARECOMP_SHADER_STATS) what the emitted instructions do, in total and inside loops (see emit_counted)
@@ -1199,6 +1201,30 @@ static uint64_t replace_word(uint64_t w) {
     return w;
 }
 
+// Some fragment shaders clear their outputs and exit under the same predicate
+// as KIL. Keep those lanes as helpers through the following texture samples.
+static uint32_t killed_helper_exit(const Ctx *c, uint64_t kill, uint32_t pc) {
+    unsigned predicate = (unsigned)bits(kill, 16, 4);
+    if ((predicate & 7) == PT || (kill & ~0x00000000000f0000ull) != 0xe33000000000000full) return 0;
+
+    const uint64_t *code = (const uint64_t *)c->code;
+    unsigned color_registers = (unsigned)__builtin_popcount(c->omap_target);
+    bool cleared_output = false;
+    for (size_t i = pc / 8 + 1; i < c->ninsts; i++) {
+        if (!(i % 4)) continue;  // scheduling word
+        uint64_t w = code[i];
+        if (c->branch_labels[i] || bits(w, 16, 4) != predicate) break;
+        if ((w & ~0x00000000000f0000ull) == 0xe30000000000000full)
+            return cleared_output ? (uint32_t)(i * 8) : 0;
+        // MOV Rcolor, RZ cannot change the predicate or branch to another block.
+        if ((w & ~0x00000000000f00ffull) != 0x5c9807800ff00000ull ||
+            bits(w, 0, 8) >= color_registers)
+            break;
+        cleared_output = true;
+    }
+    return 0;
+}
+
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     w = replace_word(w);
     char t[2048], u[2048];
@@ -1214,6 +1240,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         pr = PT;
         prn = false;
     }
+    // The same predicate already demoted these lanes, so ending them here only
+    // disrupts quad derivatives in the surviving lanes.
+    if (c->helper_exit_pc && c->helper_exit_pc == pc) return;
+
     bool guarded = !(pr == PT && !prn);
     if (pr == PT && prn) return;  // @!pt: never executes
     if (guarded) sp(&c->body, "  if (%s) {\n", P(pr, prn));
@@ -1225,7 +1255,15 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         c->info->uses_discard = true;
         if (getenv("LARECOMP_NO_DISCARD")) {
         } else if (!c->glsl) sp(&c->body, "    discard_fragment();\n");
-        else if (c->stage == STAGE_FRAGMENT) sp(&c->body, "    discard;\n");
+        else if (c->stage == STAGE_FRAGMENT) {
+            c->helper_exit_pc = c->preserve_killed_helpers ? killed_helper_exit(c, w, pc) : 0;
+            if (c->helper_exit_pc) {
+                c->uses_demote = true;
+                sp(&c->body, "    demote;\n");
+            } else {
+                sp(&c->body, "    discard;\n");
+            }
+        }
         else sp(&c->body, "    /* kil */\n");  // GLSL has discard in fragment shaders only
     } else if (OPM(0xe240000000000000ull, 0xfff0000000000020ull)) {  // BRA
         uint32_t target = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
@@ -2487,6 +2525,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};
     sp(&s, "%s", glsl_prelude);
+    if (c->uses_demote) sp(&s, "#extension GL_EXT_demote_to_helper_invocation : require\n");
     bool native_half = getenv("FE3H_NATIVE_HALF") && (stage == STAGE_FRAGMENT || stage == STAGE_COMPUTE);
     sp(&s, "%s%s", native_half ? glsl_h2f_native : getenv("FE3H_BRANCHLESS_HALF") ? glsl_h2f_branchless : glsl_h2f_exact, glsl_prelude_half);
     if (maxwell_glsl_denorm_preserve)  // (the declaration only brings in the DenormPreserve capability)
@@ -2960,6 +2999,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         memset(c->st_insns, 0, sizeof c->st_insns); memset(c->st_cat, 0, sizeof c->st_cat); c->st_branches = 0;
     }
     c->branchy = any_branch;
+    c->preserve_killed_helpers = c->glsl && stage == STAGE_FRAGMENT;
     c->bar_split = any_branch && c->glsl && stage == STAGE_COMPUTE && !getenv("LARECOMP_NO_BAR_SPLIT");
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;

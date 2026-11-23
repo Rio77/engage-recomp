@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "vk.h"
+#include "../../guest_mem.h"
 #include "../astc.h"
 #include "../renderer.h"
 #include "../texpatch.h"
@@ -477,6 +478,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
     }
     vk_collect_dead();
     b = calloc(1, sizeof *b);
+    b->created_frame = vk_frame_counter();
     b->scalable = tex_scalable(t);
     create_image(t, b);
     t->backend = b;
@@ -484,26 +486,38 @@ static TexBackend *tex_backend(NvnTexture *t) {
     return b;
 }
 
+static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
+
 void backend_texture_destroyed(NvnTexture *t) {
+    if (!t) return;
+    extern void vk_backend_lock(void);
+    extern void vk_backend_unlock(void);
+    vk_backend_lock();
     TexBackend *b = t->backend;
     if (b) {
         extern void vk_alias_texture_destroyed(NvnTexture *t);  // (exec.c copy aliases: a source's contents handed over)
         vk_alias_texture_destroyed(t);
         live_remove(b);
         destroy_image(b);
+        pthread_mutex_lock(&pending_lock);
         free(b->pending_rgba);
+        b->pending_rgba = NULL;
+        pthread_mutex_unlock(&pending_lock);
         free(b);
     }
     t->backend = NULL;
+    vk_backend_unlock();
 }
 
 // Reboot (device.c backend_reset; GPU idle): every game texture and its views go.
+static void vk_sampler_cache_reset(void);
 void vk_textures_reset(void) {
     int n = g_nlive;
     extern void vk_alias_reset(void);
     vk_alias_reset();
     while (g_nlive > 0) backend_texture_destroyed(g_live[g_nlive - 1]);
     vk_collect_dead();
+    vk_sampler_cache_reset();
     LOG("[vk] reboot: %d textures released\n", n);
 }
 
@@ -535,8 +549,6 @@ static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
     return h ^ n;
 }
 
-static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
-
 static void upload_pending(TexBackend *b) {
     pthread_mutex_lock(&pending_lock);
     void *px = b->pending_rgba;
@@ -559,12 +571,19 @@ uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, 
 static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!t->addr || t->target == 10) return;
     uint64_t frame = vk_frame_counter();
-    if (b->uploaded && b->checked_frame == frame) return;
-    if (b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7)) return;
+    bool cpu_dirty = __atomic_exchange_n(&b->cpu_dirty, 0, __ATOMIC_ACQ_REL) != 0;
+    if (cpu_dirty && b->uploaded) b->dynamic = true;
+    if (!cpu_dirty && b->uploaded && b->checked_frame == frame) return;
+    // Newly created textures (first 16 frames) are checked every frame so streaming planes
+    // (e.g. NV12 Y and UV) promote to dynamic in lockstep instead of desyncing across & 7 slots.
+    if (!cpu_dirty && b->uploaded && !b->dynamic && (frame - b->created_frame >= 16) &&
+        ((frame + ((uintptr_t)b >> 6)) & 7)) return;
     const FormatInfo *fi = t->layout.fmt;
     if (!fi || !fi->bpb) return;
     VkFmt mf = fmt_of(t->format);
-    uint64_t total = tegra_total_size(&t->layout);
+    bool linear = (t->flags & 0x10) != 0;
+    uint64_t total = (linear && t->stride) ? t->stride * t->height : tegra_total_size(&t->layout);
+    if (!total || guest_mem_validate_range(t->addr, total, 1, GMEM_PERM_R) != GMEM_OK) return;
     b->checked_frame = frame;
     prof_tex_checks++;
     if (t->flags & 0x10) b->dynamic = true;
@@ -573,60 +592,100 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     static int always_full = -1;
     if (always_full < 0) always_full = getenv("LARECOMP_TEX_FULLHASH") ? 1 : 0;
     bool full = b->dynamic || !b->uploaded || always_full;
-    bool periodic = frame - b->full_frame >= 120 && full_hash_budget >= total;  // (safety net: a full hash now and then)
-    if (!full && periodic) { full = true; full_hash_budget -= total; }
     if (!b->tp) b->tp = texpatch_identify(t) + 1;  // (button prompts / Hero Mode icon: re-uploaded when their look changes)
     bool restyle = b->tp > 0 && b->uploaded && b->tp_gen != texpatch_generation();
     // The OS's page write tracking (exec.c vk_pages_changed, shared with the vertex cache): texture memory the CPU
-    // hasn't written since the last check is not hashed at all (dynamic textures were fully hashed every frame,
-    // ~2.4 MB a frame in the overworld). The periodic full hash stays as a safety net. LARECOMP_VK_TEX_WATCH=0: off.
+    // hasn't written since the last check is not hashed or re-uploaded at all. LARECOMP_VK_TEX_WATCH=0: off.
     static int watch = -1;
     if (watch < 0) { const char *e = getenv("LARECOMP_VK_TEX_WATCH"); watch = !e || atoi(e) != 0; }
+    int watch_ch = -1;
     if (watch && !always_full) {
         extern int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
         uint32_t now = 0;
-        int ch = vk_pages_changed(t->addr, total, b->wgen, &now);
-        if (ch >= 0) {
+        watch_ch = vk_pages_changed(t->addr, total, b->wgen, &now);
+        if (watch_ch >= 0) {
             b->wgen = now;
-            if (!ch && b->uploaded && !restyle) {
-                if (!periodic) { prof_tex_watch_skips++; return; }
-                if (b->dynamic) full_hash_budget -= total;  // (the others took theirs above)
+            if (!watch_ch && b->uploaded && !restyle) {
+                b->full_frame = frame;
+                prof_tex_watch_skips++;
+                return;
             }
         }
     }
-    if (!full && !restyle) {
-        prof_tex_samples++;
-        uint64_t sh = fnv_sample(mem, total);
-        if (sh == b->sample_hash) return;
+    static int watch_legacy = -1;
+    if (watch_legacy < 0) watch_legacy = getenv("ENGAGE_TEX_WATCH_LEGACY") ? 1 : 0;
+    // When OS page-write tracking proves CPU wrote to texture pages (watch_ch == 1),
+    // never short-circuit on sparse 4 KB sample hashing.
+    bool page_written = (watch_ch > 0) && !watch_legacy;
+    bool periodic = (watch_ch < 0) && (frame - b->full_frame >= 120) && (full_hash_budget >= total);
+    if (!full && (periodic || page_written)) {
+        full = true;
+        if (periodic) full_hash_budget -= total;
     }
-    prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
-    uint64_t h = hash_full(mem, total);
-    b->full_frame = frame;
-    b->sample_hash = fnv_sample(mem, total);
-    if (b->uploaded && h == b->data_hash && !restyle) return;
-    if (b->uploaded && h != b->data_hash) b->dynamic = true;
-    if (b->tp > 0) b->tp_gen = texpatch_generation();
-    b->data_hash = h;
-    b->uploaded = true;
+    if (!b->uploaded && !b->dynamic && watch && watch_ch >= 0 && !always_full) {
+        // First mandatory upload of a static texture with page-write tracking active:
+        // capture only the 4 KB sample hash now instead of full-hashing 600-1000 MB on scene entry.
+        b->full_frame = frame;
+        b->sample_hash = fnv_sample(mem, total);
+        b->data_hash = 0;
+        if (b->tp > 0) b->tp_gen = texpatch_generation();
+        b->uploaded = true;
+    } else {
+        uint64_t prev_sample = b->sample_hash;
+        if (!full && !restyle && !page_written) {
+            prof_tex_samples++;
+            uint64_t sh = fnv_sample(mem, total);
+            if (sh == prev_sample) return;
+        }
+        prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
+        uint64_t h = hash_full(mem, total);
+        if (!h) h = 1;
+        uint64_t sh = fnv_sample(mem, total);
+        b->full_frame = frame;
+        b->sample_hash = sh;
+        if (b->uploaded && !restyle) {
+            if (b->data_hash) {
+                if (h == b->data_hash) return;
+                b->dynamic = true;
+            } else if (!page_written && sh == prev_sample) {
+                // First full hash after deferred watch-only upload (periodic check, no dirty page reported):
+                // sample unchanged -> record hash, skip re-upload.
+                b->data_hash = h;
+                return;
+            } else {
+                b->dynamic = true;
+            }
+        }
+        if (b->tp > 0) b->tp_gen = texpatch_generation();
+        b->data_hash = h;
+        b->uploaded = true;
+    }
     if (b->format != mf.vf && !b->astc_bw) return;  // unsupported format: nothing sensible to copy
     VkCommandBuffer cb = vk_upload_cmd();
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     if (layers > b->layers && b->depth == 1) layers = b->layers;
     uint64_t layer_size = tegra_layer_size(&t->layout);
-    bool linear = (t->flags & 0x10) != 0;
     uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
+    static uint8_t *astc_scratch;
+    static size_t astc_scratch_cap;
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
             if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
-                uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * 16);
+                size_t blk_bytes = (size_t)l.wb * l.hb * 16;
+                if (blk_bytes > astc_scratch_cap) {
+                    uint8_t *nb = realloc(astc_scratch, blk_bytes);
+                    if (!nb) return;
+                    astc_scratch = nb;
+                    astc_scratch_cap = blk_bytes;
+                }
+                uint8_t *blocks = astc_scratch;
                 if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
                 else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
                 if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * 16);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
                 astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
-                free(blocks);
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
                                         .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
@@ -676,11 +735,15 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     TexBackend *b = tex_backend(t);
     if (b->pending_rgba) upload_pending(b);
     if (for_render) b->gpu_owned = true;
-    else if (!b->gpu_owned) {
-        extern uint64_t prof_up_ns;
-        uint64_t t0 = prof_up_ns != ~0ull ? SDL_GetTicksNS() : 0;
-        upload_texture(t, b);
-        if (prof_up_ns != ~0ull) prof_up_ns += SDL_GetTicksNS() - t0;
+    else {
+        if (b->gpu_owned && __atomic_load_n(&b->cpu_dirty, __ATOMIC_ACQUIRE))
+            b->gpu_owned = false;
+        if (!b->gpu_owned) {
+            extern uint64_t prof_up_ns;
+            uint64_t t0 = prof_up_ns != ~0ull ? SDL_GetTicksNS() : 0;
+            upload_texture(t, b);
+            if (prof_up_ns != ~0ull) prof_up_ns += SDL_GetTicksNS() - t0;
+        }
     }
     return b;
 }
@@ -688,19 +751,43 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
 void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
+void backend_texture_written(NvnTexture *t) {
+    if (!t) return;
+    extern void vk_backend_lock(void);
+    extern void vk_backend_unlock(void);
+    vk_backend_lock();
+    TexBackend *b = t->backend;
+    if (b) __atomic_store_n(&b->cpu_dirty, 1, __ATOMIC_RELEASE);
+    vk_backend_unlock();
+}
 
 // Host-produced texel data (decoded video, any thread): applied on the render thread at the texture's next use.
+// Lock order strictly matches backend_texture_destroyed(): vk_backend_lock -> pending_lock.
 void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride) {
-    TexBackend *b = t->backend;
-    if (!b) return;  // the game binds the texture before decoding into it; first frames may arrive earlier
+    if (!t || !rgba || !w || !h || !stride) return;
     void *copy = malloc((size_t)stride * h);
+    if (!copy) return;
     memcpy(copy, rgba, (size_t)stride * h);
+    extern void vk_backend_lock(void);
+    extern void vk_backend_unlock(void);
+    vk_backend_lock();
+    TexBackend *b = t->backend;
+    // Phase 7 (Bug #1): if movie.c decodes video frames before the first GPU draw binds this live texture,
+    // create its TexBackend immediately under vk_backend_lock() rather than dropping frames.
+    if (!b && !atomic_load_explicit(&t->finalized, memory_order_acquire) && t->width && t->height)
+        b = tex_backend(t);
+    if (!b) {
+        vk_backend_unlock();
+        free(copy);
+        return;
+    }
     pthread_mutex_lock(&pending_lock);
     free(b->pending_rgba);
     b->pending_rgba = copy;
     b->pending_w = w; b->pending_h = h; b->pending_stride = stride;
     b->gpu_owned = true;
     pthread_mutex_unlock(&pending_lock);
+    vk_backend_unlock();
 }
 
 // ================================================================== views
@@ -881,8 +968,38 @@ static VkCompareOp compare_op(uint32_t f) {
     }
 }
 
+typedef struct {
+    NvnSamplerDesc key;
+    VkSampler smp;
+    bool used;
+} SamplerCacheEntry;
+#define SMP_CACHE_CAP 512
+static SamplerCacheEntry g_smp_cache[SMP_CACHE_CAP];
+
+static void vk_sampler_cache_reset(void) {
+    for (int i = 0; i < SMP_CACHE_CAP; i++) {
+        if (g_smp_cache[i].used && g_smp_cache[i].smp) {
+            vkDestroySampler(g_vk.dev, g_smp_cache[i].smp, NULL);
+        }
+    }
+    memset(g_smp_cache, 0, sizeof g_smp_cache);
+}
+
 VkSampler vk_sampler(NvnSamplerDesc *d) {
     if (d->backend) return (VkSampler)d->backend;
+    size_t ksz = offsetof(NvnSamplerDesc, backend);
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    const uint32_t *w = (const uint32_t *)d;
+    for (size_t i = 0; i < ksz / 4; i++) h = (h ^ w[i]) * 0x100000001B3ull;
+    uint32_t mask = SMP_CACHE_CAP - 1;
+    for (uint32_t p = 0; p < SMP_CACHE_CAP; p++) {
+        SamplerCacheEntry *e = &g_smp_cache[(h + p) & mask];
+        if (!e->used) break;
+        if (memcmp(&e->key, d, ksz) == 0) {
+            d->backend = (void *)e->smp;
+            return e->smp;
+        }
+    }
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = d->mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     uint32_t mf = d->min_filter;
@@ -931,6 +1048,16 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
     }
     VkSampler s;
     VK_CHECK(vkCreateSampler(g_vk.dev, &si, NULL, &s));
+    for (uint32_t p = 0; p < SMP_CACHE_CAP; p++) {
+        SamplerCacheEntry *e = &g_smp_cache[(h + p) & mask];
+        if (!e->used) {
+            e->key = *d;
+            e->key.backend = NULL;
+            e->smp = s;
+            e->used = true;
+            break;
+        }
+    }
     d->backend = (void *)s;
     return s;
 }

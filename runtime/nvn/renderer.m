@@ -1293,8 +1293,7 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
         }
         if (k == 1) {  // compiler constants stored after the shader code
             NvnShaderStage *ss = &st.program->stages[stage];
-            uint64_t size = ss->const_size ? ss->const_size : 16;
-            if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
+            uint64_t size = ss->const_size ? ss->const_size : (si->cbuf_size[1] ? si->cbuf_size[1] : 16);
             uint64_t off = ring_alloc((void *)(uintptr_t)(ss->code_addr + ss->const_offset), size);
             if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:1];
             else [enc setFragmentBuffer:ring offset:off atIndex:1];
@@ -1390,8 +1389,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
             off = ring_alloc(drv, sizeof drv);
         } else if (k == 1) {
             NvnShaderStage *ss = &st.program->stages[5];
-            uint64_t size = ss->const_size ? ss->const_size : 16;
-            if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
+            uint64_t size = ss->const_size ? ss->const_size : (si->cbuf_size[1] ? si->cbuf_size[1] : 16);
             off = ring_alloc((void *)(uintptr_t)(ss->code_addr + ss->const_offset), size);
         } else {
             int idx = k - cbuf_base;

@@ -1,4 +1,64 @@
-# Engage Recomp 0.1.0 validation
+# Engage Recomp validation
+
+## 0.2.0
+
+- Steam Deck Desktop Mode, Engage 2.0.0. The general Maxwell correction kept
+  the grass tone stable during a physical and a magic attack. The tester
+  reported no recurrence of the graphical artifacts seen in the earlier
+  candidate. The complete-frame run recorded zero skipped draws.
+- Steam Deck Gaming Mode, launched through Steam under Gamescope. The tester
+  confirmed the grass stayed correctly lit. Runtime metrics logged zero
+  skipped draws in the test session. A subsequent test of the shutdown
+  synchronization returned to Steam with exit status 0 after closing from
+  the in-game menu.
+- The packaged runtime played S01F.webm in Desktop Mode using the existing
+  working test library. Capture 1550 showed the cinematic in color, with zero
+  skipped draws or NVN diagnostics in that session.
+- Native regression suite and ASan, UBSan and TSan targets passed in the
+  Linux build container, including the deterministic Maxwell regression and
+  the lifecycle stress test.
+- The Maxwell regression test checks the conditional discard, output clear
+  and exit pattern, preserving behavior for unmatched sequences. The launcher
+  regression test checks complete-frame rendering by default and the explicit
+  opt-out.
+- Python suite: 26 passed in the build container. On SteamOS, 24 passed and
+  two platform-dependent tests were skipped.
+
+### Initial clean installation on Steam Deck
+
+- The installer activated version 0.2.0 after a fresh build from Engage 2.0.0
+  ExeFS and RomFS. It generated and built 1,408 units at -O1 with five workers.
+  Generation, compilation and link took 42 min 23 s. Copying the input,
+  building the library and preparing shaders took 48 min 32 s in total.
+- The packaged installer then updated the same isolated installation to the
+  final AppImage in 4 min 59 s. It reused the generated game library, whose
+  SHA-256 was unchanged. Both installed version metadata and shader
+  preparation metadata matched the final AppImage's SHA-256.
+- The offline shader run completed in 213 s. It recorded 4,711 successful
+  pipeline preparations, one pipeline failure, 134 translation failures
+  and zero SPIR-V compilation failures. These counts describe the offline
+  inventory. Runtime smoke tests cover the resources used by the scenes
+  they exercise.
+
+- The first fresh library failed at boot because the compiled local dispatch
+  omitted a valid target from an inferred jump table. The generator now keeps
+  the local fallback for inferred jump tables. A synthetic test covers the
+  missing-target case, while exception-only dispatch still uses exact targets.
+
+### Clean installation with the corrected generator
+
+- The exact release kit installed from a fresh directory in 47 min 23 s.
+  Zig compiled 1,464 units at -O1 with five workers. Generation took
+  5 min 35 s, C compilation 36 min 13 s and linking 10 s. Offline shader
+  preparation took 2 min 52 s. The installed app and shader-preparation
+  records match the distributed AppImage's SHA-256.
+- The installed launcher reached and played S01.webm in Steam Deck Desktop
+  Mode, past the original missing-branch failure. The smoke run reached frame
+  2,400 with zero skipped draws or NVN diagnostics and exited with code 0.
+  Gaming Mode testing from the newly generated installation remains a
+  separate manual check.
+
+## 0.1.0 validation
 
 This is an experimental Linux x86-64 / Steam Deck release. Tests used a Steam
 Deck LCD, SteamOS, a 15 W power limit and a private Engage 2.0.0 dump. Test saves,

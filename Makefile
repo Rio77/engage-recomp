@@ -127,7 +127,7 @@ $(B)/obj/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS)
 	@mkdir -p $(dir $@)
 	$(CC) $(GENFLAGS) -DGAMELIB_ID='"$(GAMELIB_ID)"' -c $< -o $@
 # the shader translator's id: cached translations (cache/xlat, runtime/nvn/vulkan/exec.c) from another one aren't used
-TRANSLATOR_ID := $(shell cat runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h runtime/nvn/maxwell/scf*.[ch] | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+TRANSLATOR_ID := $(shell LC_ALL=C cat runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h runtime/nvn/maxwell/scf*.[ch] | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 $(B)/rt/nvn/vulkan/exec.o: runtime/nvn/maxwell/translate.c $(wildcard runtime/nvn/maxwell/scf*.[ch])
 $(B)/rt/nvn/vulkan/exec.o: RTFLAGS += -DTRANSLATOR_ID='"$(TRANSLATOR_ID)"'
 $(B)/rt/gamelib.o: $(GAMELIB_SRCS)
@@ -327,7 +327,63 @@ appimages:
 smoketest:
 	tools/linux/smoketest.sh
 
-.PHONY: dmg all gen gen-main gen-helper gen-objs runtime-objs deps deps-windows app dist rando-helper appimage appimages smoketest
+.PHONY: dmg all gen gen-main gen-helper gen-objs runtime-objs deps deps-windows app dist rando-helper appimage appimages smoketest test-nvn test-nvn-sanitizers
+
+NVN_TEST_PHASE ?= 5
+NVN_TEST_CFLAGS := -O2 -g -fno-strict-aliasing -ffunction-sections -fdata-sections -Iruntime -Iruntime/nvn $(OSFLAGS) -DNVN_TEST_PHASE=$(NVN_TEST_PHASE)
+NVN_SAN_LD ?= gcc
+NVN_ASAN_FLAGS := -O1 -g -fno-strict-aliasing -ffunction-sections -fdata-sections -fsanitize=address,undefined -fno-sanitize=function -fno-sanitize-recover=all -Iruntime -Iruntime/nvn -Wno-format -DNVN_TEST_PHASE=$(NVN_TEST_PHASE)
+NVN_TSAN_FLAGS := -O1 -g -fno-strict-aliasing -ffunction-sections -fdata-sections -fsanitize=thread -mllvm -tsan-instrument-memintrinsics=false -Iruntime -Iruntime/nvn -Wno-format -DNVN_TEST_PHASE=$(NVN_TEST_PHASE)
+
+test-nvn:
+	@mkdir -p $(B)/nvn-tests
+	$(CC) $(NVN_TEST_CFLAGS) tools/test_guest_mem.c runtime/guest_mem.c -Wl,--gc-sections -pthread -o $(B)/nvn-tests/test_guest_mem
+	$(CC) $(NVN_TEST_CFLAGS) tools/test_nvn_diag.c runtime/nvn/diag.c -Wl,--gc-sections -pthread -o $(B)/nvn-tests/test_nvn_diag
+	$(CC) $(NVN_TEST_CFLAGS) tools/test_nvn_abi.c tools/test_nvn_abi_cmdbuf.c runtime/guest_mem.c runtime/nvn/diag.c runtime/nvn/formats.c runtime/nvn/tegra.c -Wl,--gc-sections -pthread -lm -o $(B)/nvn-tests/test_nvn_abi
+	$(CC) $(NVN_TEST_CFLAGS) tools/test_nvn_lifecycle.c runtime/guest_mem.c runtime/nvn/diag.c runtime/nvn/formats.c runtime/nvn/tegra.c -Wl,--gc-sections -pthread -lm -o $(B)/nvn-tests/test_nvn_lifecycle
+	$(CC) $(NVN_TEST_CFLAGS) tools/test_texture_identity.c runtime/guest_mem.c runtime/nvn/diag.c -Wl,--gc-sections -pthread -lm -o $(B)/nvn-tests/test_texture_identity
+	$(CC) $(NVN_TEST_CFLAGS) tools/fuzz_nvn_lifecycle.c runtime/guest_mem.c runtime/nvn/diag.c runtime/nvn/formats.c runtime/nvn/tegra.c -Wl,--gc-sections -pthread -lm -o $(B)/nvn-tests/fuzz_nvn_lifecycle
+	$(CC) $(NVN_TEST_CFLAGS) tools/test_nvn_stress_threads.c runtime/guest_mem.c runtime/nvn/diag.c runtime/nvn/formats.c runtime/nvn/tegra.c -Wl,--gc-sections -pthread -lm -o $(B)/nvn-tests/test_nvn_stress_threads
+	$(B)/nvn-tests/test_guest_mem
+	$(B)/nvn-tests/test_nvn_diag
+	$(B)/nvn-tests/test_nvn_abi
+	$(B)/nvn-tests/test_nvn_lifecycle
+	$(B)/nvn-tests/test_texture_identity
+	$(B)/nvn-tests/fuzz_nvn_lifecycle
+	$(B)/nvn-tests/test_nvn_stress_threads
+
+test-nvn-sanitizers:
+	@mkdir -p $(B)/nvn-san
+	$(CC) $(NVN_ASAN_FLAGS) -c runtime/guest_mem.c -o $(B)/nvn-san/guest_mem.o
+	$(CC) $(NVN_ASAN_FLAGS) -c runtime/nvn/diag.c -o $(B)/nvn-san/diag.o
+	$(CC) $(NVN_ASAN_FLAGS) -c runtime/nvn/formats.c -o $(B)/nvn-san/formats.o
+	$(CC) $(NVN_ASAN_FLAGS) -c runtime/nvn/tegra.c -o $(B)/nvn-san/tegra.o
+	$(CC) $(NVN_ASAN_FLAGS) -c tools/test_guest_mem.c -o $(B)/nvn-san/test_guest_mem.o
+	$(CC) $(NVN_ASAN_FLAGS) -c tools/test_nvn_diag.c -o $(B)/nvn-san/test_nvn_diag.o
+	$(CC) $(NVN_ASAN_FLAGS) -c tools/test_nvn_abi.c -o $(B)/nvn-san/test_nvn_abi.o
+	$(CC) $(NVN_ASAN_FLAGS) -c tools/test_nvn_abi_cmdbuf.c -o $(B)/nvn-san/test_nvn_abi_cmdbuf.o
+	$(CC) $(NVN_ASAN_FLAGS) -c tools/test_nvn_lifecycle.c -o $(B)/nvn-san/test_nvn_lifecycle.o
+	$(CC) $(NVN_ASAN_FLAGS) -c tools/test_texture_identity.c -o $(B)/nvn-san/test_texture_identity.o
+	$(CC) $(NVN_ASAN_FLAGS) -c tools/fuzz_nvn_lifecycle.c -o $(B)/nvn-san/fuzz_nvn_lifecycle.o
+	$(NVN_SAN_LD) -fsanitize=address,undefined -Wl,--gc-sections $(B)/nvn-san/test_guest_mem.o $(B)/nvn-san/guest_mem.o -pthread -o $(B)/nvn-san/test_guest_mem_asan
+	$(NVN_SAN_LD) -fsanitize=address,undefined -Wl,--gc-sections $(B)/nvn-san/test_nvn_diag.o $(B)/nvn-san/diag.o -pthread -o $(B)/nvn-san/test_nvn_diag_asan
+	$(NVN_SAN_LD) -fsanitize=address,undefined -Wl,--gc-sections $(B)/nvn-san/test_nvn_abi.o $(B)/nvn-san/test_nvn_abi_cmdbuf.o $(B)/nvn-san/guest_mem.o $(B)/nvn-san/diag.o $(B)/nvn-san/formats.o $(B)/nvn-san/tegra.o -pthread -lm -o $(B)/nvn-san/test_nvn_abi_asan
+	$(NVN_SAN_LD) -fsanitize=address,undefined -Wl,--gc-sections $(B)/nvn-san/test_nvn_lifecycle.o $(B)/nvn-san/guest_mem.o $(B)/nvn-san/diag.o $(B)/nvn-san/formats.o $(B)/nvn-san/tegra.o -pthread -lm -o $(B)/nvn-san/test_nvn_lifecycle_asan
+	$(NVN_SAN_LD) -fsanitize=address,undefined -Wl,--gc-sections $(B)/nvn-san/test_texture_identity.o $(B)/nvn-san/guest_mem.o $(B)/nvn-san/diag.o -pthread -lm -o $(B)/nvn-san/test_texture_identity_asan
+	$(NVN_SAN_LD) -fsanitize=address,undefined -Wl,--gc-sections $(B)/nvn-san/fuzz_nvn_lifecycle.o $(B)/nvn-san/guest_mem.o $(B)/nvn-san/diag.o $(B)/nvn-san/formats.o $(B)/nvn-san/tegra.o -pthread -lm -o $(B)/nvn-san/fuzz_nvn_lifecycle_asan
+	$(CC) $(NVN_TSAN_FLAGS) -c runtime/guest_mem.c -o $(B)/nvn-san/guest_mem_tsan.o
+	$(CC) $(NVN_TSAN_FLAGS) -c runtime/nvn/diag.c -o $(B)/nvn-san/diag_tsan.o
+	$(CC) $(NVN_TSAN_FLAGS) -c runtime/nvn/formats.c -o $(B)/nvn-san/formats_tsan.o
+	$(CC) $(NVN_TSAN_FLAGS) -c runtime/nvn/tegra.c -o $(B)/nvn-san/tegra_tsan.o
+	$(CC) $(NVN_TSAN_FLAGS) -c tools/test_nvn_stress_threads.c -o $(B)/nvn-san/test_nvn_stress_threads_tsan.o
+	$(NVN_SAN_LD) -fsanitize=thread -Wl,--gc-sections $(B)/nvn-san/test_nvn_stress_threads_tsan.o $(B)/nvn-san/guest_mem_tsan.o $(B)/nvn-san/diag_tsan.o $(B)/nvn-san/formats_tsan.o $(B)/nvn-san/tegra_tsan.o -pthread -lm -o $(B)/nvn-san/test_nvn_stress_threads_tsan
+	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 $(B)/nvn-san/test_guest_mem_asan
+	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 $(B)/nvn-san/test_nvn_diag_asan
+	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 $(B)/nvn-san/test_nvn_abi_asan
+	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 $(B)/nvn-san/test_nvn_lifecycle_asan
+	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 $(B)/nvn-san/test_texture_identity_asan
+	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 NVN_FUZZ_ITERS=100000 $(B)/nvn-san/fuzz_nvn_lifecycle_asan
+	TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 $(B)/nvn-san/test_nvn_stress_threads_tsan
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c

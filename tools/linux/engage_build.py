@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import struct
 import re
+import time
 
 def verify_library(path):
     """Reject accidentally incomplete guest linkage without external binutils."""
@@ -38,15 +39,19 @@ def build(bundle: Path, workspace: Path, exefs: Path):
     environment = dict(os.environ, LARECOMP_CHEATS=os.devnull,
         ZIG_GLOBAL_CACHE_DIR=str(workspace / 'zig-cache/global'),
         ZIG_LOCAL_CACHE_DIR=str(workspace / 'zig-cache/local'))
+    resume = os.environ.get('ENGAGE_GAMELIB_RESUME', '0').strip() not in ('', '0', 'false', 'no')
     compiler = [str(bundle / 'zig/zig'), 'cc', '-target', 'x86_64-linux-gnu',
         '-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label',
         '-fvisibility=hidden', '-mcpu=x86_64_v3', '-fPIC', '-I' + str(source)]
     # Check the shipped compiler before spending time on the full translation.
+    t_start = time.monotonic()
     probe = workspace / 'compiler-probe.c'
     probe.write_text('#include "cpu.h"\nint engage_compiler_probe(void) { return sizeof(Cpu)>0; }\n')
     subprocess.run(compiler + ['-c', str(probe), '-o', str(workspace / 'compiler-probe.o')], env=environment, check=True)
-    subprocess.run([str(bundle / 'engagegen/engagegen'), '--workspace', str(workspace),
-        '--exefs', str(exefs), '--hle', str(source / 'hle_symbols.txt')], env=environment, check=True)
+    if not (resume and (workspace / 'generated/main').exists() and any((workspace / 'generated/main').glob('*.c'))):
+        subprocess.run([str(bundle / 'engagegen/engagegen'), '--workspace', str(workspace),
+            '--exefs', str(exefs), '--hle', str(source / 'hle_symbols.txt')], env=environment, check=True)
+    t_gen = time.monotonic()
     objects = []
     jobs = []
     for module in ('main', 'sdk', 'subsdk0'):
@@ -58,20 +63,40 @@ def build(bundle: Path, workspace: Path, exefs: Path):
     entry = workspace / 'objects/entry.o'
     jobs.append((source / 'gamelib_entry.c', entry))
     objects.append(entry)
+    # Longest Processing Time (LPT) scheduling: compile largest C units first to prevent tail stalls.
+    jobs.sort(key=lambda pair: pair[0].stat().st_size, reverse=True)
+    def pick_workers():
+        cpus = os.cpu_count() or 4
+        avail_gib = 8
+        try:
+            with open('/proc/meminfo', 'r', encoding='ascii', errors='ignore') as mf:
+                for line in mf:
+                    if line.startswith('MemAvailable:'):
+                        avail_gib = max(2, int(line.split()[1]) // (1024 * 1024))
+                        break
+        except OSError:
+            pass
+        # Each zig cc worker uses ~40-160 MB RSS; leave generous headroom for the OS.
+        return max(1, min(16, cpus, max(4, avail_gib // 2)))
+    workers = pick_workers()
+    print(f'Compiling {len(jobs)} units (-O1) with {workers} workers (gen {t_gen - t_start:.1f}s)', flush=True)
     def compile_one(pair):
         file, target = pair
+        if resume and target.exists() and target.stat().st_size > 0:
+            return
         temporary = target.with_suffix('.o.tmp')
         flags = ['-DGAMELIB_ID="engage-200-bringup"'] if target == entry else []
         print('Compiling ' + file.name, flush=True)
         subprocess.run(compiler + flags + ['-c', str(file), '-o', str(temporary)], env=environment, check=True)
         temporary.replace(target)
-    with ThreadPoolExecutor(max_workers=min(3, os.cpu_count() or 1)) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(compile_one, pair) for pair in jobs]
         try:
             for future in as_completed(futures): future.result()
         except BaseException:
             for future in futures: future.cancel()
             raise
+    t_comp = time.monotonic()
     output = workspace / 'engagegame.so'
     temporary = output.with_suffix('.so.tmp')
     response = workspace / 'objects.rsp'
@@ -81,4 +106,6 @@ def build(bundle: Path, workspace: Path, exefs: Path):
     verify_library(temporary)
     temporary.replace(output)
     output.with_suffix('.so.id').write_text('engage-200-bringup\n')
+    t_end = time.monotonic()
+    print(f'Built engagegame.so in {t_end - t_start:.1f}s (gen {t_gen - t_start:.1f}s, cc {t_comp - t_gen:.1f}s, link {t_end - t_comp:.1f}s)', flush=True)
     return output

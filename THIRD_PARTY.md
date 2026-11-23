@@ -7,7 +7,7 @@ The runtime, generator and compiler are separate components. Each keeps its own 
 | FE3H Recomp / LASRecomp code | MIT; root LICENSE retains upstream copyrights |
 | Engage timing patch sites | Valiantsin Dzerakh / engage-pc-recomp, MIT; revision in UPSTREAM.md and notice in LICENSE |
 | Command recording lifetime reference | engage-pc-recomp via MacNativeGames / d2r-mobile, jhaizhou, MIT; notice retained in LICENSE |
-| nxnative compatibility profile and HLE references | seedds, MIT; notice retained in LICENSE; source links in UPSTREAM.md |
+| nxnative compatibility profile, HLE references, and shader inventory/UnityFS reader | seedds, MIT; `dm/games/0100A6301214E000/{shader_map,shader_pairs,shader_facts,pso_manifest}.tsv`, `dm/gfx/tools/unityfs.py` and Unity/GLSLC extraction helpers (`74c9b1f`); notice retained in LICENSE; source links in UPSTREAM.md |
 | Inherited LAS randomizer source | Owen_Splat, MIT; third_party/LAS-Randomizer/LICENSE.txt; not enabled for Engage |
 | Ryujinx audio-derived reverb and auxiliary processing | MIT; third_party/ryujinx/LICENSE.txt |
 | AMD FidelityFX Super Resolution 1 retained shader helpers | MIT; third_party/fsr/LICENSE.txt; no new opt5 FSR features enabled |

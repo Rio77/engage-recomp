@@ -31,6 +31,10 @@ try:
         if remaining <= 0:
             break
         if address is None:
+            # Avoid flashing a progress dialog when prewarm finishes in under a second.
+            if time.monotonic() - started < 0.8:
+                time.sleep(0.1)
+                continue
             dialog = subprocess.run(
                 ["kdialog", "--title", "Engage Recomp", "--icon", str(Path(sys.argv[3])),
                  "--progressbar", ("Preparando gráficos conocidos…" if os.environ.get('LANG', '').startswith('es')

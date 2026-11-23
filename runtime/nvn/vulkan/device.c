@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,13 +31,36 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
     return VK_FALSE;
 }
 
+static void vk_configure_mesa_cache(void) {
+#ifdef __linux__
+    const char *ov = getenv("ENGAGE_MESA_CACHE_OVERRIDE");
+    if (ov && !strcmp(ov, "0")) return;
+    const char *dis = getenv("MESA_SHADER_CACHE_DISABLE");
+    if (dis && (!strcmp(dis, "1") || !strcmp(dis, "true"))) return;
+    const char *root = rt_data_root();
+    if (!root || !*root) return;
+    char cache_dir[1100], mesa_dir[1152];
+    snprintf(cache_dir, sizeof cache_dir, "%s/cache", root);
+    snprintf(mesa_dir, sizeof mesa_dir, "%s/cache/mesa_cache", root);
+    mkdir(cache_dir, 0755);
+    mkdir(mesa_dir, 0755);
+    setenv("MESA_SHADER_CACHE_DIR", mesa_dir, 1);
+    setenv("MESA_DISK_CACHE_SINGLE_FILE", "0", 1);
+    setenv("MESA_SHADER_CACHE_MAX_SIZE", "2G", 0);
+    LOG("[vk] mesa shader cache: %s\n", mesa_dir);
+#endif
+}
+
 // LARECOMP_VK_VALIDATION=1: Khronos validation layer (MSYS2 package vulkan-validation-layers)
-static void create_instance(void) {
-    Uint32 n_sdl = 0;
-    const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
+static bool create_instance_ex(bool headless) {
+    vk_configure_mesa_cache();
     const char *ext[16];
     uint32_t n_ext = 0;
-    for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
+    if (!headless) {
+        Uint32 n_sdl = 0;
+        const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
+        for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
+    }
     bool validate = getenv("LARECOMP_VK_VALIDATION") != NULL;
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
@@ -53,7 +77,10 @@ static void create_instance(void) {
         validate = false;
         r = vkCreateInstance(&ci, NULL, &g_vk.inst);
     }
-    if (r != VK_SUCCESS) FATAL("vkCreateInstance: %d (is a Vulkan 1.3 driver installed?)\n", r);
+    if (r != VK_SUCCESS) {
+        if (headless) { LOG("[vk] headless vkCreateInstance failed: %d\n", r); return false; }
+        FATAL("vkCreateInstance: %d (is a Vulkan 1.3 driver installed?)\n", r);
+    }
     if (validate) {
         PFN_vkCreateDebugUtilsMessengerEXT f =
             (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vk.inst, "vkCreateDebugUtilsMessengerEXT");
@@ -65,18 +92,24 @@ static void create_instance(void) {
             .pfnUserCallback = debug_cb};
         if (f) f(g_vk.inst, &mi, NULL, &messenger);
     }
+    return true;
 }
+
+static void create_instance(void) { create_instance_ex(false); }
 
 static bool has_ext(VkExtensionProperties *e, uint32_t n, const char *name) {
     for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return true;
     return false;
 }
 
-// Discrete GPU first (LARECOMP_GPU=<index> picks one), needs Vulkan 1.3 and a queue that can present.
-static void pick_device(void) {
+// Discrete GPU first (LARECOMP_GPU=<index> picks one), needs Vulkan 1.3 and a queue that can present (unless headless).
+static bool pick_device_ex(bool headless) {
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(g_vk.inst, &n, NULL);
-    if (!n) FATAL("no Vulkan device\n");
+    if (!n) {
+        if (headless) { LOG("[vk] no Vulkan device\n"); return false; }
+        FATAL("no Vulkan device\n");
+    }
     VkPhysicalDevice *pd = calloc(n, sizeof *pd);
     vkEnumeratePhysicalDevices(g_vk.inst, &n, pd);
     int want = getenv("LARECOMP_GPU") ? atoi(getenv("LARECOMP_GPU")) : -1, best = -1, best_score = -1;
@@ -90,7 +123,11 @@ static void pick_device(void) {
         if ((int)i == want) score = 100;
         if (score > best_score) { best_score = score; best = (int)i; }
     }
-    if (best < 0) FATAL("no Vulkan 1.3 device\n");
+    if (best < 0) {
+        free(pd);
+        if (headless) { LOG("[vk] no Vulkan 1.3 device\n"); return false; }
+        FATAL("no Vulkan 1.3 device\n");
+    }
     g_vk.phys = pd[best];
     free(pd);
     vkGetPhysicalDeviceProperties(g_vk.phys, &g_vk.props);
@@ -100,14 +137,20 @@ static void pick_device(void) {
     vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nq, qp);
     g_vk.qfam = UINT32_MAX;
     for (uint32_t i = 0; i < nq; i++) {
-        VkBool32 present = VK_FALSE;
-        vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &present);
+        VkBool32 present = headless ? VK_TRUE : VK_FALSE;
+        if (!headless) vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &present);
         if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present) { g_vk.qfam = i; break; }
     }
     free(qp);
-    if (g_vk.qfam == UINT32_MAX) FATAL("no graphics+present queue\n");
+    if (g_vk.qfam == UINT32_MAX) {
+        if (headless) { LOG("[vk] no graphics+compute queue\n"); return false; }
+        FATAL("no graphics+present queue\n");
+    }
     LOG("[vk] using %s\n", g_vk.props.deviceName);
+    return true;
 }
+
+static void pick_device(void) { pick_device_ex(false); }
 
 static bool g_fault_ext;
 // After VK_ERROR_DEVICE_LOST: what the driver says faulted (VK_EXT_device_fault), into the log.
@@ -135,14 +178,14 @@ void vk_device_fault_report(void) {
             (unsigned long long)vend[i].vendorFaultData);
 }
 
-static void create_device(void) {
+static bool create_device_ex(bool headless) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[16];
+    const char *ext[24];
     uint32_t n_ext = 0;
-    ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    if (!headless) ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
     g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
@@ -152,6 +195,11 @@ static void create_device(void) {
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     bool dbc_ext = has_ext(ep, ne, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
+    bool gpl_ext = has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+                   has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+                   !(getenv("LARECOMP_VK_GPL") && !atoi(getenv("LARECOMP_VK_GPL")));
+    bool dyn_vi_ext = has_ext(ep, ne, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME) &&
+                      !(getenv("ENGAGE_NO_DYN_VI") && atoi(getenv("ENGAGE_NO_DYN_VI")) != 0);
     bool placed_ext = getenv("FE3H_MANAGED_HEAP") && has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) &&
                       has_ext(ep, ne, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
@@ -168,9 +216,34 @@ static void create_device(void) {
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
-    VkPhysicalDeviceDepthBiasControlFeaturesEXT dbc_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = dbc_ext ? &dbc_have : NULL};
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT dyn_vi_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+        .pNext = dyn_vi_ext ? &dyn_vi_have : NULL};
+    VkPhysicalDeviceDepthBiasControlFeaturesEXT dbc_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT,
+        .pNext = gpl_ext ? (void *)&gpl_have : dyn_vi_ext ? (void *)&dyn_vi_have : NULL};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                      .pNext = dbc_ext ? (void *)&dbc_have : gpl_ext ? (void *)&gpl_have : dyn_vi_ext ? (void *)&dyn_vi_have : NULL};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gpl_props = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+    if (gpl_ext) {
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &gpl_props};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+    }
+    g_vk.gpl = gpl_ext && gpl_have.graphicsPipelineLibrary == VK_TRUE;
+    g_vk.gpl_fast = g_vk.gpl && gpl_props.graphicsPipelineLibraryFastLinking == VK_TRUE;
+    if (g_vk.gpl && !g_vk.gpl_fast) g_vk.gpl = false; /* only beneficial when fast-linking is supported */
+    if (g_vk.gpl) {
+        ext[n_ext++] = VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME;
+        ext[n_ext++] = VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME;
+    }
+    g_vk.dyn_vi = dyn_vi_ext && dyn_vi_have.vertexInputDynamicState == VK_TRUE;
+    if (g_vk.dyn_vi) ext[n_ext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
+    LOG("[vk] gpl: %s%s\n", g_vk.gpl ? "yes" : "no", g_vk.gpl_fast ? " (fast-link)" : "");
+    LOG("[vk] vertex input dynamic state: %s\n", g_vk.dyn_vi ? "yes" : "no");
     // Depth bias in 24-bit units on float depth (DEPTH24 formats stand in as D32 on AMD): the constant term of a float
     // depth format scales with the depth's exponent, far smaller than 2^-24 - Three Houses' outlines, pushed back by
     // bias, came through thin geometry (cloaks) as black shards
@@ -236,6 +309,14 @@ static void create_device(void) {
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_en = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+        .graphicsPipelineLibrary = VK_TRUE};
+    if (g_vk.gpl) { gpl_en.pNext = f.pNext; f.pNext = &gpl_en; }
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT dyn_vi_en = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
+        .vertexInputDynamicState = VK_TRUE};
+    if (g_vk.dyn_vi) { dyn_vi_en.pNext = f.pNext; f.pNext = &dyn_vi_en; }
     if (g_vk.bias_unorm) { dbc.pNext = f.pNext; f.pNext = &dbc; }
     if (g_vk.placed_heap) {
         placed.memoryMapRangePlaced = VK_FALSE;
@@ -270,7 +351,7 @@ static void create_device(void) {
     vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nq, NULL);
     VkQueueFamilyProperties *families = calloc(nq, sizeof *families);
     vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nq, families);
-    if (getenv("FE3H_SEPARATE_PRESENT")) {
+    if (!headless && getenv("FE3H_SEPARATE_PRESENT")) {
         if (families[g_vk.qfam].queueCount > 1) present_index = 1;
         else for (uint32_t i = 0; i < nq; i++) {
             VkBool32 supported = VK_FALSE;
@@ -287,7 +368,12 @@ static void create_device(void) {
          .queueCount = 1, .pQueuePriorities = priorities}};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = other_family ? 2 : 1,
                              .pQueueCreateInfos = qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
-    VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    if (headless) {
+        VkResult r = vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev);
+        if (r != VK_SUCCESS) { LOG("[vk] headless vkCreateDevice failed: %d\n", r); return false; }
+    } else {
+        VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    }
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
     vkGetDeviceQueue(g_vk.dev, g_vk.present_qfam, present_index, &g_vk.present_queue);
     LOG("[present-queue] graphics %u:0, present %u:%u (%s)\n", g_vk.qfam, g_vk.present_qfam, present_index,
@@ -304,6 +390,10 @@ static void create_device(void) {
     if (g_vk.bias_unorm) {
         g_vk.set_bias2 = (PFN_vkCmdSetDepthBias2EXT)vkGetDeviceProcAddr(g_vk.dev, "vkCmdSetDepthBias2EXT");
         if (!g_vk.set_bias2) g_vk.bias_unorm = false;
+    }
+    if (g_vk.dyn_vi) {
+        g_vk.set_vertex_input = (PFN_vkCmdSetVertexInputEXT)vkGetDeviceProcAddr(g_vk.dev, "vkCmdSetVertexInputEXT");
+        if (!g_vk.set_vertex_input) g_vk.dyn_vi = false;
     }
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
@@ -338,25 +428,37 @@ static void create_device(void) {
                                     .pInitialData = data};
     if (vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache) != VK_SUCCESS) {
         pc.initialDataSize = 0;
-        VK_CHECK(vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache));
-    }
-    free(data);
-}
-
-void vk_pipeline_cache_save(void) {
-    size_t sz = 0;
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) return;
-    void *data = malloc(sz);
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
-        mkdir("cache", 0755);
-        FILE *f = fopen("cache/vk_pipelines.bin.tmp", "wb");
-        if (f) {
-            bool ok = fwrite(data, 1, sz, f) == sz;
-            fclose(f);
-            if (ok) { remove("cache/vk_pipelines.bin"); rename("cache/vk_pipelines.bin.tmp", "cache/vk_pipelines.bin"); }
+        if (headless) {
+            if (vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache) != VK_SUCCESS) { free(data); return false; }
+        } else {
+            VK_CHECK(vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache));
         }
     }
     free(data);
+    return true;
+}
+
+static void create_device(void) { create_device_ex(false); }
+
+void vk_pipeline_cache_save(void) {
+    static pthread_mutex_t pcache_save_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&pcache_save_lock);
+    size_t sz = 0;
+    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) == VK_SUCCESS && sz) {
+        void *data = malloc(sz);
+        if (data && vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
+            mkdir("cache", 0755);
+            FILE *f = fopen("cache/vk_pipelines.bin.tmp", "wb");
+            if (f) {
+                bool ok = fwrite(data, 1, sz, f) == sz;
+                if (fclose(f) != 0) ok = false;
+                if (ok) { remove("cache/vk_pipelines.bin"); rename("cache/vk_pipelines.bin.tmp", "cache/vk_pipelines.bin"); }
+                else remove("cache/vk_pipelines.bin.tmp");
+            }
+        }
+        free(data);
+    }
+    pthread_mutex_unlock(&pcache_save_lock);
 }
 
 // ================================================================== swapchain
@@ -784,6 +886,37 @@ static void quick_exit_handler(void) {
 #endif
 }
 
+void vk_shutdown_headless(void) {
+    if (g_vk.dev) {
+        vkDeviceWaitIdle(g_vk.dev);
+        if (g_vk.pool) vkDestroyCommandPool(g_vk.dev, g_vk.pool, NULL);
+        if (g_vk.timeline) vkDestroySemaphore(g_vk.dev, g_vk.timeline, NULL);
+        if (g_vk.pcache) vkDestroyPipelineCache(g_vk.dev, g_vk.pcache, NULL);
+        if (g_vk.vma) vmaDestroyAllocator(g_vk.vma);
+        vkDestroyDevice(g_vk.dev, NULL);
+    }
+    if (messenger && g_vk.inst) {
+        PFN_vkDestroyDebugUtilsMessengerEXT f =
+            (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vk.inst, "vkDestroyDebugUtilsMessengerEXT");
+        if (f) f(g_vk.inst, messenger, NULL);
+        messenger = VK_NULL_HANDLE;
+    }
+    if (g_vk.inst) vkDestroyInstance(g_vk.inst, NULL);
+    memset(&g_vk, 0, sizeof g_vk);
+}
+
+bool vk_init_headless(void) {
+    if (g_vk.dev) return true;
+    settings_load();
+    if (!create_instance_ex(true) || !pick_device_ex(true) || !create_device_ex(true)) {
+        vk_shutdown_headless();
+        return false;
+    }
+    vk_exec_init();
+    vk_shaders_init();
+    return true;
+}
+
 void ui_window_init(void) {
     if (window) return;
     atexit(quick_exit_handler);
@@ -848,6 +981,9 @@ int ui_run(void) {
         while (SDL_WaitEventTimeout(&e, 16)) {
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
+                // Serialize the exit handler's device wait with rendering and presentation.
+                // Keep the lock until termination so no guest thread can submit again.
+                vk_backend_lock();
                 exit(0);
             }
             extern bool input_user_blocked(const SDL_Event *e);

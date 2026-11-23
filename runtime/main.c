@@ -4,6 +4,9 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "gamelib.h"
 #include "paths.h"
@@ -11,6 +14,7 @@
 #include "hle.h"
 #include "kernel.h"
 #include "rando.h"
+#include "nvn/vulkan/prepare_shaders.h"
 
 const char *g_romfs_dir;
 
@@ -184,7 +188,23 @@ static void boot(const char *root) {
     kernel_run_main(t, t->handle, 0, init_fn, game_init, game_fini);
 }
 
+static void resolve_cli_path(const char *arg, char *out, size_t cap) {
+    if (!arg || !*arg) { out[0] = 0; return; }
+#ifndef _WIN32
+    if (arg[0] == '/') { snprintf(out, cap, "%s", arg); return; }
+    char cwd[1024];
+    if (getcwd(cwd, sizeof cwd)) { snprintf(out, cap, "%s/%s", cwd, arg); return; }
+#endif
+    snprintf(out, cap, "%s", arg);
+}
+
 int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--prepare-shaders") || !strcmp(argv[i], "--build-game")) {
+            setenv("LARECOMP_STDIO", "1", 1);
+            break;
+        }
+    }
     plat_init();
 #ifdef _WIN32
     setvbuf(stderr, NULL, _IONBF, 0);  // the Windows CRT treats _IOLBF as full buffering
@@ -193,15 +213,32 @@ int main(int argc, char **argv) {
 #endif
     const char *root = "extracted";  // (in the data root)
     bool build_only = false;
+    bool prepare_only = false;
     bool skip_launcher = true;  // Diagnostic runtime has no FE3H launcher.
-    static char arg_root[1024];
+    static char arg_root[1024], seed_abs[1024], prog_abs[1024], data_root_abs[1024];
+    PrepareOpts prep = {0};
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--build-game")) build_only = true;
         else if (!strcmp(argv[i], "--play")) skip_launcher = true;
-        else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
+        else if (!strcmp(argv[i], "--prepare-shaders") && i + 1 < argc) {
+            prepare_only = true;
+            resolve_cli_path(argv[++i], seed_abs, sizeof seed_abs);
+            prep.seed_path = seed_abs;
+        } else if (!strcmp(argv[i], "--progress-file") && i + 1 < argc) {
+            resolve_cli_path(argv[++i], prog_abs, sizeof prog_abs);
+            prep.progress_path = prog_abs;
+        } else if (!strcmp(argv[i], "--data-root") && i + 1 < argc) {
+            resolve_cli_path(argv[++i], data_root_abs, sizeof data_root_abs);
+            setenv("LARECOMP_DATA_ROOT", data_root_abs, 1);
+        } else if (!strcmp(argv[i], "--jobs") && i + 1 < argc) {
+            prep.jobs = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--no-pipelines")) {
+            prep.no_pipelines = true;
+        } else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+    if (prepare_only) return vk_prepare_shaders(&prep);
     if (build_only) {
         GameBuildOpts opts = {.jobs = 4};
         char why[1024] = {0};

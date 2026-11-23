@@ -41,17 +41,21 @@ static uint32_t *cache_load(uint64_t h, size_t *nwords) {
     return d;
 }
 
+static pthread_mutex_t spirv_dir_lock = PTHREAD_MUTEX_INITIALIZER;
 static void cache_store(uint64_t h, const uint32_t *spv, size_t nwords) {
     static int made;
-    if (!made) { made = 1; mkdir("cache", 0755); mkdir("cache/spirv", 0755); }
+    if (!made) {
+        pthread_mutex_lock(&spirv_dir_lock);
+        if (!made) { mkdir("cache", 0755); mkdir("cache/spirv", 0755); made = 1; }
+        pthread_mutex_unlock(&spirv_dir_lock);
+    }
     char path[64], tmp[80];
     snprintf(path, sizeof path, "cache/spirv/%016llx.spv", (unsigned long long)h);
     snprintf(tmp, sizeof tmp, "%s.%llx", path, (unsigned long long)(uintptr_t)&made ^ (unsigned long long)(uintptr_t)spv);
     FILE *f = fopen(tmp, "wb");
     if (!f) return;
     bool ok = fwrite(spv, 4, nwords, f) == nwords;
-    fclose(f);
-    if (!ok || rename(tmp, path) != 0) remove(tmp);  // (another thread may have stored it first)
+    if (fclose(f) || !ok || rename(tmp, path) != 0) remove(tmp);  // (another thread may have stored it first)
 }
 
 // Vertex shaders: every float add/sub/mul/div/fma gets NoContraction, so no compiler fuses or splits them. Depth
@@ -113,11 +117,12 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
 // No spirv-opt by default: it rewrote the depth pre-pass and colour-pass vertex shaders differently enough that
 // their depths stopped matching (EQUAL test: black holes in foliage), and it was most of the compile time; the
 // driver optimises anyway. LARECOMP_VK_OPT=1 turns it back on (experiments).
-uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
+uint32_t *vk_glsl_to_spirv_ex(const char *src, int stage, const char *name, size_t *nwords, bool *cache_hit) {
     uint64_t h = src_hash(src, stage);
     static int nocache = -1;
     if (nocache < 0) nocache = getenv("LARECOMP_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
+    if (cache_hit) *cache_hit = out != NULL;
     if (out) return out;
     static __thread shaderc_compiler_t comp;
     if (!comp) comp = shaderc_compiler_initialize();
@@ -140,6 +145,10 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     }
     shaderc_result_release(r);
     return out;
+}
+
+uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
+    return vk_glsl_to_spirv_ex(src, stage, name, nwords, NULL);
 }
 
 VkShaderModule vk_module(const uint32_t *spv, size_t nwords) {

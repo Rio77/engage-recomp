@@ -1613,10 +1613,13 @@ SERVICE("audren:u", audren_u) {
         resp_size(resp, 8);
         break;
     }
-    case 2: case 4:
-        LOG("[audren] GetAudioDeviceService (cmd %u)\n", req->cmd);
+    case 2: case 4: {
+        static int dev_log;
+        if (dev_log++ < 8 || getenv("ENGAGE_TRACE_IPC"))
+            LOG("[audren] GetAudioDeviceService (cmd %u)\n", req->cmd);
         ipc_return_object(resp, service_new("IAudioDevice", audio_device, NULL));
         break;
+    }
     default: LOG("[audren] cmd %u (ok)\n", req->cmd);
     }
 }

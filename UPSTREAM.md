@@ -9,8 +9,9 @@ not an unmodified checkout of any reference project.
   https://github.com/peiikai/LASRecomp, via the native FE3H opt4 branch.
 - Linux distribution and recoverable installer adapted from
   https://github.com/Rio77/fe3h-deck-recomp (0.2.4 distribution).
-- Engage ABI, service behavior and version metadata reference:
-  https://github.com/seedds/nxnative/tree/main/dm/games/0100A6301214E000 .
+- Engage ABI, service behavior, version metadata, and offline shader preparation references (UnityFS reader, Unity/GLSLC extraction logic, and MIT Engage shader inventories/PSO manifest):
+  https://github.com/seedds/nxnative/tree/74c9b1f/dm/games/0100A6301214E000 and
+  https://github.com/seedds/nxnative/blob/74c9b1f/dm/gfx/tools/unityfs.py .
 - Selected timing sites adapted from engage-pc-recomp, MIT, commit
   `5e0ce98f120bd669cb79d3b365d0da1d6d54145b`,
   `recomp/patches-engage-v200.txt`:

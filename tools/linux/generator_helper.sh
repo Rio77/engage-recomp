@@ -10,4 +10,5 @@ if [ ! -f "$V/.ok" ]; then
     "$V/bin/python" -m pip freeze --all > "$L/helper-packages.txt"
     touch "$V/.ok"
 fi
+"$V/bin/python" tools/test_gen_dispatch.py
 "$V/bin/python" -m PyInstaller --noconfirm --clean --log-level WARN --distpath "$L/helper" --workpath "$L/pyinstaller" tools/engagegen.spec

@@ -359,19 +359,23 @@ class Module:
     SPLIT_AT = 0x4000
     SPLIT_PART = 0x2000
 
-    def emit_function(self, entry, end, labels, tables, hle):
+    def emit_function(self, entry, end, labels, tables, hle, dispatch_targets=None):
         self._parts = []
-        out = [f'void {fname(entry)}(Cpu *c) {{']
         if entry in hle:
+            out = [f'void {fname(entry)}(Cpu *c) {{']
             out.append(f'    {sanitize(hle[entry])}(c);')
             out.append('}')
             return out
         refs = set()
-        # Functions with jump tables also get the all-instruction fallback: a table whose emulation
-        # missed some cases then still reaches the right instruction instead of aborting.
+        # Inferred jump-table entries are fast paths. Emulation can miss targets
+        # that depend on runtime register state, so keep the local fallback.
         all_labels = bool(tables)
+        resolved_targets = set(dispatch_targets or ())
+        need_dispatch = all_labels or bool(resolved_targets)
         if all_labels:
             labels = set(range(entry, end, 4))
+        elif resolved_targets:
+            labels = set(labels) | {t for t in resolved_targets if entry <= t < end}
         rando_here = [a for a in range(entry, end, 4) if a - self.base in VARIANTS]
         if rando_here:
             labels = set(labels)
@@ -380,6 +384,10 @@ class Module:
                     v = self.lifter.lift(w, a)
                     if v.kind in ('b', 'bcond') and isinstance(v.target, int) and entry <= v.target < end:
                         labels.add(v.target)
+
+        def fn_attr(lo, hi):
+            # Massive all-instruction switch dispatchers trigger O(N^3) CFG blowups in LLVM -O1.
+            return ' __attribute__((optnone))' if (all_labels and (hi - lo) >= 0x400) else ''
 
         def outside(t):
             if not self.in_text(t):
@@ -390,14 +398,16 @@ class Module:
         def finish(last, lo, hi, jump, out, router):
             if last not in ('b', 'br', 'ret', 'trap'):
                 out.append('    ' + jump(hi) if hi < self.hi else f'    rt_udf(c, {hx(hi)});')
-            if all_labels:
+            if need_dispatch:
                 out.append('L_dispatch:')
-                cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(lo, hi, 4))
+                dtargets = range(lo, hi, 4) if all_labels else sorted(t for t in resolved_targets if lo <= t < hi)
+                cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in dtargets)
                 out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
                 out.append(f'    __attribute__((musttail)) return {router}(c);')
             out.append('}')
 
         if end - entry < self.SPLIT_AT:
+            out = [f'void{fn_attr(entry, end)} {fname(entry)}(Cpu *c) {{']
             out.append(f'    FN_ENTER({hx(entry)});')
 
             def jump(t):
@@ -407,6 +417,7 @@ class Module:
             self._refs = refs
             return out
 
+        out = [f'void {fname(entry)}(Cpu *c) {{']
         bounds = list(range(entry, end, self.SPLIT_PART)) + [end]
         if end - bounds[-2] < self.SPLIT_PART // 4 and len(bounds) > 2:  # (no small last part)
             del bounds[-2]
@@ -439,7 +450,7 @@ class Module:
                 refs.clear()
                 return r
             plabels = {t for t in labels if lo <= t < hi} | {lo}
-            body = list(decls) + [f'void {pname(k)}(Cpu *c) {{']
+            body = list(decls) + [f'void{fn_attr(lo, hi)} {pname(k)}(Cpu *c) {{']
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in sorted(plabels))
             body.append(f'    switch (c->pc) {{ {cases} default: break; }}')
             body.append('    __attribute__((musttail)) return rt_dispatch(c);')
@@ -449,9 +460,10 @@ class Module:
             else:
                 if last not in ('b', 'br', 'ret', 'trap'):
                     body.append('    ' + jump(hi))
-                if all_labels:
+                if need_dispatch:
                     body.append('L_dispatch:')
-                    cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(lo, hi, 4))
+                    dtargets = range(lo, hi, 4) if all_labels else sorted(t for t in resolved_targets if lo <= t < hi)
+                    cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in dtargets)
                     body.append(f'    switch (c->pc) {{ {cases} default: break; }}')
                     body.append(f'    __attribute__((musttail)) return {rname}(c);')
                 body.append('}')

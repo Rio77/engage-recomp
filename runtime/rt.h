@@ -12,9 +12,11 @@
 
 // ---- address space layout (guest addresses == host addresses)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the
-// guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
+// guest lives in a 23.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
+// ALIAS_SIZE is 16 GB (15 GB usable after nn::os's 0x3FE00000 reservation) so sparse virtual
+// address reservations (Unity VammManager + NVN memory pools) never fragment out of 16 MB holes.
 #define GUEST_LO     0x7000000000ull
-#define GUEST_HI     0x7320000000ull
+#define GUEST_HI     0x75E0000000ull
 #define MAIN_BASE    0x7000000000ull
 #define SDK_BASE     0x7008000000ull
 #define SUBSDK0_BASE 0x7010000000ull   // FE3H: glslc.nss (NVIDIA shader compiler)
@@ -24,10 +26,10 @@
 #define TLS_SIZE     0x0000100000ull
 #define HLE_HEAP     0x7092000000ull   // guest-visible memory owned by host code
 #define HLE_HEAP_SIZE 0x000E000000ull
-#define ALIAS_BASE   0x70C0000000ull   // alias region (svcMapMemory targets)
-#define ALIAS_SIZE   0x0140000000ull
-#define HEAP_BASE    0x7240000000ull
-#define HEAP_MAX     0x00D0000000ull   // 3.25 GB
+#define ALIAS_BASE   0x70C0000000ull   // alias region (svcMapMemory / nn::os::MemoryBlock)
+#define ALIAS_SIZE   0x0400000000ull   // 16 GB (0x70C0000000..0x74C0000000)
+#define HEAP_BASE    0x7500000000ull
+#define HEAP_MAX     0x00D0000000ull   // 3.25 GB (0x7500000000..0x75D0000000)
 
 // ---- loader.c
 typedef struct Module {

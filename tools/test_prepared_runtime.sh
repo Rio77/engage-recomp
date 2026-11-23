@@ -6,10 +6,12 @@ mkdir -p build/prepared-tests
 export LD_LIBRARY_PATH=${DEPS:-build/linux/x86_64/deps}/lib
 common=(-O2 -ffunction-sections -fdata-sections -Iruntime -I${DEPS:-build/linux/x86_64/deps}/include)
 link=(-Wl,--gc-sections -pthread -lm)
-clang "${common[@]}" tools/test_texture_identity.c "${link[@]}" -o build/prepared-tests/identity
+clang "${common[@]}" tools/test_texture_identity.c runtime/guest_mem.c runtime/nvn/diag.c "${link[@]}" -o build/prepared-tests/identity
 build/prepared-tests/identity
 for test in program_reupload program_cache_identity command_argument_snapshot command_lifetime; do
-    clang "${common[@]}" tools/test_${test}.c "${link[@]}" -o build/prepared-tests/${test}
+    extra=()
+    if [ "$test" = "program_reupload" ]; then extra=(runtime/guest_mem.c runtime/nvn/diag.c); fi
+    clang "${common[@]}" tools/test_${test}.c "${extra[@]}" "${link[@]}" -o build/prepared-tests/${test}
     build/prepared-tests/${test}
 done
 clang "${common[@]}" tools/test_texture_view_memo.c "${link[@]}" -o build/prepared-tests/view-memo

@@ -10,6 +10,8 @@
 
 #include "hle.h"
 #include "kernel.h"
+#include "guest_mem.h"
+#include "nvn/diag.h"
 
 // ------------------------------------------------------------------ results
 #undef R_OK
@@ -73,7 +75,20 @@ static void wake(KThread *t) { pthread_cond_signal(&t->cond); }
 void kernel_signal(KObject *o) {
     // caller holds g_klock
     o->signaled = true;
-    for (KThread *t = g_syncwaiters; t; t = t->snext) wake(t);
+    for (KThread *t = g_syncwaiters; t; t = t->snext) {
+        if (!t->sync_handles || t->sync_count <= 0) {
+            wake(t);
+            continue;
+        }
+        const uint32_t *hs = (const uint32_t *)(uintptr_t)t->sync_handles;
+        for (int i = 0; i < t->sync_count; i++) {
+            KObject *wo = handle_get(hs[i]);
+            if (wo == o || !wo) {
+                wake(t);
+                break;
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ time
@@ -207,10 +222,11 @@ static bool kwait(int64_t timeout_ns, const struct timespec *ts) {
 }
 
 // ------------------------------------------------------------------ memory map
-typedef struct { uint64_t addr, size; uint32_t type, perm; } Region;
+typedef GuestRegion Region;
 static pthread_mutex_t region_lock = PTHREAD_MUTEX_INITIALIZER;
-static Region regions[1024];
+static Region regions[4096];
 static int nregions;
+static void regions_publish(void) { guest_mem_publish_regions(regions, nregions); }
 static _Atomic uint64_t heap_size;
 static uint64_t tls_next = TLS_BASE;
 uint64_t kernel_heap_size(void) { return heap_size; }  // bytes from HEAP_BASE set by SetHeapSize
@@ -227,11 +243,12 @@ int kernel_data_regions(uint64_t *addr, uint64_t *size, int max) {
 }
 
 static void region_add(uint64_t addr, uint64_t size, uint32_t type, uint32_t perm) {
-    if (nregions == 1024) FATAL("too many regions\n");
+    if (nregions == 4096) FATAL("too many regions\n");
     plat_commit(addr, size);  // back it before the OS writes there (Windows: file reads into the heap)
     int i = nregions++;
     while (i > 0 && regions[i - 1].addr > addr) { regions[i] = regions[i - 1]; i--; }
     regions[i] = (Region){addr, size, type, perm};
+    regions_publish();
 }
 
 static void region_remove(uint64_t addr) {
@@ -239,6 +256,7 @@ static void region_remove(uint64_t addr) {
         if (regions[i].addr == addr) {
             memmove(&regions[i], &regions[i + 1], (nregions - i - 1) * sizeof(Region));
             nregions--;
+            regions_publish();
             return;
         }
     }
@@ -247,10 +265,19 @@ static void region_remove(uint64_t addr) {
 // Physical memory in the alias region has the Horizon Normal state.
 #define PHYSICAL_TYPE 5
 
-static uint32_t physical_memory(uint64_t addr, uint64_t size, bool map) {
+static uint32_t physical_memory_impl(uint64_t addr, uint64_t size, bool map) {
     const uint64_t limit = ALIAS_BASE + ALIAS_SIZE;
     if (!size || ((addr | size) & 0xfff) || addr < ALIAS_BASE ||
         addr >= limit || size > limit - addr) return R_INVALID_ADDRESS;
+
+    if (!map) {
+        // Phase 5A/5B: wait for in-flight GPU work and drop overlapping USERPTR alias imports
+        // before discarding backing pages via MADV_DONTNEED (outside region_lock).
+        extern void renderer_sync(void) __attribute__((weak));
+        extern void vk_alias_pool_unregister(uint64_t addr, uint64_t size) __attribute__((weak));
+        if (renderer_sync) renderer_sync();
+        if (vk_alias_pool_unregister) vk_alias_pool_unregister(addr, size);
+    }
 
     uint64_t end = addr + size;
     pthread_mutex_lock(&region_lock);
@@ -315,8 +342,19 @@ static uint32_t physical_memory(uint64_t addr, uint64_t size, bool map) {
             FATAL("cannot discard physical memory %llx+%llx\n", addr, size);
 #endif
     }
+    regions_publish();
     pthread_mutex_unlock(&region_lock);
     return R_OK;
+}
+
+static uint32_t physical_memory(uint64_t addr, uint64_t size, bool map, uint64_t lr) {
+    uint32_t rc = physical_memory_impl(addr, size, map);
+    nvn_trace_record(NVN_TR_SVC_PHYS_MAP, addr, size, (map ? 1ull : 0ull) | ((uint64_t)rc << 32), 0, lr);
+    if (rc != R_OK) {
+        LOG("[kernel] %sPhysicalMemory(%llx, %llx) failed rc=%#x lr=%llx\n",
+            map ? "Map" : "Unmap", (unsigned long long)addr, (unsigned long long)size, rc, (unsigned long long)lr);
+    }
+    return rc;
 }
 
 static void query_memory(uint64_t addr, uint64_t out) {
@@ -1004,7 +1042,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         break;
     }
     case 0x2C: case 0x2D:  // MapPhysicalMemory / UnmapPhysicalMemory
-        x[0] = physical_memory(x[0], x[1], imm == 0x2C);
+        x[0] = physical_memory(x[0], x[1], imm == 0x2C, x[30]);
         break;
     case 0x32: x[0] = set_thread_activity((uint32_t)x[0], (uint32_t)x[1]); break;
     case 0x33: x[0] = get_thread_context(x[0], (uint32_t)x[1]); break;
@@ -1129,7 +1167,10 @@ void kernel_reset(void) {
     g_waitlist = NULL;
     g_syncwaiters = NULL;
     memset(handles, 0, sizeof handles);
+    pthread_mutex_lock(&region_lock);
     nregions = 0;
+    guest_mem_kernel_reset();
+    pthread_mutex_unlock(&region_lock);
     heap_size = 0;
     tls_next = TLS_BASE;
     next_thread_id = 0x50;

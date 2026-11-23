@@ -8,6 +8,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,7 @@ typedef struct {
     char *name, *path;
     uint64_t size, data_off;
     uint32_t off;  // entry offset in the file table
+    uint32_t sib;  // next sibling entry offset in the file table (or EMPTY)
     Dir *parent;
 } File;
 struct Dir {
@@ -36,6 +38,7 @@ struct Dir {
     File **files;
     int ndirs, nfiles;
     uint32_t off;  // entry offset in the directory table
+    uint32_t sib;  // next sibling entry offset in the directory table (or EMPTY)
 };
 
 static int by_name_dir(const void *a, const void *b) { return strcmp((*(Dir *const *)a)->name, (*(Dir *const *)b)->name); }
@@ -48,14 +51,25 @@ static Dir *scan(const char *path, const char *name, Dir *parent, int depth) {
     Dir *dir = calloc(1, sizeof *dir);
     dir->name = strdup(name), dir->path = strdup(path), dir->parent = parent;
     int cd = 0, cf = 0;
+#if !defined(_WIN32)
+    int dfd = dirfd(d);
+#endif
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;  // (".", "..", and hidden files such as .DS_Store aren't the game's)
+        struct stat st;
+#if !defined(_WIN32)
+        if (fstatat(dfd, e->d_name, &st, 0) != 0) continue;
+        if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) continue;
         size_t n = strlen(path) + strlen(e->d_name) + 2;
         char *p = malloc(n);
         snprintf(p, n, "%s/%s", path, e->d_name);
-        struct stat st;
+#else
+        size_t n = strlen(path) + strlen(e->d_name) + 2;
+        char *p = malloc(n);
+        snprintf(p, n, "%s/%s", path, e->d_name);
         if (stat(p, &st) != 0) { free(p); continue; }
+#endif
         if (S_ISDIR(st.st_mode)) {
             Dir *c = scan(p, e->d_name, dir, depth + 1);
             free(p);
@@ -148,6 +162,13 @@ bool romfs_layout(const char *dir, RomfsLayout *out, char *why, size_t why_size)
     uint32_t dsize = 0, fsize = 0;
     for (int i = 0; i < l.nd; i++) l.dirs[i]->off = dsize, dsize += 0x18 + align4((uint32_t)strlen(l.dirs[i]->name));
     for (int i = 0; i < l.nf; i++) l.files[i]->off = fsize, fsize += 0x20 + align4((uint32_t)strlen(l.files[i]->name));
+    // O(N) sibling offsets (each parent's dirs[] and files[] are already sorted)
+    root->sib = EMPTY;
+    for (int i = 0; i < l.nd; i++) {
+        Dir *d = l.dirs[i];
+        for (int k = 0; k < d->ndirs; k++) d->dirs[k]->sib = k + 1 < d->ndirs ? d->dirs[k + 1]->off : EMPTY;
+        for (int k = 0; k < d->nfiles; k++) d->files[k]->sib = k + 1 < d->nfiles ? d->files[k + 1]->off : EMPTY;
+    }
     // file data offsets (relative to the data start), each 16-byte aligned
     uint64_t data = 0;
     for (int i = 0; i < l.nf; i++) {
@@ -165,10 +186,7 @@ bool romfs_layout(const char *dir, RomfsLayout *out, char *why, size_t why_size)
         Dir *d = l.dirs[i];
         uint8_t *e = dtab + d->off;
         uint32_t parent = d->parent ? d->parent->off : 0, nl = (uint32_t)strlen(d->name);
-        uint32_t sib = EMPTY;
-        if (d->parent)
-            for (int k = 0; k + 1 < d->parent->ndirs; k++)
-                if (d->parent->dirs[k] == d) sib = d->parent->dirs[k + 1]->off;
+        uint32_t sib = d->sib;
         uint32_t h = name_hash(parent, d->name) % nbd;
         put32(e, parent);
         put32(e + 4, sib);
@@ -182,9 +200,7 @@ bool romfs_layout(const char *dir, RomfsLayout *out, char *why, size_t why_size)
     for (int i = 0; i < l.nf; i++) {
         File *f = l.files[i];
         uint8_t *e = ftab + f->off;
-        uint32_t nl = (uint32_t)strlen(f->name), sib = EMPTY;
-        for (int k = 0; k + 1 < f->parent->nfiles; k++)
-            if (f->parent->files[k] == f) sib = f->parent->files[k + 1]->off;
+        uint32_t nl = (uint32_t)strlen(f->name), sib = f->sib;
         uint32_t h = name_hash(f->parent->off, f->name) % nbf;
         put32(e, f->parent->off);
         put32(e + 4, sib);

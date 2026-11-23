@@ -3,69 +3,254 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
+#include "../guest_mem.h"
 #include "../kernel.h"
+#include "diag.h"
 #include "nvn.h"
 
 void renderer_sync(void);
 
-static uint64_t next_debug_id = 1;
+static _Atomic uint64_t next_debug_id = 1;
+static uint64_t alloc_debug_id(void) {
+    return atomic_fetch_add_explicit(&next_debug_id, 1, memory_order_relaxed);
+}
 
-// NVN objects are copied by value by Unity, including the default textures.
-// Keep host metadata stable until reset: finalizing one guest copy must not
-// leave another copy holding a freed host pointer. GPU storage is still retired
-// at Finalize and recreated lazily if a remaining copy is used again.
-typedef struct TextureIdentity {
-    NvnTexture *texture;
-    struct TextureIdentity *next;
-} TextureIdentity;
-#define TEXTURE_IDENTITIES 4096
-static TextureIdentity *texture_identities[TEXTURE_IDENTITIES];
-static pthread_mutex_t texture_identity_lock = PTHREAD_MUTEX_INITIALIZER;
-static unsigned texture_identity_bucket(uint64_t pointer) {
-    return ((pointer >> 4) ^ (pointer >> 23)) & (TEXTURE_IDENTITIES - 1);
+// Lock-free paged generational texture slot table (Phase 3).
+// Guest NVNtexture [0..16) holds an NvnGuestHandle (no raw host pointers):
+//   - Survives Unity value copies (memcpy)
+//   - O(1) lock-free lookup on hot path via acquire loads
+//   - Bounded host memory via FIFO quarantine recycling of finalized slots
+//   - Instant O(1) invalidation on RT_ON_RESET via g_tex_epoch
+#define NVN_TEX_PAGE_SHIFT 10u
+#define NVN_TEX_PAGE_SIZE  (1u << NVN_TEX_PAGE_SHIFT)
+#define NVN_TEX_PAGE_MASK  (NVN_TEX_PAGE_SIZE - 1u)
+#define NVN_TEX_MAX_PAGES  64u
+#define NVN_TEX_MAX_SLOTS  (NVN_TEX_PAGE_SIZE * NVN_TEX_MAX_PAGES)
+#define NVN_TEX_QUARANTINE 1024u
+#define NVN_TEX_QRING_CAP  2048u  // power of 2 > NVN_TEX_QUARANTINE
+
+enum {
+    TEX_SLOT_FREE = 0,
+    TEX_SLOT_ALIVE = 1,
+    TEX_SLOT_RETIRED = 2,
+};
+
+typedef struct NvnTexSlot {
+    _Atomic uint32_t generation;
+    _Atomic uint32_t state;
+    uint64_t origin_addr;
+    NvnTexture tex;
+} NvnTexSlot;
+
+static _Atomic(NvnTexSlot *) g_tex_pages[NVN_TEX_MAX_PAGES];
+static _Atomic uint16_t g_tex_epoch = 1;
+static pthread_mutex_t g_tex_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_tex_next_fresh = 0;
+static uint32_t g_tex_qring[NVN_TEX_QRING_CAP];
+static uint32_t g_tex_qhead = 0, g_tex_qtail = 0, g_tex_qcount = 0;
+
+static uint16_t nvn_handle_compute_tag(const NvnGuestHandle *h, uint8_t obj_kind) {
+    uint64_t x = ((uint64_t)h->magic << 32) ^ (uint64_t)h->slot_index;
+    x ^= ((uint64_t)h->generation << 16) ^ ((uint64_t)h->rt_epoch << 8) ^ obj_kind;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    x ^= x >> 31;
+    uint16_t t = (uint16_t)(x ^ (x >> 16));
+    return t ? t : 1u;
 }
-static void texture_identity_add(NvnTexture *texture) {
-    TextureIdentity *entry = malloc(sizeof *entry);
-    if (!entry) FATAL("texture identity allocation failed\n");
-    entry->texture = texture;
-    unsigned bucket = texture_identity_bucket((uintptr_t)texture);
-    pthread_mutex_lock(&texture_identity_lock);
-    entry->next = texture_identities[bucket];
-    texture_identities[bucket] = entry;
-    pthread_mutex_unlock(&texture_identity_lock);
+
+static NvnTexSlot *tex_slot_at(uint32_t idx) {
+    if (idx >= NVN_TEX_MAX_SLOTS) return NULL;
+    uint32_t p = idx >> NVN_TEX_PAGE_SHIFT;
+    NvnTexSlot *page = atomic_load_explicit(&g_tex_pages[p], memory_order_acquire);
+    return page ? &page[idx & NVN_TEX_PAGE_MASK] : NULL;
 }
-NvnTexture *nvn_texture_host(uint64_t guest) {
-    if (!guest) return NULL;
-    uint64_t pointer = G(uint64_t, guest, 0), serial = G(uint64_t, guest, 8);
-    NvnTexture *result = NULL;
-    pthread_mutex_lock(&texture_identity_lock);
-    for (TextureIdentity *entry = texture_identities[texture_identity_bucket(pointer)]; entry; entry = entry->next)
-        if ((uintptr_t)entry->texture == pointer && entry->texture->debug_id == serial) {
-            result = entry->texture;
-            break;
+
+static NvnTexSlot *tex_slot_alloc(uint64_t guest_addr, NvnGuestHandle *out_hdr) {
+    pthread_mutex_lock(&g_tex_alloc_lock);
+    uint32_t idx = UINT32_MAX;
+    if (g_tex_qcount >= NVN_TEX_QUARANTINE) {
+        idx = g_tex_qring[g_tex_qhead];
+        g_tex_qhead = (g_tex_qhead + 1u) & (NVN_TEX_QRING_CAP - 1u);
+        g_tex_qcount--;
+    } else if (g_tex_next_fresh < NVN_TEX_MAX_SLOTS) {
+        idx = g_tex_next_fresh++;
+    } else if (g_tex_qcount > 0) {
+        idx = g_tex_qring[g_tex_qhead];
+        g_tex_qhead = (g_tex_qhead + 1u) & (NVN_TEX_QRING_CAP - 1u);
+        g_tex_qcount--;
+    } else {
+        pthread_mutex_unlock(&g_tex_alloc_lock);
+        FATAL("NVN texture slot table exhausted (%u slots)\n", NVN_TEX_MAX_SLOTS);
+    }
+
+    uint32_t p = idx >> NVN_TEX_PAGE_SHIFT;
+    NvnTexSlot *page = atomic_load_explicit(&g_tex_pages[p], memory_order_relaxed);
+    if (!page) {
+        page = calloc(NVN_TEX_PAGE_SIZE, sizeof(NvnTexSlot));
+        if (!page) {
+            pthread_mutex_unlock(&g_tex_alloc_lock);
+            FATAL("NVN texture page allocation failed\n");
         }
-    pthread_mutex_unlock(&texture_identity_lock);
-    return result;
+        atomic_store_explicit(&g_tex_pages[p], page, memory_order_release);
+    }
+    NvnTexSlot *s = &page[idx & NVN_TEX_PAGE_MASK];
+    uint32_t gen = atomic_load_explicit(&s->generation, memory_order_relaxed) + 1u;
+    if (!gen) gen = 1u;
+    // Publish FREE + bumped generation before wiping slot payload so stale readers bail immediately.
+    atomic_store_explicit(&s->state, TEX_SLOT_FREE, memory_order_release);
+    atomic_store_explicit(&s->generation, gen, memory_order_release);
+    s->origin_addr = guest_addr;
+    memset(&s->tex, 0, sizeof s->tex);
+
+    uint16_t ep = atomic_load_explicit(&g_tex_epoch, memory_order_relaxed);
+    pthread_mutex_unlock(&g_tex_alloc_lock);
+
+    NvnGuestHandle h = {
+        .magic = NVN_MAGIC_TEX_LIVE,
+        .slot_index = idx,
+        .generation = gen,
+        .rt_epoch = ep,
+        .tag16 = 0,
+    };
+    h.tag16 = nvn_handle_compute_tag(&h, NVN_OBJ_TEXTURE);
+    *out_hdr = h;
+    return s;
 }
+
+static void tex_slot_publish_live(NvnTexSlot *s) {
+    atomic_store_explicit(&s->state, TEX_SLOT_ALIVE, memory_order_release);
+}
+
+static bool tex_slot_retire(uint32_t idx, uint32_t gen) {
+    pthread_mutex_lock(&g_tex_alloc_lock);
+    NvnTexSlot *s = tex_slot_at(idx);
+    bool retired_now = false;
+    if (s && atomic_load_explicit(&s->generation, memory_order_relaxed) == gen &&
+        atomic_load_explicit(&s->state, memory_order_relaxed) == TEX_SLOT_ALIVE) {
+        atomic_store_explicit(&s->state, TEX_SLOT_RETIRED, memory_order_release);
+        if (g_tex_qcount < NVN_TEX_QRING_CAP) {
+            g_tex_qring[g_tex_qtail] = idx;
+            g_tex_qtail = (g_tex_qtail + 1u) & (NVN_TEX_QRING_CAP - 1u);
+            g_tex_qcount++;
+        }
+        retired_now = true;
+    }
+    pthread_mutex_unlock(&g_tex_alloc_lock);
+    return retired_now;
+}
+
+static unsigned nvn_texture_allocated_slots(void) {
+    pthread_mutex_lock(&g_tex_alloc_lock);
+    unsigned n = g_tex_next_fresh;
+    pthread_mutex_unlock(&g_tex_alloc_lock);
+    return n;
+}
+
+NvnTexLookup nvn_texture_lookup(uint64_t guest) {
+    NvnTexLookup out = {0};
+    NvnGuestHandle h;
+    GuestMemStatus ms = guest_mem_read_checked(guest, &h, sizeof h, 8);
+    out.mem_status = ms;
+    if (ms != GMEM_OK) {
+        out.state = TEX_ST_BAD_ADDR;
+        return out;
+    }
+    out.hdr = h;
+    out.raw_valid = true;
+
+    if ((h.magic | h.slot_index | h.generation | h.rt_epoch | h.tag16) == 0) {
+        out.state = TEX_ST_ZEROED;
+        return out;
+    }
+    if ((h.magic != NVN_MAGIC_TEX_LIVE && h.magic != NVN_MAGIC_TEX_FIN) ||
+        h.tag16 != nvn_handle_compute_tag(&h, NVN_OBJ_TEXTURE)) {
+        out.state = TEX_ST_CORRUPT;
+        return out;
+    }
+    if (h.rt_epoch != atomic_load_explicit(&g_tex_epoch, memory_order_acquire)) {
+        out.state = TEX_ST_STALE_RESET;
+        return out;
+    }
+    NvnTexSlot *s = tex_slot_at(h.slot_index);
+    if (!s) {
+        out.state = TEX_ST_CORRUPT;
+        return out;
+    }
+    uint32_t gen = atomic_load_explicit(&s->generation, memory_order_acquire);
+    uint32_t st = atomic_load_explicit(&s->state, memory_order_acquire);
+    if (gen != h.generation || st == TEX_SLOT_FREE) {
+        out.state = TEX_ST_STALE_RECYCLED;
+        return out;
+    }
+    if (h.magic == NVN_MAGIC_TEX_FIN) {
+        out.state = TEX_ST_FINALIZED_INST;
+        out.tex = &s->tex;
+        return out;
+    }
+    out.tex = &s->tex;
+    if (st == TEX_SLOT_RETIRED) {
+        out.state = TEX_ST_STALE_COPY;
+        return out;
+    }
+    out.state = (guest == s->origin_addr) ? TEX_ST_LIVE_ORIG : TEX_ST_LIVE_COPY;
+    return out;
+}
+
+NvnTexture *nvn_texture_host(uint64_t guest) {
+    NvnTexLookup lk = nvn_texture_lookup(guest);
+    if (lk.state == TEX_ST_LIVE_ORIG || lk.state == TEX_ST_LIVE_COPY || lk.state == TEX_ST_STALE_COPY)
+        return lk.tex;
+    return NULL;
+}
+
 static NvnTexture *texture_require(uint64_t guest) {
-    NvnTexture *texture = nvn_texture_host(guest);
-    if (!texture) FATAL("[texture-life] uninitialized NVN texture used: guest=%llx\n", guest);
-    return texture;
+    NvnTexLookup lk = nvn_texture_lookup(guest);
+    if (lk.state == TEX_ST_LIVE_ORIG || lk.state == TEX_ST_LIVE_COPY || lk.state == TEX_ST_STALE_COPY)
+        return lk.tex;
+    uint64_t q0 = 0, q1 = 0;
+    if (lk.raw_valid) {
+        memcpy(&q0, &lk.hdr, 8);
+        memcpy(&q1, (const uint8_t *)&lk.hdr + 8, 8);
+    }
+    nvn_diag_record(NVN_EV_LOOKUP_FAIL, NVN_OBJ_TEXTURE, (uint8_t)lk.state, guest,
+                    lk.hdr.slot_index, lk.hdr.generation, lk.hdr.rt_epoch, 0, 0,
+                    lk.raw_valid, q0, q1);
+    nvn_diag_dump_for_addr("texture_require", guest, lk.hdr.slot_index, lk.hdr.generation, 0);
+    FATAL("[texture-life] invalid NVN texture used: guest=%llx state=%u mem=%s\n",
+          (unsigned long long)guest, (unsigned)lk.state, guest_mem_status_name(lk.mem_status));
 }
+
+// Helper for unit tests (e.g. test_texture_identity.c) to bind a synthetic texture into guest memory.
+static NvnTexture *texture_identity_bind_test(uint64_t guest, uint32_t levels) {
+    NvnGuestHandle hdr;
+    NvnTexSlot *s = tex_slot_alloc(guest, &hdr);
+    s->tex.debug_id = alloc_debug_id();
+    s->tex.levels = levels;
+    tex_slot_publish_live(s);
+    uint8_t zeros[112] = {0};
+    guest_mem_write_checked(guest, &hdr, sizeof hdr, 8);
+    guest_mem_write_checked(guest + 16, zeros, sizeof zeros, 8);
+    return &s->tex;
+}
+
 // main.c calls reset hooks only after stopping all guest threads and releasing
 // renderer resources, so no queued command or copied object can still use these.
 RT_ON_RESET(texture_identities_reset) {
-    for (unsigned i = 0; i < TEXTURE_IDENTITIES; ++i) {
-        TextureIdentity *entry = texture_identities[i];
-        while (entry) {
-            TextureIdentity *next = entry->next;
-            free(entry->texture);
-            free(entry);
-            entry = next;
-        }
-        texture_identities[i] = NULL;
+    pthread_mutex_lock(&g_tex_alloc_lock);
+    uint16_t next_ep = (uint16_t)(atomic_load_explicit(&g_tex_epoch, memory_order_relaxed) + 1u);
+    if (!next_ep) next_ep = 1u;
+    atomic_store_explicit(&g_tex_epoch, next_ep, memory_order_release);
+    for (uint32_t p = 0; p < NVN_TEX_MAX_PAGES; p++) {
+        NvnTexSlot *page = atomic_exchange_explicit(&g_tex_pages[p], NULL, memory_order_acq_rel);
+        free(page);
     }
+    g_tex_next_fresh = 0;
+    g_tex_qhead = g_tex_qtail = g_tex_qcount = 0;
+    pthread_mutex_unlock(&g_tex_alloc_lock);
+    nvn_diag_record(NVN_EV_RESET, NVN_OBJ_TEXTURE, 0, 0, 0, 0, next_ep, 0, 0, false, 0, 0);
 }
 
 
@@ -180,39 +365,261 @@ NVN(nvnQueueGetTotalComputeMemoryUsed) { RET(0); }
 NVN(nvnQueueResetMemoryUsageCounts) { (void)c; }
 NVN(nvnQueueSubmitCommands) {
     int n = (int)A(1);
+    if (n <= 0 || n > 65536 || guest_mem_validate_range(A(2), (uint64_t)n * sizeof(uint64_t), 8, GMEM_PERM_R) != GMEM_OK)
+        return;
     const uint64_t *handles = AP(2);
     for (int i = 0; i < n; i++) backend_execute(handles[i]);
 }
 NVN(nvnQueueFlush) {
     (void)c;
 #ifndef __APPLE__
-    if (getenv("FE3H_BATCH_SUBMITS")) { extern void renderer_submit(void); renderer_submit(); }
+    extern bool vk_batch_submits_on(void) __attribute__((weak));
+    extern void renderer_submit(void) __attribute__((weak));
+    if (vk_batch_submits_on && renderer_submit && vk_batch_submits_on()) renderer_submit();
 #endif
 }
 NVN(nvnQueueFinish) { (void)c; renderer_sync(); }
 
-static NvnSync *sync_of(uint64_t guest) {
-    NvnSync *s = HOST(NvnSync, guest);
-    if (!s) { s = calloc(1, sizeof *s); SET_HOST(guest, s); }
+// ================================================================== generational sync table (Phase 5A)
+#define NVN_SYNC_PAGE_SHIFT 8u
+#define NVN_SYNC_PAGE_SIZE  (1u << NVN_SYNC_PAGE_SHIFT)
+#define NVN_SYNC_PAGE_MASK  (NVN_SYNC_PAGE_SIZE - 1u)
+#define NVN_SYNC_MAX_PAGES  256u
+#define NVN_SYNC_MAX_SLOTS  (NVN_SYNC_PAGE_SIZE * NVN_SYNC_MAX_PAGES)
+#define NVN_SYNC_QUARANTINE 256u
+#define NVN_SYNC_QRING_CAP  512u
+
+typedef struct NvnSyncSlot {
+    _Atomic uint32_t generation;
+    _Atomic uint32_t state;
+    NvnSync sync;
+} NvnSyncSlot;
+
+static _Atomic(NvnSyncSlot *) g_sync_pages[NVN_SYNC_MAX_PAGES];
+static _Atomic uint16_t g_sync_epoch = 1;
+static pthread_mutex_t g_sync_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_sync_next_fresh = 0;
+static uint32_t g_sync_qring[NVN_SYNC_QRING_CAP];
+static uint32_t g_sync_qhead = 0, g_sync_qtail = 0, g_sync_qcount = 0;
+
+static NvnSyncSlot *sync_slot_at(uint32_t idx) {
+    if (idx >= NVN_SYNC_MAX_SLOTS) return NULL;
+    NvnSyncSlot *page = atomic_load_explicit(&g_sync_pages[idx >> NVN_SYNC_PAGE_SHIFT], memory_order_acquire);
+    return page ? &page[idx & NVN_SYNC_PAGE_MASK] : NULL;
+}
+
+static NvnSyncSlot *sync_slot_alloc(NvnGuestHandle *out_hdr) {
+    pthread_mutex_lock(&g_sync_alloc_lock);
+    uint32_t idx = UINT32_MAX;
+    if (g_sync_qcount >= NVN_SYNC_QUARANTINE) {
+        idx = g_sync_qring[g_sync_qhead];
+        g_sync_qhead = (g_sync_qhead + 1u) & (NVN_SYNC_QRING_CAP - 1u);
+        g_sync_qcount--;
+    } else if (g_sync_next_fresh < NVN_SYNC_MAX_SLOTS) {
+        idx = g_sync_next_fresh++;
+    } else if (g_sync_qcount > 0) {
+        idx = g_sync_qring[g_sync_qhead];
+        g_sync_qhead = (g_sync_qhead + 1u) & (NVN_SYNC_QRING_CAP - 1u);
+        g_sync_qcount--;
+    } else {
+        pthread_mutex_unlock(&g_sync_alloc_lock);
+        FATAL("NVN sync slot table exhausted (%u slots)\n", NVN_SYNC_MAX_SLOTS);
+    }
+    uint32_t p = idx >> NVN_SYNC_PAGE_SHIFT;
+    NvnSyncSlot *page = atomic_load_explicit(&g_sync_pages[p], memory_order_relaxed);
+    if (!page) {
+        page = calloc(NVN_SYNC_PAGE_SIZE, sizeof(NvnSyncSlot));
+        if (!page) {
+            pthread_mutex_unlock(&g_sync_alloc_lock);
+            FATAL("NVN sync page allocation failed\n");
+        }
+        atomic_store_explicit(&g_sync_pages[p], page, memory_order_release);
+    }
+    NvnSyncSlot *s = &page[idx & NVN_SYNC_PAGE_MASK];
+    uint32_t gen = atomic_load_explicit(&s->generation, memory_order_relaxed) + 1u;
+    if (!gen) gen = 1u;
+    atomic_store_explicit(&s->state, TEX_SLOT_FREE, memory_order_release);
+    atomic_store_explicit(&s->generation, gen, memory_order_release);
+    atomic_store_explicit(&s->sync.signaled, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->sync.seq, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->state, TEX_SLOT_ALIVE, memory_order_release);
+    uint16_t ep = atomic_load_explicit(&g_sync_epoch, memory_order_relaxed);
+    pthread_mutex_unlock(&g_sync_alloc_lock);
+
+    NvnGuestHandle h = {
+        .magic = NVN_MAGIC_SYNC_LIVE,
+        .slot_index = idx,
+        .generation = gen,
+        .rt_epoch = ep,
+        .tag16 = 0,
+    };
+    h.tag16 = nvn_handle_compute_tag(&h, NVN_OBJ_SYNC);
+    *out_hdr = h;
     return s;
 }
+
+static bool sync_slot_retire(uint32_t idx, uint32_t gen) {
+    pthread_mutex_lock(&g_sync_alloc_lock);
+    NvnSyncSlot *s = sync_slot_at(idx);
+    bool ok = false;
+    if (s && atomic_load_explicit(&s->generation, memory_order_relaxed) == gen &&
+        atomic_load_explicit(&s->state, memory_order_relaxed) == TEX_SLOT_ALIVE) {
+        atomic_store_explicit(&s->state, TEX_SLOT_RETIRED, memory_order_release);
+        if (g_sync_qcount < NVN_SYNC_QRING_CAP) {
+            g_sync_qring[g_sync_qtail] = idx;
+            g_sync_qtail = (g_sync_qtail + 1u) & (NVN_SYNC_QRING_CAP - 1u);
+            g_sync_qcount++;
+        }
+        ok = true;
+    }
+    pthread_mutex_unlock(&g_sync_alloc_lock);
+    return ok;
+}
+
+RT_ON_RESET(sync_identities_reset) {
+    pthread_mutex_lock(&g_sync_alloc_lock);
+    uint16_t next_ep = (uint16_t)(atomic_load_explicit(&g_sync_epoch, memory_order_relaxed) + 1u);
+    if (!next_ep) next_ep = 1u;
+    atomic_store_explicit(&g_sync_epoch, next_ep, memory_order_release);
+    for (uint32_t p = 0; p < NVN_SYNC_MAX_PAGES; p++) {
+        NvnSyncSlot *page = atomic_exchange_explicit(&g_sync_pages[p], NULL, memory_order_acq_rel);
+        free(page);
+    }
+    g_sync_next_fresh = 0;
+    g_sync_qhead = g_sync_qtail = g_sync_qcount = 0;
+    pthread_mutex_unlock(&g_sync_alloc_lock);
+}
+
+static bool sync_read_handle(uint64_t guest, NvnGuestHandle *out) {
+    if (guest_mem_read_checked(guest, out, sizeof *out, 8) != GMEM_OK) return false;
+    if (out->magic != NVN_MAGIC_SYNC_LIVE) return false;
+    if (out->tag16 != nvn_handle_compute_tag(out, NVN_OBJ_SYNC)) return false;
+    if (out->rt_epoch != atomic_load_explicit(&g_sync_epoch, memory_order_acquire)) return false;
+    return true;
+}
+
+NvnSync *nvn_sync_host(uint64_t guest) {
+    NvnGuestHandle h;
+    if (!sync_read_handle(guest, &h)) return NULL;
+    NvnSyncSlot *s = sync_slot_at(h.slot_index);
+    if (!s) return NULL;
+    if (atomic_load_explicit(&s->state, memory_order_acquire) != TEX_SLOT_ALIVE) return NULL;
+    if (atomic_load_explicit(&s->generation, memory_order_acquire) != h.generation) return NULL;
+    return &s->sync;
+}
+
+void nvn_sync_pack_handle(uint64_t guest, uint64_t *out_token, uint64_t *out_epoch) {
+    *out_token = 0;
+    *out_epoch = 0;
+    NvnGuestHandle h;
+    if (!sync_read_handle(guest, &h)) return;
+    NvnSyncSlot *s = sync_slot_at(h.slot_index);
+    if (!s || atomic_load_explicit(&s->state, memory_order_acquire) != TEX_SLOT_ALIVE ||
+        atomic_load_explicit(&s->generation, memory_order_acquire) != h.generation)
+        return;
+    *out_token = ((uint64_t)h.slot_index << 32) | (uint64_t)h.generation;
+    *out_epoch = (uint64_t)h.rt_epoch;
+}
+
 uint64_t renderer_fence_seq(void);
 void renderer_wait_seq(uint64_t seq);
-NVN(nvnQueueFenceSync) { NvnSync *s = sync_of(A(1)); s->signaled = 1; s->seq = renderer_fence_seq(); }
-void nvn_sync_set_seq(uint64_t guest, uint64_t seq) { NvnSync *s = sync_of(guest); s->signaled = 1; s->seq = seq; }
+
+NVN(nvnQueueFenceSync) {
+    NvnSync *s = nvn_sync_host(A(1));
+    if (!s) {
+        nvn_diag_record(NVN_EV_LOOKUP_FAIL, NVN_OBJ_SYNC, 0, A(1), 0, 0, 0, 0, c->x[30], false, 0, 0);
+        return;
+    }
+    atomic_store_explicit(&s->seq, renderer_fence_seq(), memory_order_release);
+    atomic_store_explicit(&s->signaled, 1, memory_order_release);
+}
+
+void nvn_sync_set_seq(uint64_t guest, uint64_t seq) {
+    // Read-only lookup: never allocates or writes to finalized/reused guest memory.
+    NvnSync *s = nvn_sync_host(guest);
+    if (!s) return;
+    atomic_store_explicit(&s->seq, seq, memory_order_release);
+    atomic_store_explicit(&s->signaled, 1, memory_order_release);
+}
+
+void nvn_sync_set_seq_token(uint64_t guest, uint64_t token, uint64_t epoch, uint64_t seq) {
+    if (token) {
+        if ((uint16_t)epoch != atomic_load_explicit(&g_sync_epoch, memory_order_acquire)) return;
+        uint32_t idx = (uint32_t)(token >> 32);
+        uint32_t gen = (uint32_t)(token & 0xFFFFFFFFu);
+        NvnSyncSlot *s = sync_slot_at(idx);
+        if (!s) return;
+        if (atomic_load_explicit(&s->state, memory_order_acquire) != TEX_SLOT_ALIVE) return;
+        if (atomic_load_explicit(&s->generation, memory_order_acquire) != gen) return;
+        atomic_store_explicit(&s->sync.seq, seq, memory_order_release);
+        atomic_store_explicit(&s->sync.signaled, 1, memory_order_release);
+        return;
+    }
+    if (guest) nvn_sync_set_seq(guest, seq);
+}
+
 NVN(nvnQueueWaitSync) { RET(1); }
 
 // ================================================================== sync / event
-NVN(nvnSyncInitialize) { SET_HOST(A(0), calloc(1, sizeof(NvnSync))); RET(1); }
-NVN(nvnSyncFinalize) { free(HOST(NvnSync, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnSyncInitialize) {
+    uint64_t guest = A(0);
+    if (guest_mem_validate_range(guest, sizeof(NvnGuestHandle), 8, GMEM_PERM_RW) != GMEM_OK) {
+        RET(0);
+        return;
+    }
+    NvnGuestHandle prev;
+    if (sync_read_handle(guest, &prev)) sync_slot_retire(prev.slot_index, prev.generation);
+    NvnGuestHandle h;
+    sync_slot_alloc(&h);
+    guest_mem_write_checked(guest, &h, sizeof h, 8);
+    nvn_diag_record(NVN_EV_INIT, NVN_OBJ_SYNC, 1, guest, h.slot_index, h.generation, h.rt_epoch, 0, c->x[30], false, 0, 0);
+    RET(1);
+}
+NVN(nvnSyncFinalize) {
+    uint64_t guest = A(0);
+    NvnGuestHandle h;
+    if (sync_read_handle(guest, &h)) {
+        sync_slot_retire(h.slot_index, h.generation);
+        nvn_diag_record(NVN_EV_FINALIZE, NVN_OBJ_SYNC, 0, guest, h.slot_index, h.generation, h.rt_epoch, 0, c->x[30], false, 0, 0);
+    }
+    uint8_t zeros[sizeof(NvnGuestHandle)] = {0};
+    guest_mem_write_checked(guest, zeros, sizeof zeros, 8);
+}
 NVN(nvnSyncSetDebugLabel) { (void)c; }
 void renderer_flush(void);
 NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
+    NvnSync *sync = nvn_sync_host(A(0));
 #ifndef __APPLE__
-    if (getenv("FE3H_TIMED_SYNC")) {
+    static int timed = -1;
+    if (timed < 0) {
+        const char *e = getenv("FE3H_TIMED_SYNC");
+        timed = (!e || atoi(e) != 0) ? 1 : 0;
+    }
+    if (timed) {
         extern int renderer_wait_seq_timeout(uint64_t seq, uint64_t timeout_ns);
-        NvnSync *sync = sync_of(A(0));
-        RET(sync->signaled ? renderer_wait_seq_timeout(sync->seq, A(1)) : 2);
+        if (!sync) { RET(0); return; }
+        uint64_t timeout_ns = A(1);
+        int sig = atomic_load_explicit(&sync->signaled, memory_order_acquire);
+        if (!sig && timeout_ns > 0) {
+            uint64_t cap = timeout_ns > 2000000000ull ? 2000000000ull : timeout_ns;
+            struct timespec ts0, now;
+            clock_gettime(CLOCK_MONOTONIC, &ts0);
+            uint64_t elapsed = 0;
+            while (!sig && elapsed < cap) {
+                struct timespec slp = {0, 100000};
+                nanosleep(&slp, NULL);
+                sig = atomic_load_explicit(&sync->signaled, memory_order_acquire);
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                elapsed = (uint64_t)(now.tv_sec - ts0.tv_sec) * 1000000000ull +
+                          (uint64_t)(now.tv_nsec - ts0.tv_nsec);
+            }
+            if (sig && timeout_ns != UINT64_MAX) {
+                timeout_ns = timeout_ns > elapsed ? timeout_ns - elapsed : 0;
+            }
+        }
+        if (!sig) { RET(2); return; }
+        uint64_t seq = atomic_load_explicit(&sync->seq, memory_order_acquire);
+        RET(renderer_wait_seq_timeout(seq, timeout_ns));
         return;
     }
 #endif
@@ -224,36 +631,197 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (whole < 0) whole = getenv("LARECOMP_SYNC_ALL") ? 1 : 0;
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
-    else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
+    else if (sync) renderer_wait_seq(atomic_load_explicit(&sync->seq, memory_order_acquire));
     RET(0);
 }
 NVN(nvnSyncCreateGLSync) { RET(0); }
 NVN(nvnSyncInitializeFromFencedGLSync) { RET(0); }
 
 // EventBuilder: pool@0 offset@8 ; Event: storage address (u32 value lives in guest memory)
-NVN(nvnEventBuilderSetDefaults) { G(uint64_t, A(0), 0) = 0; G(uint64_t, A(0), 8) = 0; }
-NVN(nvnEventBuilderSetStorage) { G(uint64_t, A(0), 0) = A(1); G(uint64_t, A(0), 8) = A(2); }
-NVN(nvnEventBuilderGetStorage) { RET(G(uint64_t, A(0), 0)); }
-NVN(nvnEventBuilderGetMemoryPool) { RET(G(uint64_t, A(0), 0)); }
-NVN(nvnEventBuilderGetMemoryOffset) { RET(G(uint64_t, A(0), 8)); }
-static uint64_t event_addr(uint64_t ev) { return G(uint64_t, ev, 0); }
+NVN(nvnEventBuilderSetDefaults) {
+    if (guest_mem_validate_range(A(0), 16, 8, GMEM_PERM_RW) != GMEM_OK) return;
+    G(uint64_t, A(0), 0) = 0; G(uint64_t, A(0), 8) = 0;
+}
+NVN(nvnEventBuilderSetStorage) {
+    if (guest_mem_validate_range(A(0), 16, 8, GMEM_PERM_RW) != GMEM_OK) return;
+    G(uint64_t, A(0), 0) = A(1); G(uint64_t, A(0), 8) = A(2);
+}
+NVN(nvnEventBuilderGetStorage) {
+    uint64_t v = 0; guest_mem_read_checked(A(0), &v, 8, 8); RET(v);
+}
+NVN(nvnEventBuilderGetMemoryPool) {
+    uint64_t v = 0; guest_mem_read_checked(A(0), &v, 8, 8); RET(v);
+}
+NVN(nvnEventBuilderGetMemoryOffset) {
+    uint64_t v = 0; guest_mem_read_checked(A(0) + 8, &v, 8, 8); RET(v);
+}
+static uint64_t event_addr(uint64_t ev) {
+    uint64_t addr = 0;
+    guest_mem_read_checked(ev, &addr, sizeof addr, 8);
+    return addr;
+}
 NVN(nvnEventInitialize) {
+    if (guest_mem_validate_range(A(0), 24, 8, GMEM_PERM_RW) != GMEM_OK ||
+        guest_mem_validate_range(A(1), 16, 8, GMEM_PERM_R) != GMEM_OK) {
+        RET(0);
+        return;
+    }
     uint64_t pool = G(uint64_t, A(1), 0), off = G(uint64_t, A(1), 8);
-    G(uint64_t, A(0), 0) = HOST(NvnPool, pool)->storage + off;
+    NvnPool *p = HOST(NvnPool, pool);
+    if (!p) { RET(0); return; }
+    G(uint64_t, A(0), 0) = p->storage + off;
     G(uint64_t, A(0), 8) = pool;
     G(uint64_t, A(0), 16) = off;
     RET(1);
 }
 NVN(nvnEventFinalize) { (void)c; }
-NVN(nvnEventGetValue) { RET(*(uint32_t *)(uintptr_t)event_addr(A(0))); }
-NVN(nvnEventSignal) { *(uint32_t *)(uintptr_t)event_addr(A(0)) = (uint32_t)A(2); }
-NVN(nvnEventGetMemoryPool) { RET(G(uint64_t, A(0), 8)); }
-NVN(nvnEventGetMemoryOffset) { RET(G(uint64_t, A(0), 16)); }
+NVN(nvnEventGetValue) {
+    uint64_t addr = event_addr(A(0));
+    uint32_t v = 0;
+    guest_mem_read_checked(addr, &v, sizeof v, 4);
+    RET(v);
+}
+NVN(nvnEventSignal) {
+    uint64_t addr = event_addr(A(0));
+    uint32_t v = (uint32_t)A(2);
+    guest_mem_write_checked(addr, &v, sizeof v, 4);
+}
+NVN(nvnEventGetMemoryPool) {
+    uint64_t v = 0; guest_mem_read_checked(A(0) + 8, &v, 8, 8); RET(v);
+}
+NVN(nvnEventGetMemoryOffset) {
+    uint64_t v = 0; guest_mem_read_checked(A(0) + 16, &v, 8, 8); RET(v);
+}
 
-// ================================================================== memory pools
+// ================================================================== memory pools (Phase 5A generational)
+#define NVN_POOL_PAGE_SHIFT 8u
+#define NVN_POOL_PAGE_SIZE  (1u << NVN_POOL_PAGE_SHIFT)
+#define NVN_POOL_PAGE_MASK  (NVN_POOL_PAGE_SIZE - 1u)
+#define NVN_POOL_MAX_PAGES  256u
+#define NVN_POOL_MAX_SLOTS  (NVN_POOL_PAGE_SIZE * NVN_POOL_MAX_PAGES)
+#define NVN_POOL_QUARANTINE 256u
+#define NVN_POOL_QRING_CAP  512u
+
+typedef struct NvnPoolSlot {
+    _Atomic uint32_t generation;
+    _Atomic uint32_t state;
+    NvnPool pool;
+} NvnPoolSlot;
+
+static _Atomic(NvnPoolSlot *) g_pool_pages[NVN_POOL_MAX_PAGES];
+static _Atomic uint16_t g_pool_epoch = 1;
+static pthread_mutex_t g_pool_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_pool_next_fresh = 0;
+static uint32_t g_pool_qring[NVN_POOL_QRING_CAP];
+static uint32_t g_pool_qhead = 0, g_pool_qtail = 0, g_pool_qcount = 0;
+
+static NvnPoolSlot *pool_slot_at(uint32_t idx) {
+    if (idx >= NVN_POOL_MAX_SLOTS) return NULL;
+    NvnPoolSlot *page = atomic_load_explicit(&g_pool_pages[idx >> NVN_POOL_PAGE_SHIFT], memory_order_acquire);
+    return page ? &page[idx & NVN_POOL_PAGE_MASK] : NULL;
+}
+
+static NvnPoolSlot *pool_slot_alloc(NvnGuestHandle *out_hdr) {
+    pthread_mutex_lock(&g_pool_alloc_lock);
+    uint32_t idx = UINT32_MAX;
+    if (g_pool_qcount >= NVN_POOL_QUARANTINE) {
+        idx = g_pool_qring[g_pool_qhead];
+        g_pool_qhead = (g_pool_qhead + 1u) & (NVN_POOL_QRING_CAP - 1u);
+        g_pool_qcount--;
+    } else if (g_pool_next_fresh < NVN_POOL_MAX_SLOTS) {
+        idx = g_pool_next_fresh++;
+    } else if (g_pool_qcount > 0) {
+        idx = g_pool_qring[g_pool_qhead];
+        g_pool_qhead = (g_pool_qhead + 1u) & (NVN_POOL_QRING_CAP - 1u);
+        g_pool_qcount--;
+    } else {
+        pthread_mutex_unlock(&g_pool_alloc_lock);
+        FATAL("NVN memory pool slot table exhausted (%u slots)\n", NVN_POOL_MAX_SLOTS);
+    }
+    uint32_t p = idx >> NVN_POOL_PAGE_SHIFT;
+    NvnPoolSlot *page = atomic_load_explicit(&g_pool_pages[p], memory_order_relaxed);
+    if (!page) {
+        page = calloc(NVN_POOL_PAGE_SIZE, sizeof(NvnPoolSlot));
+        if (!page) {
+            pthread_mutex_unlock(&g_pool_alloc_lock);
+            FATAL("NVN memory pool page allocation failed\n");
+        }
+        atomic_store_explicit(&g_pool_pages[p], page, memory_order_release);
+    }
+    NvnPoolSlot *s = &page[idx & NVN_POOL_PAGE_MASK];
+    uint32_t gen = atomic_load_explicit(&s->generation, memory_order_relaxed) + 1u;
+    if (!gen) gen = 1u;
+    atomic_store_explicit(&s->state, TEX_SLOT_FREE, memory_order_release);
+    atomic_store_explicit(&s->generation, gen, memory_order_release);
+    memset(&s->pool, 0, sizeof s->pool);
+    uint16_t ep = atomic_load_explicit(&g_pool_epoch, memory_order_relaxed);
+    pthread_mutex_unlock(&g_pool_alloc_lock);
+
+    NvnGuestHandle h = {
+        .magic = NVN_MAGIC_POOL_LIVE,
+        .slot_index = idx,
+        .generation = gen,
+        .rt_epoch = ep,
+        .tag16 = 0,
+    };
+    h.tag16 = nvn_handle_compute_tag(&h, NVN_OBJ_POOL);
+    *out_hdr = h;
+    return s;
+}
+
+static bool pool_slot_retire(uint32_t idx, uint32_t gen) {
+    pthread_mutex_lock(&g_pool_alloc_lock);
+    NvnPoolSlot *s = pool_slot_at(idx);
+    bool ok = false;
+    if (s && atomic_load_explicit(&s->generation, memory_order_relaxed) == gen &&
+        atomic_load_explicit(&s->state, memory_order_relaxed) == TEX_SLOT_ALIVE) {
+        atomic_store_explicit(&s->state, TEX_SLOT_RETIRED, memory_order_release);
+        if (g_pool_qcount < NVN_POOL_QRING_CAP) {
+            g_pool_qring[g_pool_qtail] = idx;
+            g_pool_qtail = (g_pool_qtail + 1u) & (NVN_POOL_QRING_CAP - 1u);
+            g_pool_qcount++;
+        }
+        ok = true;
+    }
+    pthread_mutex_unlock(&g_pool_alloc_lock);
+    return ok;
+}
+
+RT_ON_RESET(pool_identities_reset) {
+    pthread_mutex_lock(&g_pool_alloc_lock);
+    uint16_t next_ep = (uint16_t)(atomic_load_explicit(&g_pool_epoch, memory_order_relaxed) + 1u);
+    if (!next_ep) next_ep = 1u;
+    atomic_store_explicit(&g_pool_epoch, next_ep, memory_order_release);
+    for (uint32_t p = 0; p < NVN_POOL_MAX_PAGES; p++) {
+        NvnPoolSlot *page = atomic_exchange_explicit(&g_pool_pages[p], NULL, memory_order_acq_rel);
+        free(page);
+    }
+    g_pool_next_fresh = 0;
+    g_pool_qhead = g_pool_qtail = g_pool_qcount = 0;
+    pthread_mutex_unlock(&g_pool_alloc_lock);
+}
+
+static bool pool_read_handle(uint64_t guest, NvnGuestHandle *out) {
+    if (guest_mem_read_checked(guest, out, sizeof *out, 8) != GMEM_OK) return false;
+    if (out->magic != NVN_MAGIC_POOL_LIVE) return false;
+    if (out->tag16 != nvn_handle_compute_tag(out, NVN_OBJ_POOL)) return false;
+    if (out->rt_epoch != atomic_load_explicit(&g_pool_epoch, memory_order_acquire)) return false;
+    return true;
+}
+
+NvnPool *nvn_pool_host(uint64_t guest) {
+    NvnGuestHandle h;
+    if (!pool_read_handle(guest, &h)) return NULL;
+    NvnPoolSlot *s = pool_slot_at(h.slot_index);
+    if (!s) return NULL;
+    if (atomic_load_explicit(&s->state, memory_order_acquire) != TEX_SLOT_ALIVE) return NULL;
+    if (atomic_load_explicit(&s->generation, memory_order_acquire) != h.generation) return NULL;
+    return &s->pool;
+}
+
 // Builder: device@0 flags@8 storage@0x10 size@0x18
 NVN(nvnMemoryPoolBuilderSetDevice) { G(uint64_t, A(0), 0) = A(1); }
-NVN(nvnMemoryPoolBuilderSetDefaults) { memset(AP(0), 0, 0x20); G(uint32_t, A(0), 8) = 0x9; }
+NVN(nvnMemoryPoolBuilderSetDefaults) { memset((uint8_t *)AP(0) + 8, 0, 0x18); G(uint32_t, A(0), 8) = 0x9; }
 NVN(nvnMemoryPoolBuilderSetFlags) { G(uint32_t, A(0), 8) = (uint32_t)A(1); }
 NVN(nvnMemoryPoolBuilderSetStorage) { G(uint64_t, A(0), 0x10) = A(1); G(uint64_t, A(0), 0x18) = A(2); }
 NVN(nvnMemoryPoolBuilderGetDevice) { RET(G(uint64_t, A(0), 0)); }
@@ -262,24 +830,77 @@ NVN(nvnMemoryPoolBuilderGetMemory) { RET(G(uint64_t, A(0), 0x10)); }
 NVN(nvnMemoryPoolBuilderGetSize) { RET(G(uint64_t, A(0), 0x18)); }
 
 NVN(nvnMemoryPoolInitialize) {
-    NvnPool *p = calloc(1, sizeof *p);
-    p->storage = G(uint64_t, A(1), 0x10);
-    p->size = G(uint64_t, A(1), 0x18);
-    p->flags = G(uint32_t, A(1), 8);
+    uint64_t guest = A(0), builder = A(1);
+    if (guest_mem_validate_range(guest, sizeof(NvnGuestHandle), 8, GMEM_PERM_RW) != GMEM_OK ||
+        guest_mem_validate_range(builder, 0x20, 8, GMEM_PERM_R) != GMEM_OK) {
+        nvn_diag_record(NVN_EV_LOOKUP_FAIL, NVN_OBJ_POOL, 0, guest, 0, 0, 0, 0, c->x[30], false, builder, 0);
+        nvn_trace_record(NVN_TR_POOL_INIT_FAIL, guest, builder, 0, 0, c->x[30]);
+        uint64_t cnt = 0;
+        if (nvn_diag_should_log(NVN_EV_LOOKUP_FAIL, 0xFE, c->x[30], &cnt)) {
+            LOG("[nvn-diag] nvnMemoryPoolInitialize validation failed (x%llu): guest=%llx builder=%llx lr=%llx\n",
+                (unsigned long long)cnt, (unsigned long long)guest, (unsigned long long)builder,
+                (unsigned long long)c->x[30]);
+        }
+        RET(0);
+        return;
+    }
+    NvnGuestHandle prev;
+    if (pool_read_handle(guest, &prev)) pool_slot_retire(prev.slot_index, prev.generation);
+    NvnGuestHandle h;
+    NvnPoolSlot *slot = pool_slot_alloc(&h);
+    NvnPool *p = &slot->pool;
+    p->storage = G(uint64_t, builder, 0x10);
+    p->size = G(uint64_t, builder, 0x18);
+    p->flags = G(uint32_t, builder, 8);
+    atomic_store_explicit(&slot->state, TEX_SLOT_ALIVE, memory_order_release);
     if (getenv("LARECOMP_LOG_POOLS"))  // (FE3H makes a transient pool thousands of times a session)
         LOG("[nvn] memory pool storage %llx size %llx flags %#x\n", (unsigned long long)p->storage, (unsigned long long)p->size, p->flags);
-    SET_HOST(A(0), p);
+#ifndef __APPLE__
+    {
+        extern void vk_alias_pool_register(uint64_t storage, uint64_t size) __attribute__((weak));
+        if (vk_alias_pool_register) vk_alias_pool_register(p->storage, p->size);
+    }
+#endif
+    guest_mem_write_checked(guest, &h, sizeof h, 8);
+    nvn_diag_record(NVN_EV_INIT, NVN_OBJ_POOL, 1, guest, h.slot_index, h.generation, h.rt_epoch, 0, c->x[30], false, 0, 0);
     RET(1);
 }
-NVN(nvnMemoryPoolFinalize) { free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnMemoryPoolFinalize) {
+    uint64_t guest = A(0);
+    NvnGuestHandle h;
+    if (pool_read_handle(guest, &h)) {
+        NvnPoolSlot *s = pool_slot_at(h.slot_index);
+        uint64_t p_storage = s ? s->pool.storage : 0;
+        uint64_t p_size = s ? s->pool.size : 0;
+        bool retired = pool_slot_retire(h.slot_index, h.generation);
+#ifndef __APPLE__
+        if (retired && p_size && p_storage >= ALIAS_BASE && p_storage < ALIAS_BASE + ALIAS_SIZE) {
+            extern void vk_alias_pool_unregister(uint64_t addr, uint64_t size) __attribute__((weak));
+            if (vk_alias_pool_unregister) vk_alias_pool_unregister(p_storage, p_size);
+        }
+#else
+        (void)retired; (void)p_storage; (void)p_size;
+#endif
+        NvnGuestHandle fin = {
+            .magic = NVN_MAGIC_POOL_FIN,
+            .slot_index = h.slot_index,
+            .generation = h.generation,
+            .rt_epoch = h.rt_epoch,
+            .tag16 = 0,
+        };
+        fin.tag16 = nvn_handle_compute_tag(&fin, NVN_OBJ_POOL);
+        guest_mem_write_checked(guest, &fin, sizeof fin, 8);
+        nvn_diag_record(NVN_EV_FINALIZE, NVN_OBJ_POOL, 0, guest, h.slot_index, h.generation, h.rt_epoch, 0, c->x[30], false, 0, 0);
+    }
+}
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
-NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
-NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
-NVN(nvnMemoryPoolGetSize) { RET(HOST(NvnPool, A(0))->size); }
-NVN(nvnMemoryPoolGetFlags) { RET(HOST(NvnPool, A(0))->flags); }
+NVN(nvnMemoryPoolMap) { NvnPool *p = HOST(NvnPool, A(0)); RET(p ? p->storage : 0); }
+NVN(nvnMemoryPoolGetBufferAddress) { NvnPool *p = HOST(NvnPool, A(0)); RET(p ? p->storage : 0); }  // GPU address == CPU address
+NVN(nvnMemoryPoolGetSize) { NvnPool *p = HOST(NvnPool, A(0)); RET(p ? p->size : 0); }
+NVN(nvnMemoryPoolGetFlags) { NvnPool *p = HOST(NvnPool, A(0)); RET(p ? p->flags : 0); }
 NVN(nvnMemoryPoolFlushMappedRange) {
     NvnPool *p = HOST(NvnPool, A(0));
-    backend_pool_written(p->storage + A(1), A(2));
+    if (p) backend_pool_written(p->storage + A(1), A(2));
 }
 NVN(nvnMemoryPoolInvalidateMappedRange) { (void)c; }
 // MapVirtual(pool, numRequests, const NVNmappingRequest *): {physicalPool*, physicalOffset, virtualOffset, size,
@@ -287,6 +908,7 @@ NVN(nvnMemoryPoolInvalidateMappedRange) { (void)c; }
 NVN(nvnMemoryPoolMapVirtual) {
     static int nlog;
     NvnPool *vp = HOST(NvnPool, A(0));
+    if (!vp) { RET(0); return; }
     int n = (int)A(1);
     for (int i = 0; i < n && nlog < 40; i++, nlog++) {
         const uint8_t *rq = (const uint8_t *)AP(2) + i * 0x28;
@@ -304,7 +926,7 @@ NVN(nvnMemoryPoolMapVirtual) {
 // ================================================================== buffers
 // Builder: device@0 pool@8 offset@0x10 size@0x18. Buffer: address@0 pool@8 offset@0x10 size@0x18 id@0x20
 NVN(nvnBufferBuilderSetDevice) { G(uint64_t, A(0), 0) = A(1); }
-NVN(nvnBufferBuilderSetDefaults) { memset(AP(0) + 8, 0, 0x18); }
+NVN(nvnBufferBuilderSetDefaults) { memset((uint8_t *)AP(0) + 8, 0, 0x18); }
 NVN(nvnBufferBuilderSetStorage) {
     G(uint64_t, A(0), 8) = A(1); G(uint64_t, A(0), 0x10) = A(2); G(uint64_t, A(0), 0x18) = A(3);
 }
@@ -313,23 +935,38 @@ NVN(nvnBufferBuilderGetMemoryPool) { RET(G(uint64_t, A(0), 8)); }
 NVN(nvnBufferBuilderGetMemoryOffset) { RET(G(uint64_t, A(0), 0x10)); }
 NVN(nvnBufferBuilderGetSize) { RET(G(uint64_t, A(0), 0x18)); }
 NVN(nvnBufferInitialize) {
+    if (guest_mem_validate_range(A(0), 0x28, 8, GMEM_PERM_RW) != GMEM_OK ||
+        guest_mem_validate_range(A(1), 0x20, 8, GMEM_PERM_R) != GMEM_OK) {
+        RET(0);
+        return;
+    }
     uint64_t pool = G(uint64_t, A(1), 8), off = G(uint64_t, A(1), 0x10);
-    G(uint64_t, A(0), 0) = HOST(NvnPool, pool)->storage + off;
+    NvnPool *p = HOST(NvnPool, pool);
+    if (!p) { RET(0); return; }
+    G(uint64_t, A(0), 0) = p->storage + off;
     G(uint64_t, A(0), 8) = pool;
     G(uint64_t, A(0), 0x10) = off;
     G(uint64_t, A(0), 0x18) = G(uint64_t, A(1), 0x18);
-    G(uint64_t, A(0), 0x20) = next_debug_id++;
+    G(uint64_t, A(0), 0x20) = alloc_debug_id();
     RET(1);
+}
+static uint64_t buf_read_u64(uint64_t guest, uint64_t off) {
+    uint64_t v = 0;
+    if (guest) guest_mem_read_checked(guest + off, &v, sizeof v, 8);
+    return v;
 }
 NVN(nvnBufferFinalize) { (void)c; }
 NVN(nvnBufferSetDebugLabel) { (void)c; }
-NVN(nvnBufferMap) { RET(G(uint64_t, A(0), 0)); }
-NVN(nvnBufferGetAddress) { RET(G(uint64_t, A(0), 0)); }
-NVN(nvnBufferGetMemoryPool) { RET(G(uint64_t, A(0), 8)); }
-NVN(nvnBufferGetMemoryOffset) { RET(G(uint64_t, A(0), 0x10)); }
-NVN(nvnBufferGetSize) { RET(G(uint64_t, A(0), 0x18)); }
-NVN(nvnBufferGetDebugID) { RET(G(uint64_t, A(0), 0x20)); }
-NVN(nvnBufferFlushMappedRange) { backend_pool_written(G(uint64_t, A(0), 0) + A(1), A(2)); }
+NVN(nvnBufferMap) { RET(buf_read_u64(A(0), 0)); }
+NVN(nvnBufferGetAddress) { RET(buf_read_u64(A(0), 0)); }
+NVN(nvnBufferGetMemoryPool) { RET(buf_read_u64(A(0), 8)); }
+NVN(nvnBufferGetMemoryOffset) { RET(buf_read_u64(A(0), 0x10)); }
+NVN(nvnBufferGetSize) { RET(buf_read_u64(A(0), 0x18)); }
+NVN(nvnBufferGetDebugID) { RET(buf_read_u64(A(0), 0x20)); }
+NVN(nvnBufferFlushMappedRange) {
+    uint64_t base = buf_read_u64(A(0), 0);
+    if (base) backend_pool_written(base + A(1), A(2));
+}
 NVN(nvnBufferInvalidateMappedRange) { (void)c; }
 
 // ================================================================== textures
@@ -345,8 +982,18 @@ NVN(nvnTextureBuilderSetDefaults) {
     TB(uint32_t, 0x1C) = 1;
     TB(uint8_t, 0x28) = 2; TB(uint8_t, 0x29) = 3; TB(uint8_t, 0x2A) = 4; TB(uint8_t, 0x2B) = 5;
 }
-NVN(nvnTextureBuilderSetFlags) { TB(uint32_t, 8) = (uint32_t)A(1); }
-NVN(nvnTextureBuilderSetTarget) { TB(uint32_t, 0xC) = (uint32_t)A(1); }
+NVN(nvnTextureBuilderSetFlags) {
+    TB(uint32_t, 8) = (uint32_t)A(1);
+    nvn_trace_record(NVN_TR_TEX_FLAGS, A(0), (uint32_t)A(1),
+                     (uint64_t)TB(uint32_t, 0x10) | ((uint64_t)TB(uint32_t, 0x14) << 32),
+                     (uint64_t)TB(uint32_t, 0x20) | ((uint64_t)TB(uint32_t, 0x1C) << 32), c->x[30]);
+}
+NVN(nvnTextureBuilderSetTarget) {
+    TB(uint32_t, 0xC) = (uint32_t)A(1);
+    nvn_trace_record(NVN_TR_TEX_TARGET, A(0), (uint32_t)A(1),
+                     (uint64_t)TB(uint32_t, 0x10) | ((uint64_t)TB(uint32_t, 0x14) << 32),
+                     (uint64_t)TB(uint32_t, 0x20) | ((uint64_t)TB(uint32_t, 0x24) << 32), c->x[30]);
+}
 NVN(nvnTextureBuilderSetWidth) { TB(uint32_t, 0x10) = (uint32_t)A(1); }
 NVN(nvnTextureBuilderSetHeight) { TB(uint32_t, 0x14) = (uint32_t)A(1); }
 NVN(nvnTextureBuilderSetDepth) { TB(uint32_t, 0x18) = (uint32_t)A(1); }
@@ -420,20 +1067,73 @@ static void builder_layout(uint64_t b, TexLayout *t) {
 
 static bool is_linear(uint64_t b) { return (G(uint32_t, b, 8) & 0x10) || G(uint32_t, b, 0xC) == 10; }
 
-static uint64_t builder_storage_size(uint64_t b) {
-    if (G(uint32_t, b, 0xC) == 10) {  // buffer texture
-        return (uint64_t)G(uint32_t, b, 0x10) * nvn_format_info(G(uint32_t, b, 0x20))->bpb;
+// Scale sample grid for 2D multisample / multisample-array targets (NVN targets 5 and 6)
+// using Tegra X1 block-linear sample multipliers so RT pools never under-allocate or alias.
+static void msaa_scale_dims(uint32_t target, uint32_t samples, uint32_t *w, uint32_t *h) {
+    if ((target != 5 && target != 6) || samples <= 1) return;
+    uint32_t sx = samples >= 8 ? 4u : 2u;
+    uint32_t sy = samples >= 16 ? 4u : (samples >= 4 ? 2u : 1u);
+    *w *= sx;
+    *h *= sy;
+}
+
+static uint64_t compute_tex_storage_size(uint32_t target, uint32_t flags, uint32_t width, uint32_t height,
+                                         uint32_t format, uint32_t samples, uint64_t stride,
+                                         const TexLayout *base_layout) {
+    if (target == 10) return (uint64_t)width * nvn_format_info(format)->bpb;  // buffer texture
+    if (flags & 0x10) return stride * height;
+    TexLayout sz = *base_layout;
+    if ((target == 5 || target == 6) && samples > 1) {
+        msaa_scale_dims(target, samples, &sz.width, &sz.height);
+        tegra_layout_init(&sz);
     }
-    if (is_linear(b)) return G(uint64_t, b, 0x30) * G(uint32_t, b, 0x14);
+    return tegra_total_size(&sz);
+}
+
+static uint64_t builder_storage_size(uint64_t b) {
+    TexLayout t = {0};
+    uint32_t target = G(uint32_t, b, 0xC);
+    uint32_t flags = G(uint32_t, b, 8);
+    uint32_t width = G(uint32_t, b, 0x10);
+    uint32_t height = G(uint32_t, b, 0x14);
+    uint32_t format = G(uint32_t, b, 0x20);
+    uint32_t samples = G(uint32_t, b, 0x24);
+    uint64_t stride = G(uint64_t, b, 0x30);
+    if (target != 10 && !(flags & 0x10)) builder_layout(b, &t);
+    return compute_tex_storage_size(target, flags, width, height, format, samples, stride, &t);
+}
+
+static uint64_t builder_storage_alignment(uint64_t b) {
+    if (is_linear(b)) return 32;
+    uint32_t flags = G(uint32_t, b, 8);
+    uint32_t target = G(uint32_t, b, 0xC);
+    uint32_t samples = G(uint32_t, b, 0x24);
+    // NVN compressible textures (flags & 8) and MSAA targets require 64 KB alignment.
+    if ((flags & 8u) || ((target == 5 || target == 6) && samples > 1)) return 65536ull;
     TexLayout t = {0};
     builder_layout(b, &t);
-    return tegra_total_size(&t);
+    uint64_t blk = 512ull << t.block_height_log2;
+    return blk > 512ull ? blk : 512ull;
 }
-NVN(nvnTextureBuilderGetStorageSize) { RET(builder_storage_size(A(0))); }
-NVN(nvnTextureBuilderGetStorageAlignment) { RET(is_linear(A(0)) ? 32 : 512); }
 
-static NvnTexture *texture_from_builder(uint64_t b) {
-    NvnTexture *t = calloc(1, sizeof *t);
+NVN(nvnTextureBuilderGetStorageSize) {
+    uint64_t b = A(0);
+    uint64_t sz = builder_storage_size(b);
+    nvn_trace_record(NVN_TR_TEX_STORAGE_SIZE, b, sz,
+                     (uint64_t)G(uint32_t, b, 0x10) | ((uint64_t)G(uint32_t, b, 0x14) << 32),
+                     (uint64_t)G(uint32_t, b, 0x20) | ((uint64_t)G(uint32_t, b, 0xC) << 32) |
+                     ((uint64_t)G(uint32_t, b, 0x24) << 40), c->x[30]);
+    RET(sz);
+}
+NVN(nvnTextureBuilderGetStorageAlignment) {
+    uint64_t b = A(0);
+    uint64_t al = builder_storage_alignment(b);
+    nvn_trace_record(NVN_TR_TEX_STORAGE_ALIGN, b, al, G(uint32_t, b, 8),
+                     (uint64_t)G(uint32_t, b, 0xC) | ((uint64_t)G(uint32_t, b, 0x24) << 32), c->x[30]);
+    RET(al);
+}
+
+static void texture_fill_from_builder(NvnTexture *t, uint64_t b) {
     t->target = G(uint32_t, b, 0xC);
     t->flags = G(uint32_t, b, 8);
     t->width = G(uint32_t, b, 0x10);
@@ -447,107 +1147,294 @@ static NvnTexture *texture_from_builder(uint64_t b) {
     t->stride = G(uint64_t, b, 0x30);
     uint64_t pool = G(uint64_t, b, 0x38);
     t->guest_pool = pool;
-    t->pool = pool ? HOST(NvnPool, pool) : NULL;
-    t->pool_size = t->pool ? t->pool->size : 0;
+    t->pool = NULL;  // Phase 5A: never retain a raw NvnPool* pointer that can dangle after pool finalize
+    t->pool_slot = 0; t->pool_gen = 0; t->pool_epoch = 0;
+    NvnPool *p = NULL;
+    if (pool) {
+        NvnGuestHandle ph;
+        if (pool_read_handle(pool, &ph)) {
+            t->pool_slot = ph.slot_index;
+            t->pool_gen = ph.generation;
+            t->pool_epoch = ph.rt_epoch;
+        }
+        p = nvn_pool_host(pool);
+    }
+    t->pool_size = p ? p->size : 0;
     t->pool_offset = G(uint64_t, b, 0x40);
-    t->addr = t->pool ? t->pool->storage + t->pool_offset : 0;
+    t->addr = p ? p->storage + t->pool_offset : 0;
     builder_layout(b, &t->layout);
-    t->debug_id = next_debug_id++;
-    return t;
+    t->debug_id = alloc_debug_id();
+}
+
+static bool nvn_strict_mode(void) {
+    const char *e = getenv("ENGAGE_NVN_STRICT");
+    return e && *e && strcmp(e, "0") != 0;
+}
+
+static uint64_t texture_storage_size(const NvnTexture *t) {
+    return compute_tex_storage_size(t->target, t->flags, t->width, t->height,
+                                    t->format, t->samples, t->stride, &t->layout);
 }
 
 NVN(nvnTextureInitialize) {
-    NvnTexture *t = texture_from_builder(A(1));
+    uint64_t guest = A(0), builder = A(1);
+    if (guest_mem_validate_range(guest, 128, 8, GMEM_PERM_RW) != GMEM_OK ||
+        guest_mem_validate_range(builder, 128, 8, GMEM_PERM_R) != GMEM_OK) {
+        nvn_diag_record(NVN_EV_LOOKUP_FAIL, NVN_OBJ_TEXTURE, TEX_ST_BAD_ADDR, guest, 0, 0, 0, 0, c->x[30], false, 0, 0);
+        RET(0);
+        return;
+    }
+    // Detect re-initialization over an active original NVNtexture without prior Finalize.
+    NvnTexLookup prev = nvn_texture_lookup(guest);
+    if (prev.state == TEX_ST_LIVE_ORIG && prev.tex) {
+        bool retired = tex_slot_retire(prev.hdr.slot_index, prev.hdr.generation);
+        nvn_diag_record(NVN_EV_REINIT_OVER_LIVE, NVN_OBJ_TEXTURE, (uint8_t)prev.state, guest,
+                        prev.hdr.slot_index, prev.hdr.generation, prev.hdr.rt_epoch, 0, c->x[30], false, 0, 0);
+        if (retired) {
+            atomic_store_explicit(&prev.tex->finalized, true, memory_order_release);
+            backend_texture_destroyed(prev.tex);
+        }
+    }
+
+    NvnGuestHandle hdr;
+    NvnTexSlot *slot = tex_slot_alloc(guest, &hdr);
+    NvnTexture *t = &slot->tex;
+    atomic_store_explicit(&t->finalized, false, memory_order_release);
+    texture_fill_from_builder(t, builder);
+    tex_slot_publish_live(slot);
     if (t->flags & 2)
-        LOG("[nvn] video texture %p: %ux%u fmt %#x flags %#x target %u addr %llx stride %llu\n", t, t->width, t->height,
-            t->format, t->flags, t->target, t->addr, t->stride);
-    if (getenv("ENGAGE_TRACE_TEXTURES"))
-        LOG("[texture-life] init guest=%llx host=%p id=%llu levels=%u lr=%llx\n",
-            A(0), (void *)t, t->debug_id, t->levels, c->x[30]);
-    texture_identity_add(t);
-    memset(AP(0), 0, 128);
-    SET_HOST(A(0), t);
-    G(uint64_t, A(0), 8) = t->debug_id;
+        LOG("[nvn] video texture %p: %ux%u fmt %#x flags %#x target %u addr %llx stride %llu\n", (void *)t, t->width, t->height,
+            t->format, t->flags, t->target, (unsigned long long)t->addr, (unsigned long long)t->stride);
+    uint8_t zeros[112] = {0};
+    guest_mem_write_checked(guest, &hdr, sizeof hdr, 8);
+    guest_mem_write_checked(guest + 16, zeros, sizeof zeros, 8);
+    nvn_diag_record(NVN_EV_INIT, NVN_OBJ_TEXTURE, TEX_ST_LIVE_ORIG, guest, hdr.slot_index, hdr.generation,
+                    hdr.rt_epoch, 0, c->x[30], false, 0, 0);
     RET(1);
 }
 NVN(nvnTextureFinalize) {
-    NvnTexture *t = HOST(NvnTexture, A(0));
-    if (getenv("ENGAGE_TRACE_TEXTURES"))
-        LOG("[texture-life] finalize guest=%llx host=%p id=%llu lr=%llx\n",
-            A(0), (void *)t, t ? t->debug_id : 0, c->x[30]);
-    if (t) backend_texture_destroyed(t);
-    memset(AP(0), 0, 128);
+    uint64_t guest = A(0);
+    NvnTexLookup lk = nvn_texture_lookup(guest);
+    if (lk.state == TEX_ST_BAD_ADDR) {
+        nvn_diag_record(NVN_EV_LOOKUP_FAIL, NVN_OBJ_TEXTURE, TEX_ST_BAD_ADDR, guest, 0, 0, 0, 0, c->x[30], false, 0, 0);
+        return;
+    }
+    if (lk.state == TEX_ST_LIVE_ORIG || lk.state == TEX_ST_LIVE_COPY || lk.state == TEX_ST_STALE_COPY) {
+        bool retired_now = tex_slot_retire(lk.hdr.slot_index, lk.hdr.generation);
+        nvn_diag_record(retired_now ? NVN_EV_FINALIZE : NVN_EV_DOUBLE_FINALIZE, NVN_OBJ_TEXTURE, (uint8_t)lk.state,
+                        guest, lk.hdr.slot_index, lk.hdr.generation, lk.hdr.rt_epoch, 0, c->x[30], false, 0, 0);
+        if (lk.tex) {
+            atomic_store_explicit(&lk.tex->finalized, true, memory_order_release);
+            backend_texture_destroyed(lk.tex);
+        }
+        // Write finalized sentinel preserving (slot_index, generation, rt_epoch) so finalized
+        // instances remain distinguishable from ZEROED_GUEST.
+        NvnGuestHandle fin = lk.hdr;
+        fin.magic = NVN_MAGIC_TEX_FIN;
+        fin.tag16 = 0;
+        fin.tag16 = nvn_handle_compute_tag(&fin, NVN_OBJ_TEXTURE);
+        uint8_t zeros[112] = {0};
+        guest_mem_write_checked(guest, &fin, sizeof fin, 8);
+        guest_mem_write_checked(guest + 16, zeros, sizeof zeros, 8);
+        return;
+    }
+    if (lk.state == TEX_ST_FINALIZED_INST) {
+        nvn_diag_record(NVN_EV_DOUBLE_FINALIZE, NVN_OBJ_TEXTURE, (uint8_t)lk.state,
+                        guest, lk.hdr.slot_index, lk.hdr.generation, lk.hdr.rt_epoch, 0, c->x[30], false, 0, 0);
+        return;  // Keep existing finalized sentinel intact
+    }
+    // Zeroed / stale / alien: do not overwrite arbitrary alien memory; zeroed is already zero.
 }
 NVN(nvnTextureSetDebugLabel) {
     NvnTexture *t = HOST(NvnTexture, A(0));
     if (t && A(1)) strncpy(t->label, (const char *)AP(1), sizeof t->label - 1);
 }
-#define TEX texture_require(A(0))
-NVN(nvnTextureGetFlags) { RET(TEX->flags); }
-NVN(nvnTextureGetTarget) { RET(TEX->target); }
-NVN(nvnTextureGetWidth) { RET(TEX->width); }
-NVN(nvnTextureGetHeight) { RET(TEX->height); }
-NVN(nvnTextureGetDepth) { RET(TEX->depth); }
-NVN(nvnTextureGetLevels) {
-    NvnTexture *t = nvn_texture_host(A(0));
-    if (!t) {
-        // Unity probes pending native objects during streaming. Zero levels
-        // makes its existing range check defer use until initialization.
-        static unsigned pending_probes;
-        if (pending_probes++ < 20) LOG("[texture-life] deferred pending GetLevels guest=%llx lr=%llx\n", A(0), c->x[30]);
-        RET(0); return;
+static NvnTexture *texture_getter_lookup(uint64_t guest, const char *fn_name, uint64_t lr) {
+    NvnTexLookup lk = nvn_texture_lookup(guest);
+    if (lk.state == TEX_ST_LIVE_ORIG || lk.state == TEX_ST_LIVE_COPY) {
+        return lk.tex;
     }
-    if (getenv("ENGAGE_TRACE_TEXTURES"))
-        LOG("[texture-life] levels guest=%llx host=%p id=%llu levels=%u lr=%llx\n",
-            A(0), (void *)t, t->debug_id, t->levels, c->x[30]);
-    RET(t->levels);
+    if (lk.state == TEX_ST_STALE_COPY) {
+        uint64_t cnt = 0;
+        if (nvn_diag_should_log(NVN_EV_COPY_SEEN, (uint8_t)lk.state, lr, &cnt)) {
+            LOG("[nvn-diag] %s on value copy after sibling finalize (x%llu): guest=%llx slot=%u gen=%u lr=%llx\n",
+                fn_name, (unsigned long long)cnt, (unsigned long long)guest, lk.hdr.slot_index, lk.hdr.generation,
+                (unsigned long long)lr);
+        }
+        return lk.tex;
+    }
+    if (lk.state == TEX_ST_ZEROED) {
+        // Legitimate pending / uninitialized zeroed struct probed by Unity during streaming.
+        uint64_t cnt = 0;
+        if (nvn_diag_should_log(NVN_EV_LOOKUP_FAIL, (uint8_t)lk.state, lr, &cnt)) {
+            LOG("[texture-life] deferred pending %s (x%llu) guest=%llx lr=%llx\n",
+                fn_name, (unsigned long long)cnt, (unsigned long long)guest, (unsigned long long)lr);
+        }
+        return NULL;
+    }
+    if (lk.state == TEX_ST_BAD_ADDR && lk.mem_status == GMEM_NULL) {
+        return NULL;
+    }
+    uint64_t q0 = 0, q1 = 0;
+    if (lk.raw_valid) {
+        memcpy(&q0, &lk.hdr, 8);
+        memcpy(&q1, (const uint8_t *)&lk.hdr + 8, 8);
+    }
+    nvn_diag_record(NVN_EV_LOOKUP_FAIL, NVN_OBJ_TEXTURE, (uint8_t)lk.state, guest,
+                    lk.hdr.slot_index, lk.hdr.generation, lk.hdr.rt_epoch, 0, lr,
+                    lk.raw_valid, q0, q1);
+    if (lk.state == TEX_ST_CORRUPT) {
+        if (nvn_strict_mode()) {
+            nvn_diag_dump_for_addr(fn_name, guest, lk.hdr.slot_index, lk.hdr.generation, lr);
+            nvn_trace_dump(fn_name);
+            FATAL("[texture-life] corrupt NVNtexture in %s: guest=%llx raw=[%016llx %016llx] lr=%llx\n",
+                  fn_name, (unsigned long long)guest, (unsigned long long)q0, (unsigned long long)q1,
+                  (unsigned long long)lr);
+        }
+        uint64_t cnt = 0;
+        if (nvn_diag_should_log(NVN_EV_LOOKUP_FAIL, (uint8_t)lk.state, lr, &cnt)) {
+            LOG("[nvn-diag] TAINTED/MITIGATED corrupt %s (x%llu): guest=%llx raw=[%016llx %016llx] lr=%llx\n",
+                fn_name, (unsigned long long)cnt, (unsigned long long)guest, (unsigned long long)q0,
+                (unsigned long long)q1, (unsigned long long)lr);
+            if (cnt == 1) {
+                nvn_diag_dump_for_addr(fn_name, guest, lk.hdr.slot_index, lk.hdr.generation, lr);
+                nvn_trace_dump(fn_name);
+            }
+        }
+        return NULL;
+    }
+    // FINALIZED_INST / STALE_RESET / STALE_RECYCLED / BAD_ADDR (non-NULL)
+    uint64_t cnt = 0;
+    if (nvn_diag_should_log(NVN_EV_LOOKUP_FAIL, (uint8_t)lk.state, lr, &cnt)) {
+        LOG("[nvn-diag] invalid %s (x%llu) state=%u mem=%s guest=%llx lr=%llx\n",
+            fn_name, (unsigned long long)cnt, (unsigned)lk.state, guest_mem_status_name(lk.mem_status),
+            (unsigned long long)guest, (unsigned long long)lr);
+    }
+    if (nvn_strict_mode()) {
+        nvn_diag_dump_for_addr(fn_name, guest, lk.hdr.slot_index, lk.hdr.generation, lr);
+        FATAL("[texture-life] invalid NVNtexture in %s: state=%u mem=%s guest=%llx lr=%llx\n",
+              fn_name, (unsigned)lk.state, guest_mem_status_name(lk.mem_status), (unsigned long long)guest,
+              (unsigned long long)lr);
+    }
+    return NULL;
 }
-NVN(nvnTextureGetFormat) { RET(TEX->format); }
-NVN(nvnTextureGetSamples) { RET(TEX->samples); }
-NVN(nvnTextureGetSwizzle) { for (int i = 0; i < 4; i++) *(uint32_t *)AP(1 + i) = TEX->swizzle[i]; }
-NVN(nvnTextureGetDepthStencilMode) { RET(TEX->ds_mode); }
-NVN(nvnTextureGetStride) { RET(TEX->stride); }
-NVN(nvnTextureGetTextureAddress) { RET(TEX->addr); }
-NVN(nvnTextureGetMemoryPool) { RET(TEX->guest_pool); }
-NVN(nvnTextureGetMemoryOffset) { RET(TEX->pool_offset); }
-NVN(nvnTextureGetStorageSize) { RET(tegra_total_size(&TEX->layout)); }
-NVN(nvnTextureGetDebugID) { RET(TEX->debug_id); }
+#define TEX_GET(fn, expr) do { \
+    const NvnTexture *t = texture_getter_lookup(A(0), (fn), c->x[30]); \
+    RET(t ? (expr) : 0); \
+} while (0)
+NVN(nvnTextureGetFlags) { TEX_GET("nvnTextureGetFlags", t->flags); }
+NVN(nvnTextureGetTarget) { TEX_GET("nvnTextureGetTarget", t->target); }
+NVN(nvnTextureGetWidth) { TEX_GET("nvnTextureGetWidth", t->width); }
+NVN(nvnTextureGetHeight) { TEX_GET("nvnTextureGetHeight", t->height); }
+NVN(nvnTextureGetDepth) { TEX_GET("nvnTextureGetDepth", t->depth); }
+NVN(nvnTextureGetLevels) { TEX_GET("nvnTextureGetLevels", t->levels); }
+NVN(nvnTextureGetFormat) { TEX_GET("nvnTextureGetFormat", t->format); }
+NVN(nvnTextureGetSamples) { TEX_GET("nvnTextureGetSamples", t->samples); }
+NVN(nvnTextureGetSwizzle) {
+    const NvnTexture *t = texture_getter_lookup(A(0), "nvnTextureGetSwizzle", c->x[30]);
+    for (int i = 0; i < 4; i++) {
+        if (guest_mem_validate_range(A(1 + i), sizeof(uint32_t), 4, GMEM_PERM_RW) == GMEM_OK)
+            *(uint32_t *)AP(1 + i) = t ? t->swizzle[i] : 0;
+    }
+}
+NVN(nvnTextureGetDepthStencilMode) { TEX_GET("nvnTextureGetDepthStencilMode", t->ds_mode); }
+NVN(nvnTextureGetStride) { TEX_GET("nvnTextureGetStride", t->stride); }
+NVN(nvnTextureGetTextureAddress) { TEX_GET("nvnTextureGetTextureAddress", t->addr); }
+NVN(nvnTextureGetMemoryPool) { TEX_GET("nvnTextureGetMemoryPool", t->guest_pool); }
+NVN(nvnTextureGetMemoryOffset) { TEX_GET("nvnTextureGetMemoryOffset", t->pool_offset); }
+NVN(nvnTextureGetStorageSize) { TEX_GET("nvnTextureGetStorageSize", texture_storage_size(t)); }
+NVN(nvnTextureGetDebugID) { TEX_GET("nvnTextureGetDebugID", t->debug_id); }
+#undef TEX_GET
 NVN(nvnTextureGetViewOffset) { RET(0); }
 NVN(nvnTextureGetStorageClass) { RET(0); }
 NVN(nvnTextureGetRawStorageClass) { RET(0); }
 NVN(nvnTextureGetSparseTileLayout) { RET(0); }
-NVN(nvnTextureGetZCullStorageSize) { RET(0); }
-NVN(nvnTextureCompare) { RET(A(0) == A(1)); }
+NVN(nvnTextureGetZCullStorageSize) { RET(0); }  // [NVN_UNVERIFIED_HW]
+NVN(nvnTextureCompare) {
+    NvnTexLookup a = nvn_texture_lookup(A(0));
+    NvnTexLookup b = nvn_texture_lookup(A(1));
+    bool a_ok = (a.state == TEX_ST_LIVE_ORIG || a.state == TEX_ST_LIVE_COPY || a.state == TEX_ST_STALE_COPY);
+    bool b_ok = (b.state == TEX_ST_LIVE_ORIG || b.state == TEX_ST_LIVE_COPY || b.state == TEX_ST_STALE_COPY);
+    if (a_ok && b_ok) {
+        if (a.tex == b.tex) { RET(1); return; }
+        const NvnTexture *ta = a.tex, *tb = b.tex;
+        RET(ta->addr == tb->addr && ta->target == tb->target && ta->format == tb->format &&
+            ta->flags == tb->flags && ta->width == tb->width && ta->height == tb->height &&
+            ta->depth == tb->depth && ta->levels == tb->levels && ta->samples == tb->samples &&
+            ta->stride == tb->stride && ta->ds_mode == tb->ds_mode &&
+            memcmp(ta->swizzle, tb->swizzle, 4) == 0);
+        return;
+    }
+    RET(a.state == TEX_ST_ZEROED && b.state == TEX_ST_ZEROED && A(0) == A(1));
+}
 NVN(nvnTextureFlushTexels) { (void)c; }
 NVN(nvnTextureInvalidateTexels) { (void)c; }
 
-// Texture views (our layout of the 0x28-byte guest struct)
-#define TV(T, off) G(T, A(0), off)
-NVN(nvnTextureViewSetDefaults) { memset(AP(0), 0, 0x28); }
-NVN(nvnTextureViewSetLevels) { TV(uint32_t, 0) |= 1; TV(uint16_t, 4) = (uint16_t)A(1); TV(uint16_t, 6) = (uint16_t)A(2); }
-NVN(nvnTextureViewSetLayers) { TV(uint32_t, 0) |= 2; TV(uint16_t, 8) = (uint16_t)A(1); TV(uint16_t, 10) = (uint16_t)A(2); }
-NVN(nvnTextureViewSetFormat) { TV(uint32_t, 0) |= 4; TV(uint32_t, 12) = (uint32_t)A(1); }
+// Texture views: compact 16-byte layout (NVN 55.0.0 ABI — verified in Engage 2.0.0 main)
+NVN(nvnTextureViewSetDefaults) {
+    if (guest_mem_validate_range(A(0), sizeof(NvnTextureView), 1, GMEM_PERM_RW) == GMEM_OK)
+        memset(AP(0), 0, sizeof(NvnTextureView));
+}
+NVN(nvnTextureViewSetLevels) {
+    NvnTextureView *v = AP(0);
+    int32_t base = (int32_t)A(1);
+    int32_t count = (int32_t)A(2);
+    v->setmask |= 1;
+    v->base_level = (uint8_t)(base < 0 ? 0 : (base > 255 ? 255 : base));
+    v->num_levels = (uint8_t)(count < 0 ? 0 : (count > 255 ? 255 : count));
+}
+NVN(nvnTextureViewSetLayers) {
+    NvnTextureView *v = AP(0);
+    v->setmask |= 2;
+    v->min_layer = (uint16_t)A(1);
+    v->num_layers = (uint16_t)A(2);
+}
+NVN(nvnTextureViewSetFormat) {
+    NvnTextureView *v = AP(0);
+    v->setmask |= 4;
+    v->format = (uint16_t)A(1);
+}
 NVN(nvnTextureViewSetSwizzle) {
     NvnTextureView *v = AP(0);
     v->setmask |= 8;
     v->swizzle[0] = (uint8_t)A(1); v->swizzle[1] = (uint8_t)A(2); v->swizzle[2] = (uint8_t)A(3); v->swizzle[3] = (uint8_t)A(4);
 }
-NVN(nvnTextureViewSetDepthStencilMode) { NvnTextureView *v = AP(0); v->setmask |= 16; v->ds_mode = (uint32_t)A(1); }
-NVN(nvnTextureViewSetTarget) { NvnTextureView *v = AP(0); v->setmask |= 32; v->target = (uint32_t)A(1); }
-NVN(nvnTextureViewGetLevels) { *(int32_t *)AP(1) = TV(uint16_t, 4); *(int32_t *)AP(2) = TV(uint16_t, 6); RET(TV(uint32_t, 0) & 1); }
-NVN(nvnTextureViewGetLayers) { *(int32_t *)AP(1) = TV(uint16_t, 8); *(int32_t *)AP(2) = TV(uint16_t, 10); RET(!!(TV(uint32_t, 0) & 2)); }
-NVN(nvnTextureViewGetFormat) { *(uint32_t *)AP(1) = TV(uint32_t, 12); RET(!!(TV(uint32_t, 0) & 4)); }
-NVN(nvnTextureViewGetSwizzle) { NvnTextureView *v = AP(0); for (int i = 0; i < 4; i++) *(uint32_t *)AP(1 + i) = v->swizzle[i]; RET(!!(v->setmask & 8)); }
-NVN(nvnTextureViewGetDepthStencilMode) { NvnTextureView *v = AP(0); *(uint32_t *)AP(1) = v->ds_mode; RET(!!(v->setmask & 16)); }
-NVN(nvnTextureViewGetTarget) { NvnTextureView *v = AP(0); *(uint32_t *)AP(1) = v->target; RET(!!(v->setmask & 32)); }
-NVN(nvnTextureViewCompare) { RET(memcmp(AP(0), AP(1), 0x1C) == 0); }
+NVN(nvnTextureViewSetDepthStencilMode) { NvnTextureView *v = AP(0); v->setmask |= 16; v->ds_mode = (uint8_t)A(1); }
+NVN(nvnTextureViewSetTarget) { NvnTextureView *v = AP(0); v->setmask |= 32; v->target = (uint8_t)A(1); }
+NVN(nvnTextureViewGetLevels) {
+    const NvnTextureView *v = AP(0);
+    *(int32_t *)AP(1) = v->base_level; *(int32_t *)AP(2) = v->num_levels;
+    RET(!!(v->setmask & 1));
+}
+NVN(nvnTextureViewGetLayers) {
+    const NvnTextureView *v = AP(0);
+    *(int32_t *)AP(1) = v->min_layer; *(int32_t *)AP(2) = v->num_layers;
+    RET(!!(v->setmask & 2));
+}
+NVN(nvnTextureViewGetFormat) {
+    const NvnTextureView *v = AP(0);
+    *(uint32_t *)AP(1) = v->format;
+    RET(!!(v->setmask & 4));
+}
+NVN(nvnTextureViewGetSwizzle) {
+    const NvnTextureView *v = AP(0);
+    for (int i = 0; i < 4; i++) *(uint32_t *)AP(1 + i) = v->swizzle[i];
+    RET(!!(v->setmask & 8));
+}
+NVN(nvnTextureViewGetDepthStencilMode) { const NvnTextureView *v = AP(0); *(uint32_t *)AP(1) = v->ds_mode; RET(!!(v->setmask & 16)); }
+NVN(nvnTextureViewGetTarget) { const NvnTextureView *v = AP(0); *(uint32_t *)AP(1) = v->target; RET(!!(v->setmask & 32)); }
+NVN(nvnTextureViewCompare) { RET(memcmp(AP(0), AP(1), sizeof(NvnTextureView)) == 0); }
 
 static void write_texels(Cpu *c, uint64_t row_pitch, uint64_t image_pitch) {
     NvnTexture *t = HOST(NvnTexture, A(0));
-    const NvnTextureView *view = AP(1);
+    const NvnTextureView *view = (A(1) && guest_mem_validate_range(A(1), sizeof(NvnTextureView), 1, GMEM_PERM_R) == GMEM_OK)
+                                     ? (const NvnTextureView *)AP(1) : NULL;
+    if (!t || !t->addr || !t->pool_size ||
+        guest_mem_validate_range(A(2), 6 * sizeof(int32_t), 4, GMEM_PERM_R) != GMEM_OK ||
+        !A(3))
+        return;
     const int32_t *r = AP(2);
     const uint8_t *pixels = AP(3);
-    if (!t || !t->pool || !r || !pixels) return;
     for (int axis = 0; axis < 3; ++axis)
         if (r[axis] < 0 || r[axis + 3] <= 0) return;
 
@@ -584,6 +1471,10 @@ static void write_texels(Cpu *c, uint64_t row_pitch, uint64_t image_pitch) {
     if (linear && (level || slices != 1 || z || layer || !t->stride ||
                    (uint64_t)xbytes + width_bytes > t->stride))
         return;
+    uint64_t src_total = slices > 0 ? (uint64_t)(slices - 1) * image_pitch + (uint64_t)(rows - 1) * row_pitch + width_bytes : 0;
+    if (guest_mem_validate_range(A(3), src_total, 1, GMEM_PERM_R) != GMEM_OK ||
+        guest_mem_validate_range(t->addr, storage_size, 1, GMEM_PERM_RW) != GMEM_OK)
+        return;
 
     uint8_t *storage = (uint8_t *)(uintptr_t)t->addr;
     for (uint32_t i = 0; i < slices; ++i) {
@@ -599,6 +1490,12 @@ static void write_texels(Cpu *c, uint64_t row_pitch, uint64_t image_pitch) {
         }
     }
     backend_pool_written(t->addr, storage_size);
+#ifndef __APPLE__
+    {
+        extern void backend_texture_written(NvnTexture *t) __attribute__((weak));
+        if (backend_texture_written) backend_texture_written(t);
+    }
+#endif
 }
 
 NVN(nvnTextureWriteTexels) { write_texels(c, 0, 0); }
@@ -642,130 +1539,445 @@ NVN(nvnSamplerBuilderGetMaxAnisotropy) { RETF(SD->max_aniso); }
 NVN(nvnSamplerBuilderGetReductionFilter) { RET(SD->reduction); }
 NVN(nvnSamplerBuilderGetLodSnap) { RETF(0); }
 
+// NVNsampler (0x60 bytes) stores canonical state inline (Phase 5A):
+//   +0..4:  uint32_t magic (NVN_MAGIC_SMP_LIVE / NVN_MAGIC_SMP_FIN)
+//   +4..8:  uint32_t debug_id
+//   +8..80: NvnSamplerDesc (canonical state bytes; backend = NULL)
+// Zero heap allocations -> value copies (memcpy) and double Finalize can never double-free.
+typedef struct NvnSamplerHeader {
+    uint32_t magic;
+    uint32_t debug_id;
+} NvnSamplerHeader;
+_Static_assert(sizeof(NvnSamplerHeader) + sizeof(NvnSamplerDesc) <= 0x60, "NVNsampler inline layout exceeds 0x60");
+
+NvnSamplerDesc *nvn_sampler_host(uint64_t guest) {
+    if (guest_mem_validate_range(guest, sizeof(NvnSamplerHeader) + sizeof(NvnSamplerDesc), 8, GMEM_PERM_R) != GMEM_OK)
+        return NULL;
+    NvnSamplerHeader hdr;
+    memcpy(&hdr, (const void *)(uintptr_t)guest, sizeof hdr);
+    if (hdr.magic != NVN_MAGIC_SMP_LIVE) return NULL;
+    return (NvnSamplerDesc *)((uint8_t *)(uintptr_t)guest + sizeof(NvnSamplerHeader));
+}
+
 NVN(nvnSamplerInitialize) {
-    NvnSamplerDesc *d = malloc(sizeof *d);
-    *d = *(NvnSamplerDesc *)(AP(1) + 8);
-    SET_HOST(A(0), d);
+    uint64_t guest = A(0), builder = A(1);
+    if (guest_mem_validate_range(guest, sizeof(NvnSamplerHeader) + sizeof(NvnSamplerDesc), 8, GMEM_PERM_RW) != GMEM_OK ||
+        guest_mem_validate_range(builder, 8 + sizeof(NvnSamplerDesc), 8, GMEM_PERM_R) != GMEM_OK) {
+        RET(0);
+        return;
+    }
+    NvnSamplerDesc desc;
+    memcpy(&desc, (const uint8_t *)(uintptr_t)builder + 8, sizeof desc);
+    desc.backend = NULL;
+    NvnSamplerHeader hdr = {
+        .magic = NVN_MAGIC_SMP_LIVE,
+        .debug_id = (uint32_t)alloc_debug_id(),
+    };
+    memcpy((uint8_t *)(uintptr_t)guest, &hdr, sizeof hdr);
+    memcpy((uint8_t *)(uintptr_t)guest + sizeof hdr, &desc, sizeof desc);
     RET(1);
 }
-NVN(nvnSamplerFinalize) { free(HOST(NvnSamplerDesc, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnSamplerFinalize) {
+    uint64_t guest = A(0);
+    if (guest_mem_validate_range(guest, sizeof(NvnSamplerHeader), 8, GMEM_PERM_RW) != GMEM_OK) return;
+    uint32_t fin = NVN_MAGIC_SMP_FIN;
+    memcpy((uint8_t *)(uintptr_t)guest, &fin, sizeof fin);
+}
 NVN(nvnSamplerSetDebugLabel) { (void)c; }
 #define SMP HOST(NvnSamplerDesc, A(0))
-NVN(nvnSamplerGetMinMagFilter) { *(uint32_t *)AP(1) = SMP->min_filter; *(uint32_t *)AP(2) = SMP->mag_filter; }
-NVN(nvnSamplerGetWrapMode) { for (int i = 0; i < 3; i++) *(uint32_t *)AP(1 + i) = SMP->wrap[i]; }
-NVN(nvnSamplerGetLodClamp) { *(float *)AP(1) = SMP->lod_min; *(float *)AP(2) = SMP->lod_max; }
-NVN(nvnSamplerGetLodBias) { RETF(SMP->lod_bias); }
-NVN(nvnSamplerGetCompare) { *(uint32_t *)AP(1) = SMP->compare_mode; *(uint32_t *)AP(2) = SMP->compare_func; }
-NVN(nvnSamplerGetBorderColor) { memcpy(AP(1), SMP->border, 16); }
-NVN(nvnSamplerGetBorderColori) { memcpy(AP(1), SMP->border, 16); }
-NVN(nvnSamplerGetBorderColorui) { memcpy(AP(1), SMP->border, 16); }
-NVN(nvnSamplerGetMaxAnisotropy) { RETF(SMP->max_aniso); }
-NVN(nvnSamplerGetReductionFilter) { RET(SMP->reduction); }
-NVN(nvnSamplerCompare) { RET(memcmp(HOST(NvnSamplerDesc, A(0)), HOST(NvnSamplerDesc, A(1)), sizeof(NvnSamplerDesc)) == 0); }
-NVN(nvnSamplerGetDebugID) { RET(A(0)); }
+NVN(nvnSamplerGetMinMagFilter) { NvnSamplerDesc *s = SMP; if (!s) return; *(uint32_t *)AP(1) = s->min_filter; *(uint32_t *)AP(2) = s->mag_filter; }
+NVN(nvnSamplerGetWrapMode) { NvnSamplerDesc *s = SMP; if (!s) return; for (int i = 0; i < 3; i++) *(uint32_t *)AP(1 + i) = s->wrap[i]; }
+NVN(nvnSamplerGetLodClamp) { NvnSamplerDesc *s = SMP; if (!s) return; *(float *)AP(1) = s->lod_min; *(float *)AP(2) = s->lod_max; }
+NVN(nvnSamplerGetLodBias) { NvnSamplerDesc *s = SMP; RETF(s ? s->lod_bias : 0.0f); }
+NVN(nvnSamplerGetCompare) { NvnSamplerDesc *s = SMP; if (!s) return; *(uint32_t *)AP(1) = s->compare_mode; *(uint32_t *)AP(2) = s->compare_func; }
+NVN(nvnSamplerGetBorderColor) { NvnSamplerDesc *s = SMP; if (!s) return; memcpy(AP(1), s->border, 16); }
+NVN(nvnSamplerGetBorderColori) { NvnSamplerDesc *s = SMP; if (!s) return; memcpy(AP(1), s->border, 16); }
+NVN(nvnSamplerGetBorderColorui) { NvnSamplerDesc *s = SMP; if (!s) return; memcpy(AP(1), s->border, 16); }
+NVN(nvnSamplerGetMaxAnisotropy) { NvnSamplerDesc *s = SMP; RETF(s ? s->max_aniso : 1.0f); }
+NVN(nvnSamplerGetReductionFilter) { NvnSamplerDesc *s = SMP; RET(s ? s->reduction : 0); }
+NVN(nvnSamplerCompare) {
+    NvnSamplerDesc *a = HOST(NvnSamplerDesc, A(0)), *b = HOST(NvnSamplerDesc, A(1));
+    if (!a || !b) { RET(0); return; }
+    RET(memcmp(a, b, offsetof(NvnSamplerDesc, backend)) == 0);
+}
+NVN(nvnSamplerGetDebugID) {
+    if (guest_mem_validate_range(A(0), sizeof(NvnSamplerHeader), 8, GMEM_PERM_R) != GMEM_OK) { RET(0); return; }
+    NvnSamplerHeader hdr;
+    memcpy(&hdr, AP(0), sizeof hdr);
+    RET(hdr.magic == NVN_MAGIC_SMP_LIVE ? (uint64_t)hdr.debug_id : 0);
+}
 
-// ================================================================== descriptor pools
-NvnDescPool *g_texture_pools[64], *g_sampler_pools[64];
-RT_ON_RESET(desc_pools_reset) { memset(g_texture_pools, 0, sizeof g_texture_pools); memset(g_sampler_pools, 0, sizeof g_sampler_pools); }
+// ================================================================== descriptor pools (Phase 5A generational & synchronized)
+#define NVN_DPOOL_PAGE_SHIFT 6u
+#define NVN_DPOOL_PAGE_SIZE  (1u << NVN_DPOOL_PAGE_SHIFT)
+#define NVN_DPOOL_PAGE_MASK  (NVN_DPOOL_PAGE_SIZE - 1u)
+#define NVN_DPOOL_MAX_PAGES  64u
+#define NVN_DPOOL_MAX_SLOTS  (NVN_DPOOL_PAGE_SIZE * NVN_DPOOL_MAX_PAGES)
 
-static NvnDescPool *desc_pool_init(uint64_t guest, uint64_t pool, uint64_t off, int count, size_t entry, NvnDescPool **reg) {
-    NvnDescPool *d = calloc(1, sizeof *d);
-    d->addr = HOST(NvnPool, pool)->storage + off;
+typedef struct NvnDescPoolSlot {
+    _Atomic uint32_t generation;
+    _Atomic uint32_t state;
+    NvnDescPool pool;
+} NvnDescPoolSlot;
+
+typedef struct RetiredDescEntries {
+    void *entries;
+    struct RetiredDescEntries *next;
+} RetiredDescEntries;
+
+static _Atomic(NvnDescPoolSlot *) g_dpool_pages[NVN_DPOOL_MAX_PAGES];
+static _Atomic uint16_t g_dpool_epoch = 1;
+static pthread_mutex_t g_dpool_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_dpool_next_fresh = 0;
+static RetiredDescEntries *g_dpool_retired = NULL;
+
+static NvnDescPoolSlot *dpool_slot_at(uint32_t idx) {
+    if (idx >= NVN_DPOOL_MAX_SLOTS) return NULL;
+    NvnDescPoolSlot *page = atomic_load_explicit(&g_dpool_pages[idx >> NVN_DPOOL_PAGE_SHIFT], memory_order_acquire);
+    return page ? &page[idx & NVN_DPOOL_PAGE_MASK] : NULL;
+}
+
+static bool dpool_read_handle(uint64_t guest, NvnGuestHandle *out) {
+    if (guest_mem_read_checked(guest, out, sizeof *out, 8) != GMEM_OK) return false;
+    if (out->magic != NVN_MAGIC_DPOOL_LIVE) return false;
+    if (out->tag16 != nvn_handle_compute_tag(out, NVN_OBJ_DESC_POOL)) return false;
+    if (out->rt_epoch != atomic_load_explicit(&g_dpool_epoch, memory_order_acquire)) return false;
+    return true;
+}
+
+NvnDescPool *nvn_desc_pool_host(uint64_t guest) {
+    NvnGuestHandle h;
+    if (!dpool_read_handle(guest, &h)) return NULL;
+    NvnDescPoolSlot *s = dpool_slot_at(h.slot_index);
+    if (!s) return NULL;
+    if (atomic_load_explicit(&s->state, memory_order_acquire) != TEX_SLOT_ALIVE) return NULL;
+    if (atomic_load_explicit(&s->generation, memory_order_acquire) != h.generation) return NULL;
+    return &s->pool;
+}
+
+static void dpool_retire_entries_locked(void *entries) {
+    if (!entries) return;
+    RetiredDescEntries *node = malloc(sizeof *node);
+    if (!node) return;
+    node->entries = entries;
+    node->next = g_dpool_retired;
+    g_dpool_retired = node;
+}
+
+RT_ON_RESET(desc_pools_reset) {
+    pthread_mutex_lock(&g_dpool_alloc_lock);
+    uint16_t next_ep = (uint16_t)(atomic_load_explicit(&g_dpool_epoch, memory_order_relaxed) + 1u);
+    if (!next_ep) next_ep = 1u;
+    atomic_store_explicit(&g_dpool_epoch, next_ep, memory_order_release);
+    for (uint32_t p = 0; p < NVN_DPOOL_MAX_PAGES; p++) {
+        NvnDescPoolSlot *page = atomic_exchange_explicit(&g_dpool_pages[p], NULL, memory_order_acq_rel);
+        if (page) {
+            for (uint32_t i = 0; i < NVN_DPOOL_PAGE_SIZE; i++) {
+                if (page[i].pool.entries) {
+                    free(page[i].pool.entries);
+                    pthread_mutex_destroy(&page[i].pool.write_lock);
+                }
+            }
+            free(page);
+        }
+    }
+    while (g_dpool_retired) {
+        RetiredDescEntries *node = g_dpool_retired;
+        g_dpool_retired = node->next;
+        free(node->entries);
+        free(node);
+    }
+    g_dpool_next_fresh = 0;
+    pthread_mutex_unlock(&g_dpool_alloc_lock);
+}
+
+static NvnDescPool *desc_pool_init(uint64_t guest, uint64_t pool, uint64_t off, int count, size_t entry, bool is_sampler) {
+    if (count < 0 || guest_mem_validate_range(guest, sizeof(NvnGuestHandle), 8, GMEM_PERM_RW) != GMEM_OK) return NULL;
+    NvnPool *mp = HOST(NvnPool, pool);
+    if (!mp) return NULL;
+
+    pthread_mutex_lock(&g_dpool_alloc_lock);
+    if (g_dpool_next_fresh >= NVN_DPOOL_MAX_SLOTS) {
+        pthread_mutex_unlock(&g_dpool_alloc_lock);
+        FATAL("NVN descriptor pool slot table exhausted (%u slots)\n", NVN_DPOOL_MAX_SLOTS);
+    }
+    uint32_t idx = g_dpool_next_fresh++;
+    uint32_t p = idx >> NVN_DPOOL_PAGE_SHIFT;
+    NvnDescPoolSlot *page = atomic_load_explicit(&g_dpool_pages[p], memory_order_relaxed);
+    if (!page) {
+        page = calloc(NVN_DPOOL_PAGE_SIZE, sizeof(NvnDescPoolSlot));
+        if (!page) {
+            pthread_mutex_unlock(&g_dpool_alloc_lock);
+            FATAL("NVN descriptor pool page allocation failed\n");
+        }
+        atomic_store_explicit(&g_dpool_pages[p], page, memory_order_release);
+    }
+    NvnDescPoolSlot *s = &page[idx & NVN_DPOOL_PAGE_MASK];
+    uint32_t gen = atomic_load_explicit(&s->generation, memory_order_relaxed) + 1u;
+    if (!gen) gen = 1u;
+    atomic_store_explicit(&s->state, TEX_SLOT_FREE, memory_order_release);
+    atomic_store_explicit(&s->generation, gen, memory_order_release);
+    NvnDescPool *d = &s->pool;
+    memset(d, 0, sizeof *d);
+    pthread_mutex_init(&d->write_lock, NULL);
+    d->addr = mp->storage + off;
+    d->guest_pool = pool;
+    d->pool_offset = off;
     d->count = count;
-    d->entries = calloc(count, entry);
-    SET_HOST(guest, d);
-    G(uint64_t, guest, 8) = pool;
-    G(uint64_t, guest, 16) = off;
-    G(uint32_t, guest, 24) = (uint32_t)count;
-    for (int i = 0; i < 64; i++) if (!reg[i]) { reg[i] = d; break; }
+    d->is_sampler = is_sampler;
+    d->entries = calloc(count ? (size_t)count : 1u, entry);
+    if (!d->entries) {
+        pthread_mutex_unlock(&g_dpool_alloc_lock);
+        FATAL("NVN descriptor pool entries allocation failed\n");
+    }
+    atomic_store_explicit(&s->state, TEX_SLOT_ALIVE, memory_order_release);
+    uint16_t ep = atomic_load_explicit(&g_dpool_epoch, memory_order_relaxed);
+    pthread_mutex_unlock(&g_dpool_alloc_lock);
+
+    NvnGuestHandle h = {
+        .magic = NVN_MAGIC_DPOOL_LIVE,
+        .slot_index = idx,
+        .generation = gen,
+        .rt_epoch = ep,
+        .tag16 = 0,
+    };
+    h.tag16 = nvn_handle_compute_tag(&h, NVN_OBJ_DESC_POOL);
+    guest_mem_write_checked(guest, &h, sizeof h, 8);
     return d;
 }
 
-NVN(nvnTexturePoolInitialize) {
-    desc_pool_init(A(0), A(1), A(2), (int)A(3), sizeof(NvnTexEntry), g_texture_pools);
-    RET(1);
+static void desc_pool_finalize(uint64_t guest, uint64_t lr) {
+    NvnGuestHandle h;
+    if (!dpool_read_handle(guest, &h)) return;
+    pthread_mutex_lock(&g_dpool_alloc_lock);
+    NvnDescPoolSlot *s = dpool_slot_at(h.slot_index);
+    if (s && atomic_load_explicit(&s->generation, memory_order_relaxed) == h.generation &&
+        atomic_load_explicit(&s->state, memory_order_relaxed) == TEX_SLOT_ALIVE) {
+        atomic_store_explicit(&s->state, TEX_SLOT_RETIRED, memory_order_release);
+        // Keep backing entries memory alive until reset (in-flight command lists may still hold NvnDescPool*).
+        dpool_retire_entries_locked(s->pool.entries);
+        s->pool.entries = NULL;
+        s->pool.count = 0;
+        pthread_mutex_destroy(&s->pool.write_lock);
+    }
+    pthread_mutex_unlock(&g_dpool_alloc_lock);
+
+    NvnGuestHandle fin = {
+        .magic = NVN_MAGIC_DPOOL_FIN,
+        .slot_index = h.slot_index,
+        .generation = h.generation,
+        .rt_epoch = h.rt_epoch,
+        .tag16 = 0,
+    };
+    fin.tag16 = nvn_handle_compute_tag(&fin, NVN_OBJ_DESC_POOL);
+    guest_mem_write_checked(guest, &fin, sizeof fin, 8);
+    nvn_diag_record(NVN_EV_FINALIZE, NVN_OBJ_DESC_POOL, 0, guest, h.slot_index, h.generation, h.rt_epoch, 0, lr, false, 0, 0);
 }
-NVN(nvnTexturePoolFinalize) { (void)c; }
+
+NVN(nvnTexturePoolInitialize) {
+    RET(desc_pool_init(A(0), A(1), A(2), (int)A(3), sizeof(NvnTexEntry), false) != NULL);
+}
+NVN(nvnTexturePoolFinalize) { desc_pool_finalize(A(0), c->x[30]); }
 NVN(nvnTexturePoolSetDebugLabel) { (void)c; }
-NVN(nvnTexturePoolGetMemoryPool) { RET(G(uint64_t, A(0), 8)); }
-NVN(nvnTexturePoolGetMemoryOffset) { RET(G(uint64_t, A(0), 16)); }
-NVN(nvnTexturePoolGetSize) { RET(G(uint32_t, A(0), 24)); }
+NVN(nvnTexturePoolGetMemoryPool) { NvnDescPool *d = HOST(NvnDescPool, A(0)); RET(d ? d->guest_pool : 0); }
+NVN(nvnTexturePoolGetMemoryOffset) { NvnDescPool *d = HOST(NvnDescPool, A(0)); RET(d ? d->pool_offset : 0); }
+NVN(nvnTexturePoolGetSize) { NvnDescPool *d = HOST(NvnDescPool, A(0)); RET(d ? (uint32_t)d->count : 0); }
 static void register_texture(Cpu *c) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
-    if (id < 0 || id >= d->count) return;
+    if (!d || !d->entries || id < 0 || id >= d->count) return;
+    NvnTexLookup lk = nvn_texture_lookup(A(2));
+    NvnTexture *t = (lk.state == TEX_ST_LIVE_ORIG || lk.state == TEX_ST_LIVE_COPY || lk.state == TEX_ST_STALE_COPY)
+                        ? lk.tex : NULL;
+    NvnTextureView view = {0};
+    bool has_view = false;
+    if (A(3) && guest_mem_read_checked(A(3), &view, sizeof view, 4) == GMEM_OK) has_view = true;
+
+    NvnTexEntryData tmp = {.tex = t, .view = view, .has_view = has_view};
+    uint64_t w[4] = {0};
+    memcpy(w, &tmp, sizeof tmp);
+
+    pthread_mutex_lock(&d->write_lock);
     NvnTexEntry *e = &((NvnTexEntry *)d->entries)[id];
-    e->tex = HOST(NvnTexture, A(2));
-    e->has_view = A(3) != 0;
-    if (e->has_view) memcpy(&e->view, AP(3), sizeof e->view);
+    uint32_t seq = atomic_load_explicit(&e->seq, memory_order_relaxed);
+    atomic_store_explicit(&e->seq, seq + 1u, memory_order_release);
+    for (int k = 0; k < 4; k++) atomic_store_explicit(&e->words[k], w[k], memory_order_relaxed);
+    atomic_store_explicit(&e->seq, seq + 2u, memory_order_release);
+    pthread_mutex_unlock(&d->write_lock);
+
+    if (t) {
+        nvn_diag_record(NVN_EV_DESC_REGISTER, NVN_OBJ_TEXTURE, (uint8_t)lk.state, A(2),
+                        lk.hdr.slot_index, lk.hdr.generation, lk.hdr.rt_epoch, (uint16_t)id, c->x[30], false, 0, 0);
+    }
 }
 NVN(nvnTexturePoolRegisterTexture) { register_texture(c); }
 NVN(nvnTexturePoolRegisterImage) { register_texture(c); }
 
 NVN(nvnSamplerPoolInitialize) {
-    desc_pool_init(A(0), A(1), A(2), (int)A(3), sizeof(NvnSamplerDesc), g_sampler_pools);
-    RET(1);
+    RET(desc_pool_init(A(0), A(1), A(2), (int)A(3), sizeof(NvnSamplerEntry), true) != NULL);
 }
-NVN(nvnSamplerPoolFinalize) { (void)c; }
+NVN(nvnSamplerPoolFinalize) { desc_pool_finalize(A(0), c->x[30]); }
 NVN(nvnSamplerPoolSetDebugLabel) { (void)c; }
-NVN(nvnSamplerPoolGetMemoryPool) { RET(G(uint64_t, A(0), 8)); }
-NVN(nvnSamplerPoolGetMemoryOffset) { RET(G(uint64_t, A(0), 16)); }
-NVN(nvnSamplerPoolGetSize) { RET(G(uint32_t, A(0), 24)); }
+NVN(nvnSamplerPoolGetMemoryPool) { NvnDescPool *d = HOST(NvnDescPool, A(0)); RET(d ? d->guest_pool : 0); }
+NVN(nvnSamplerPoolGetMemoryOffset) { NvnDescPool *d = HOST(NvnDescPool, A(0)); RET(d ? d->pool_offset : 0); }
+NVN(nvnSamplerPoolGetSize) { NvnDescPool *d = HOST(NvnDescPool, A(0)); RET(d ? (uint32_t)d->count : 0); }
+static void register_sampler_desc(NvnDescPool *d, int id, const NvnSamplerDesc *src) {
+    if (!d || !d->entries || !src || id < 0 || id >= d->count) return;
+    NvnSamplerDesc copy = *src;
+    copy.backend = NULL;
+    enum { NW = sizeof(NvnSamplerDesc) / 8 };
+    uint64_t w[NW];
+    memcpy(w, &copy, sizeof copy);
+    pthread_mutex_lock(&d->write_lock);
+    NvnSamplerEntry *e = &((NvnSamplerEntry *)d->entries)[id];
+    uint32_t seq = atomic_load_explicit(&e->seq, memory_order_relaxed);
+    atomic_store_explicit(&e->seq, seq + 1u, memory_order_release);
+    for (int k = 0; k < NW; k++) atomic_store_explicit(&e->words[k], w[k], memory_order_relaxed);
+    atomic_store_explicit(&e->seq, seq + 2u, memory_order_release);
+    pthread_mutex_unlock(&d->write_lock);
+}
 NVN(nvnSamplerPoolRegisterSampler) {
-    NvnDescPool *d = HOST(NvnDescPool, A(0));
-    int id = (int)A(1);
-    if (id >= 0 && id < d->count) ((NvnSamplerDesc *)d->entries)[id] = *HOST(NvnSamplerDesc, A(2));
+    register_sampler_desc(HOST(NvnDescPool, A(0)), (int)A(1), HOST(NvnSamplerDesc, A(2)));
 }
 NVN(nvnSamplerPoolRegisterSamplerBuilder) {
-    NvnDescPool *d = HOST(NvnDescPool, A(0));
-    int id = (int)A(1);
-    if (id >= 0 && id < d->count) ((NvnSamplerDesc *)d->entries)[id] = *(NvnSamplerDesc *)(AP(2) + 8);
+    if (guest_mem_validate_range(A(2), 8 + sizeof(NvnSamplerDesc), 8, GMEM_PERM_R) != GMEM_OK) return;
+    register_sampler_desc(HOST(NvnDescPool, A(0)), (int)A(1), (const NvnSamplerDesc *)((const uint8_t *)AP(2) + 8));
 }
 
-NvnDescPool *nvn_find_pool(NvnDescPool **reg, uint64_t guest_pool) {
-    return guest_pool ? HOST(NvnDescPool, guest_pool) : NULL;
-}
-
-// ================================================================== programs
+// ================================================================== programs (Phase 5A generational & immutable revisions)
 // Recorded BindProgram commands keep these descriptors, not the guest object's
 // storage. Uploads create immutable revisions, retained until the renderer stops.
-typedef struct ProgramIdentity { NvnProgram program; struct ProgramIdentity *next; } ProgramIdentity;
-static ProgramIdentity *program_identities;
-static pthread_mutex_t program_identity_lock = PTHREAD_MUTEX_INITIALIZER;
-static NvnProgram *program_new(void) {
-    ProgramIdentity *entry = calloc(1, sizeof *entry);
-    if (!entry) FATAL("nvn: program descriptor allocation failed\n");
-    pthread_mutex_lock(&program_identity_lock);
-    entry->next = program_identities; program_identities = entry;
-    pthread_mutex_unlock(&program_identity_lock);
-    return &entry->program;
+#define NVN_PROG_PAGE_SHIFT 9u
+#define NVN_PROG_PAGE_SIZE  (1u << NVN_PROG_PAGE_SHIFT)
+#define NVN_PROG_PAGE_MASK  (NVN_PROG_PAGE_SIZE - 1u)
+#define NVN_PROG_MAX_PAGES  64u
+#define NVN_PROG_MAX_SLOTS  (NVN_PROG_PAGE_SIZE * NVN_PROG_MAX_PAGES)
+
+typedef struct NvnProgSlot {
+    _Atomic uint32_t generation;
+    _Atomic uint32_t state;
+    NvnProgram program;
+} NvnProgSlot;
+
+static _Atomic(NvnProgSlot *) g_prog_pages[NVN_PROG_MAX_PAGES];
+static _Atomic uint16_t g_prog_epoch = 1;
+static pthread_mutex_t g_prog_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_prog_next_fresh = 0;
+
+static NvnProgSlot *prog_slot_at(uint32_t idx) {
+    if (idx >= NVN_PROG_MAX_SLOTS) return NULL;
+    NvnProgSlot *page = atomic_load_explicit(&g_prog_pages[idx >> NVN_PROG_PAGE_SHIFT], memory_order_acquire);
+    return page ? &page[idx & NVN_PROG_PAGE_MASK] : NULL;
 }
+
+static NvnProgram *program_slot_alloc(NvnGuestHandle *out_hdr) {
+    pthread_mutex_lock(&g_prog_alloc_lock);
+    if (g_prog_next_fresh >= NVN_PROG_MAX_SLOTS) {
+        pthread_mutex_unlock(&g_prog_alloc_lock);
+        FATAL("NVN program slot table exhausted (%u slots)\n", NVN_PROG_MAX_SLOTS);
+    }
+    uint32_t idx = g_prog_next_fresh++;
+    uint32_t p = idx >> NVN_PROG_PAGE_SHIFT;
+    NvnProgSlot *page = atomic_load_explicit(&g_prog_pages[p], memory_order_relaxed);
+    if (!page) {
+        page = calloc(NVN_PROG_PAGE_SIZE, sizeof(NvnProgSlot));
+        if (!page) {
+            pthread_mutex_unlock(&g_prog_alloc_lock);
+            FATAL("nvn: program descriptor allocation failed\n");
+        }
+        atomic_store_explicit(&g_prog_pages[p], page, memory_order_release);
+    }
+    NvnProgSlot *s = &page[idx & NVN_PROG_PAGE_MASK];
+    uint32_t gen = atomic_load_explicit(&s->generation, memory_order_relaxed) + 1u;
+    if (!gen) gen = 1u;
+    atomic_store_explicit(&s->generation, gen, memory_order_release);
+    memset(&s->program, 0, sizeof s->program);
+    atomic_store_explicit(&s->state, TEX_SLOT_ALIVE, memory_order_release);
+    uint16_t ep = atomic_load_explicit(&g_prog_epoch, memory_order_relaxed);
+    pthread_mutex_unlock(&g_prog_alloc_lock);
+
+    NvnGuestHandle h = {
+        .magic = NVN_MAGIC_PROG_LIVE,
+        .slot_index = idx,
+        .generation = gen,
+        .rt_epoch = ep,
+        .tag16 = 0,
+    };
+    h.tag16 = nvn_handle_compute_tag(&h, NVN_OBJ_PROGRAM);
+    *out_hdr = h;
+    return &s->program;
+}
+
+NvnProgram *nvn_program_host(uint64_t guest) {
+    NvnGuestHandle h;
+    if (guest_mem_read_checked(guest, &h, sizeof h, 8) != GMEM_OK) return NULL;
+    if (h.magic != NVN_MAGIC_PROG_LIVE) return NULL;
+    if (h.tag16 != nvn_handle_compute_tag(&h, NVN_OBJ_PROGRAM)) return NULL;
+    if (h.rt_epoch != atomic_load_explicit(&g_prog_epoch, memory_order_acquire)) return NULL;
+    NvnProgSlot *s = prog_slot_at(h.slot_index);
+    if (!s) return NULL;
+    if (atomic_load_explicit(&s->state, memory_order_acquire) != TEX_SLOT_ALIVE) return NULL;
+    if (atomic_load_explicit(&s->generation, memory_order_acquire) != h.generation) return NULL;
+    return &s->program;
+}
+
 RT_ON_RESET(program_identities_reset) {
-    while (program_identities) {
-        ProgramIdentity *entry = program_identities;
-        program_identities = entry->next; free(entry);
+    pthread_mutex_lock(&g_prog_alloc_lock);
+    uint16_t next_ep = (uint16_t)(atomic_load_explicit(&g_prog_epoch, memory_order_relaxed) + 1u);
+    if (!next_ep) next_ep = 1u;
+    atomic_store_explicit(&g_prog_epoch, next_ep, memory_order_release);
+    for (uint32_t p = 0; p < NVN_PROG_MAX_PAGES; p++) {
+        NvnProgSlot *page = atomic_exchange_explicit(&g_prog_pages[p], NULL, memory_order_acq_rel);
+        free(page);
+    }
+    g_prog_next_fresh = 0;
+    pthread_mutex_unlock(&g_prog_alloc_lock);
+}
+
+NVN(nvnProgramInitialize) {
+    if (guest_mem_validate_range(A(0), sizeof(NvnGuestHandle), 8, GMEM_PERM_RW) != GMEM_OK) { RET(0); return; }
+    NvnGuestHandle h;
+    program_slot_alloc(&h);
+    guest_mem_write_checked(A(0), &h, sizeof h, 8);
+    RET(1);
+}
+NVN(nvnProgramFinalize) {
+    NvnGuestHandle h;
+    if (guest_mem_read_checked(A(0), &h, sizeof h, 8) == GMEM_OK && h.magic == NVN_MAGIC_PROG_LIVE) {
+        h.magic = NVN_MAGIC_PROG_FIN;
+        h.tag16 = nvn_handle_compute_tag(&h, NVN_OBJ_PROGRAM);
+        guest_mem_write_checked(A(0), &h, sizeof h, 8);
     }
 }
-NVN(nvnProgramInitialize) { SET_HOST(A(0), program_new()); RET(1); }
-NVN(nvnProgramFinalize) { SET_HOST(A(0), 0); }
 NVN(nvnProgramSetDebugLabel) { (void)c; }
 NVN(nvnProgramSetSampleShading) { (void)c; }
 NVN(nvnProgramSetSubroutineLinkage) { RET(1); }
 static void set_shaders(Cpu *c, int stride) {
     static _Atomic uint64_t revisions;
-    uint64_t revision = atomic_fetch_add_explicit(&revisions, 1, memory_order_relaxed) + 1;
-    NvnProgram *p = program_new();
-    SET_HOST(A(0), p);
     int n = (int)A(1);
+    if (n < 0 || n > 6 || guest_mem_validate_range(A(0), sizeof(NvnGuestHandle), 8, GMEM_PERM_RW) != GMEM_OK ||
+        (n > 0 && guest_mem_validate_range(A(2), (uint64_t)n * (uint64_t)stride, 8, GMEM_PERM_R) != GMEM_OK)) {
+        RET(0);
+        return;
+    }
+    uint64_t revision = atomic_fetch_add_explicit(&revisions, 1, memory_order_relaxed) + 1;
+    NvnGuestHandle h;
+    NvnProgram *p = program_slot_alloc(&h);
     const uint8_t *data = AP(2);  // NVNshaderData[n] = {u64 data (GPU addr), const void* control}
     memset(p->stages, 0, sizeof p->stages);
     p->stage_mask = 0;
     p->backend = NULL;
     for (int i = 0; i < n; i++) {
-        uint64_t code = *(uint64_t *)(data + i * stride);
-        const uint8_t *control = (const uint8_t *)(uintptr_t) * (uint64_t *)(data + i * stride + 8);
+        uint64_t code = *(const uint64_t *)(data + i * stride);
+        uint64_t ctrl_addr = *(const uint64_t *)(data + i * stride + 8);
+        if (guest_mem_validate_range(code, 0x34, 4, GMEM_PERM_R) != GMEM_OK ||
+            guest_mem_validate_range(ctrl_addr, 0x704, 4, GMEM_PERM_R) != GMEM_OK) {
+            RET(0);
+            return;
+        }
+        const uint8_t *control = (const uint8_t *)(uintptr_t)ctrl_addr;
         // stage from the Maxwell shader program header (after the 0x30-byte NVN header)
-        uint32_t sph0 = *(uint32_t *)(uintptr_t)(code + 0x30);
+        uint32_t sph0 = *(const uint32_t *)(uintptr_t)(code + 0x30);
         uint32_t stage;
         switch ((sph0 >> 10) & 0xF) {
         case 1: stage = 0; break;  // vertex
@@ -775,15 +1987,30 @@ static void set_shaders(Cpu *c, int stride) {
         case 3: stage = 4; break;  // tess eval
         default: stage = 5; break; // compute (no SPH)
         }
-        if (*(uint32_t *)(uintptr_t)code != 0x12345678) stage = 5;
+        if (*(const uint32_t *)(uintptr_t)code != 0x12345678) stage = 5;
         p->stages[stage].stage = stage;
         p->stages[stage].code_addr = code;
         p->stages[stage].revision = revision;
         p->stages[stage].control = control;
-        p->stages[stage].const_offset = *(const uint32_t *)(control + 0x700);
-        p->stages[stage].const_size = *(const uint32_t *)(control + 0x6FC);
+        uint32_t coff = *(const uint32_t *)(control + 0x700);
+        uint32_t csz = *(const uint32_t *)(control + 0x6FC);
+        p->stages[stage].const_offset = coff;
+        p->stages[stage].const_size = csz;
+        free(p->stages[stage].const_snap);
+        p->stages[stage].const_snap = NULL;
+        p->stages[stage].const_snap_size = 0;
+        if (csz > 0 && csz <= 4096 &&
+            guest_mem_validate_range(code + coff, csz, 1, GMEM_PERM_R) == GMEM_OK) {
+            uint8_t *snap = malloc(csz);
+            if (snap) {
+                memcpy(snap, (const void *)(uintptr_t)(code + coff), csz);
+                p->stages[stage].const_snap = snap;
+                p->stages[stage].const_snap_size = csz;
+            }
+        }
         p->stage_mask |= 1u << stage;
     }
+    guest_mem_write_checked(A(0), &h, sizeof h, 8);
     RET(1);
 }
 
@@ -823,38 +2050,66 @@ NVN(nvnWindowFinalize) { (void)c; }
 NVN(nvnWindowSetDebugLabel) { (void)c; }
 #define WIN HOST(NvnWindow, A(0))
 NVN(nvnWindowGetNativeWindow) { RET(0); }
-NVN(nvnWindowGetNumTextures) { RET(WIN->num); }
-NVN(nvnWindowGetNumActiveTextures) { RET(WIN->active); }
-NVN(nvnWindowSetNumActiveTextures) { WIN->active = (int)A(1); }
-NVN(nvnWindowGetPresentInterval) { RET(WIN->interval); }
-NVN(nvnWindowSetPresentInterval) { WIN->interval = (int)A(1); }
-NVN(nvnWindowSetCrop) { int *cr = WIN->crop; cr[0] = (int)A(1); cr[1] = (int)A(2); cr[2] = (int)A(3); cr[3] = (int)A(4); }
-NVN(nvnWindowGetCrop) { memcpy(AP(1), WIN->crop, 16); }
+NVN(nvnWindowGetNumTextures) { NvnWindow *w = WIN; RET(w ? w->num : 0); }
+NVN(nvnWindowGetNumActiveTextures) { NvnWindow *w = WIN; RET(w ? w->active : 0); }
+NVN(nvnWindowSetNumActiveTextures) { NvnWindow *w = WIN; if (w) w->active = (int)A(1); }
+NVN(nvnWindowGetPresentInterval) { NvnWindow *w = WIN; RET(w ? w->interval : 1); }
+NVN(nvnWindowSetPresentInterval) { NvnWindow *w = WIN; if (w) w->interval = (int)A(1); }
+NVN(nvnWindowSetCrop) {
+    NvnWindow *w = WIN;
+    if (!w) return;
+    int *cr = w->crop; cr[0] = (int)A(1); cr[1] = (int)A(2); cr[2] = (int)A(3); cr[3] = (int)A(4);
+}
+NVN(nvnWindowGetCrop) {
+    NvnWindow *w = WIN;
+    if (w && guest_mem_validate_range(A(1), 16, 4, GMEM_PERM_RW) == GMEM_OK) memcpy(AP(1), w->crop, 16);
+}
 NVN(nvnWindowAcquireTexture) {
     NvnWindow *w = WIN;
-    if (A(1)) { NvnSync *sync = sync_of(A(1)); sync->signaled = 1; sync->seq = 0; }
-    *(int32_t *)AP(2) = w->next;
+    if (A(1)) {
+        NvnSync *sync = nvn_sync_host(A(1));
+        if (sync) {
+            atomic_store_explicit(&sync->seq, 0, memory_order_release);
+            atomic_store_explicit(&sync->signaled, 1, memory_order_release);
+        }
+    }
+    if (!w) { RET(0); return; }
+    if (guest_mem_validate_range(A(2), sizeof(int32_t), 4, GMEM_PERM_RW) == GMEM_OK)
+        *(int32_t *)AP(2) = w->next;
     w->next = (w->next + 1) % (w->active ? w->active : 1);
     RET(0);  // NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS
 }
 NVN(nvnQueueAcquireTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
-    *(int32_t *)AP(2) = w->next;
+    if (!w) { RET(0); return; }
+    if (guest_mem_validate_range(A(2), sizeof(int32_t), 4, GMEM_PERM_RW) == GMEM_OK)
+        *(int32_t *)AP(2) = w->next;
     w->next = (w->next + 1) % (w->active ? w->active : 1);
     RET(0);
 }
 NVN(nvnQueuePresentTexture) {
+    if (guest_mem_validate_range(A(1), 8, 8, GMEM_PERM_R) != GMEM_OK) return;
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
-    if (i >= 0 && i < w->num) {
-        NvnTexture *t = HOST(NvnTexture, w->textures[i]);
-        memcpy(t->window_crop, w->crop, sizeof t->window_crop);
-        extern void engage_present_pace(void);
-        extern void engage_timing_apply(Cpu *);
-        engage_timing_apply(c);
-        engage_present_pace();
-        backend_present(t);
+    if (!w || i < 0 || i >= w->num) return;
+    NvnTexLookup lk = nvn_texture_lookup(w->textures[i]);
+    if (lk.state != TEX_ST_LIVE_ORIG && lk.state != TEX_ST_LIVE_COPY) {
+        nvn_diag_record(NVN_EV_LOOKUP_FAIL, NVN_OBJ_TEXTURE, (uint8_t)lk.state, w->textures[i],
+                        lk.hdr.slot_index, lk.hdr.generation, lk.hdr.rt_epoch, 0, c->x[30], false, 0, 0);
+        uint64_t cnt = 0;
+        if (nvn_diag_should_log(NVN_EV_LOOKUP_FAIL, (uint8_t)lk.state, c->x[30], &cnt)) {
+            LOG("[nvn-diag] nvnQueuePresentTexture rejected invalid texture[%d] guest=%llx state=%u lr=%llx\n",
+                i, (unsigned long long)w->textures[i], (unsigned)lk.state, (unsigned long long)c->x[30]);
+        }
+        return;
     }
+    NvnTexture *t = lk.tex;
+    memcpy(t->window_crop, w->crop, sizeof t->window_crop);
+    extern void engage_present_pace(void);
+    extern void engage_timing_apply(Cpu *);
+    engage_timing_apply(c);
+    engage_present_pace();
+    backend_present(t);
 }
 
 // ================================================================== small state objects
