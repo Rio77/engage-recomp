@@ -55,8 +55,11 @@
 - The installed launcher reached and played S01.webm in Steam Deck Desktop
   Mode, past the original missing-branch failure. The smoke run reached frame
   2,400 with zero skipped draws or NVN diagnostics and exited with code 0.
-  Gaming Mode testing from the newly generated installation remains a
-  separate manual check.
+- The same installed AppImage and freshly generated library started from
+  Steam in Gaming Mode under Gamescope. The game passed the opening
+  cinematic, rendered over 5,200 frames and exited from the window close
+  with code 0. The log recorded zero skipped draws and NVN diagnostics.
+  This run used copies of the test saves.
 
 ## 0.1.0 validation
 
