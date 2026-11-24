@@ -558,33 +558,32 @@ static void tab_audio(void) {
     opt_end();
 }
 
-// Quit: back to the start screen (in game: the game reboots to it) or out to the desktop. Each asks first (progress
-// since the last save is lost); B / Esc or Cancel backs out.
-extern "C" void rt_request_reboot(int kind);  // runtime/main.c (RT_REBOOT_TITLE = 2: the start screen)
+// Quit: exit to desktop or close and rebuild with cheats.txt. Each asks first (progress since the last save is lost);
+// B / Esc or Cancel backs out.
+extern "C" void rt_request_reboot(int kind);  // runtime/main.c (RT_REBOOT_REBUILD = 3)
 static void tab_quit(float scale, bool in_game) {
-    static int ask;  // 0: the two choices; 1: start screen?; 2: desktop?
+    static int ask;  // 0: the two choices; 1: desktop?; 2: close and rebuild?
     if (ask && (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)))
         ask = 0;
     const char *lost = in_game ? "\n\nProgress since your last save is lost." : "";
-    char d1[200], d2[200];
-    snprintf(d1, sizeof d1, "Leaves the game and goes back to the " RT_APP_NAME " start screen.%s", lost);
-    snprintf(d2, sizeof d2, "Closes " RT_APP_NAME ".%s", lost);
+    char d1[240], d2[240];
+    snprintf(d1, sizeof d1, "Closes " RT_APP_NAME ".%s", lost);
+    snprintf(d2, sizeof d2, "Closes " RT_APP_NAME " and rebuilds the game code applying cheats from cheats.txt.%s", lost);
     opt_begin("##quit", scale);
     opt_section("Quit");
     if (!ask) {
-        if (!in_game) opt_disable_next();  // (already on it)
-        if (opt_action("Quit to Start Screen", "", in_game ? d1 : "You're on the start screen.")) ask = 1;
-        if (opt_action("Quit to Desktop", "", d2)) ask = 2;
+        if (opt_action("Quit to Desktop", "", d1)) ask = 1;
+        if (opt_action("Close and Rebuild", "", d2)) ask = 2;
     } else {
-        if (opt_action(ask == 1 ? "Yes, quit to Start Screen" : "Yes, quit to Desktop", "", ask == 1 ? d1 : d2)) {
+        if (opt_action(ask == 1 ? "Yes, quit to Desktop" : "Yes, close and rebuild", "", ask == 1 ? d1 : d2)) {
             settings_save();
             if (ask == 1) {
-                rt_request_reboot(2);
-                set_open(false);
-            } else {
                 SDL_Event q = {};
                 q.type = SDL_EVENT_QUIT;
                 SDL_PushEvent(&q);
+            } else {
+                rt_request_reboot(3);
+                set_open(false);
             }
             ask = 0;
         }
@@ -605,15 +604,15 @@ static void tab_game(void) {
     for (int i = 1; i < N_LANGUAGES; i++) names[i] = g_language_names[i];
     if (opt_choice("Language", &g_settings.language, names, N_LANGUAGES, 0,
                    "The console language the game is told, which picks its text language (the voice language is in "
-                   "the game's own settings). Applies when the game restarts: Quit to Start Screen, then Play."))
+                   "the game's own settings). Restart the game after changing."))
         settings_save();
     // cheats.txt (Atmosphere's format, in the project folder): runtime/hle/cheatvm.c
     int nc = cheatvm_count();
     opt_section("Cheats");
     if (nc == 0)
-        opt_action("No cheats", "", "Put Atmosphere-format cheats in cheats.txt next to " RT_APP_NAME " (a [name] line, "
-                   "then its codes), then restart. Cheats that patch the game's code also need the game code rebuilt "
-                   "(Settings > Game Files > Rebuild game code; in a source checkout: `make gen-main` and `make`).");
+        opt_action("No cheats", "", "Put Atmosphere-format cheats in cheats.txt inside the game folder (a [name] line, "
+                   "then its codes), then restart. Cheats that patch the game's code also need a rebuild "
+                   "(Quit > Close and Rebuild).");
     for (int i = 0; i < nc; i++) {
         CheatInfo ci;
         if (!cheatvm_info(i, &ci) || ci.master) continue;
@@ -621,11 +620,9 @@ static void tab_game(void) {
         std::string d = ci.desc && *ci.desc ? ci.desc : "From cheats.txt (no description: add # lines under its name).";
         if (ci.excludes && *ci.excludes) d += std::string("\n\nOnly one at a time: switching this on turns off ") + ci.excludes + ".";
         if (ci.unsupported) d += "\n\nThis cheat uses an opcode the cheat engine doesn't support, so it can't run.";
-        else if (ci.needs_gen) d += gamebuild_available()
-            ? "\n\nIt patches the game's code, and that patch isn't built in yet: Quit to Start Screen, then Settings > "
-              "Game Files > Rebuild game code, and restart."
-            : "\n\nIt patches the game's code, and that patch isn't built in yet: run `make gen-main` and then `make`, "
-              "and restart.";
+        else if (ci.needs_gen) d +=
+            "\n\nIt patches the game's code, and that patch isn't built in yet: use Quit > Close and Rebuild "
+            "(or `make gen-main && make` in a source checkout).";
         if (ci.unsupported || ci.needs_gen) opt_disable_next();
         if (opt_toggle(ci.name, &on, false, d.c_str())) { cheatvm_set(i, on); settings_save(); }
     }

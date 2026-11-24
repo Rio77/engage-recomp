@@ -21,4 +21,6 @@ PY
 clang -std=gnu11 -O1 -Iruntime/nvn/maxwell tools/test_maxwell_kill.c \
   runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/scf_*.c -lm -o /tmp/test_maxwell_kill
 /tmp/test_maxwell_kill
+clang -D_GNU_SOURCE -O1 -Iruntime -Wall -Werror tools/test_cheatvm.c runtime/hle/cheatvm.c runtime/guest_mem.c -pthread -o /tmp/test_cheatvm
+/tmp/test_cheatvm
 make test-nvn

@@ -17,8 +17,8 @@ import textwrap
 import time
 import traceback
 import uuid
-from engage_build import build
-from install_core import Installation, atomic_json, digest
+from engage_build import build, save_incremental_cache
+from install_core import Installation, atomic_json, digest, sync_dir
 from processes import stop_session
 
 VERSION = '0.3.0'
@@ -287,10 +287,15 @@ def is_shader_prep_current(root: Path, app_sha256: str, bin_sha256: str) -> bool
 
 def _mesa_cache_env(root: Path, base_env: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
+    if env.get('ENGAGE_ALLOW_FOSSILIZE') != '1':
+        env.setdefault('DISABLE_VK_LAYER_VALVE_steam_fossilize_1', '1')
     if env.get('ENGAGE_MESA_CACHE_OVERRIDE') == '0':
         return env
     if env.get('MESA_SHADER_CACHE_DISABLE') in ('1', 'true'):
         return env
+    for key in ('MESA_GLSL_CACHE_DIR', 'MESA_DISK_CACHE_READ_ONLY_FOZ_DBS',
+                'MESA_DISK_CACHE_READ_ONLY_FOZ_DBS_DYNAMIC_LIST', 'MESA_DISK_CACHE_COMBINE_RW_WITH_RO_FOZ'):
+        env.pop(key, None)
     mesa_dir = root / 'cache/mesa_cache'
     mesa_dir.mkdir(parents=True, exist_ok=True)
     env['MESA_SHADER_CACHE_DIR'] = str(mesa_dir)
@@ -520,9 +525,12 @@ def install(args):
         command = [sys.executable, str(Path(__file__).resolve()), '--worker', str(workspace),
                    '--exefs', str(exefs), '--romfs', str(romfs)]
         if dlc: command += ['--dlc', str(dlc)]
+        if (installation.root / 'cheats.txt').is_file():
+            command += ['--cheats', str(installation.root / 'cheats.txt')]
         existing_lib = installation.root / 'extracted/engagegame.so'
         existing_id = installation.root / 'extracted/engagegame.so.id'
-        if (not args.force and existing_lib.is_file() and not existing_lib.is_symlink()
+        if (not args.force and not (installation.root / 'cheats.txt').is_file()
+                and existing_lib.is_file() and not existing_lib.is_symlink()
                 and existing_id.is_file() and existing_id.read_text(encoding='ascii', errors='ignore').strip() == 'engage-030-perf'):
             command += ['--reuse-gamelib', str(existing_lib)]
         with log.open('w') as stream:
@@ -554,6 +562,9 @@ def install(args):
                 if progress and qdbus: subprocess.run([qdbus, *shlex.split(progress), 'close'], capture_output=True)
         stored = installation.add_app(app, digest(app))
         installation.commit(token, digest(stored), VERSION)
+        compile_dir = workspace / 'compile'
+        if compile_dir.is_dir():
+            save_incremental_cache(compile_dir, installation.root / 'cache/gamelib-build')
         launchers(installation.root, stored)
         installation.cleanup_workspace(token)
         shader_status = 'skipped'
@@ -574,11 +585,90 @@ def install(args):
                 'Installation complete. Add Engage-Recomp.sh to Steam as a non-Steam game. ') + str(installation.root))
 
 
+def _atomic_copy(src: Path, dst: Path):
+    tmp = dst.with_name(dst.name + '.tmp')
+    with src.open('rb') as sf, tmp.open('wb') as df:
+        shutil.copyfileobj(sf, df, 1024 * 1024)
+        df.flush()
+        os.fsync(df.fileno())
+    tmp.chmod(0o755 if dst.suffix == '.so' else 0o644)
+    os.replace(tmp, dst)
+
+
+def _run_rebuild_worker(installation: Installation):
+    extracted = installation.root / 'extracted'
+    if not (extracted / 'exefs/main').is_file():
+        raise ValueError(tr('Faltan archivos extraídos en ', 'Missing extracted game files in ') + str(extracted))
+    cache_build = installation.root / 'cache/gamelib-build'
+    cheats_file = installation.root / 'cheats.txt'
+    output = build(
+        BUNDLE,
+        cache_build,
+        extracted / 'exefs',
+        cheats_path=cheats_file if cheats_file.is_file() else None,
+        incremental=True,
+        existing_so=extracted / 'engagegame.so',
+    )
+    if output.resolve() != (extracted / 'engagegame.so').resolve():
+        _atomic_copy(output, extracted / 'engagegame.so')
+        id_file = output.with_suffix('.so.id')
+        if id_file.is_file():
+            _atomic_copy(id_file, extracted / 'engagegame.so.id')
+        cheats_out = output.with_suffix('.so.cheats')
+        if cheats_out.is_file():
+            _atomic_copy(cheats_out, extracted / 'engagegame.so.cheats')
+        else:
+            (extracted / 'engagegame.so.cheats').unlink(missing_ok=True)
+        sync_dir(extracted)
+    save_incremental_cache(cache_build, cache_build)
+
+
+def rebuild_gamelib(installation: Installation, interactive: bool = True):
+    """Rebuild engagegame.so incrementally with cheats.txt and notify when finished (game stays closed)."""
+    log = installation.root / 'rebuild.log'
+    command = [sys.executable, str(Path(__file__).resolve()), '--rebuild-worker', '--root', str(installation.root)]
+    with log.open('w', encoding='utf-8') as stream:
+        process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        progress = None
+        qdbus = shutil.which('qdbus6') or shutil.which('qdbus')
+        if interactive:
+            message = tr('Recompilando el código del juego con cheats.txt. Registro: ',
+                         'Rebuilding game code with cheats.txt. Log: ') + str(log)
+            progress = dialog('--progressbar', textwrap.fill(message, 72), '0').stdout.strip()
+            if progress and qdbus:
+                subprocess.run([qdbus, *shlex.split(progress), 'showCancelButton', 'true'], capture_output=True)
+        try:
+            while process.poll() is None:
+                if progress and qdbus:
+                    cancelled = subprocess.run([qdbus, *shlex.split(progress), 'wasCancelled'], capture_output=True, text=True)
+                    if cancelled.returncode or cancelled.stdout.strip() == 'true':
+                        raise KeyboardInterrupt
+                    with log.open('rb') as tail:
+                        tail.seek(max(0, log.stat().st_size - 1024))
+                        lines = tail.read().decode(errors='replace').splitlines()
+                    label = (lines[-1][:240] if lines else tr('Analizando cheats.txt…', 'Checking cheats.txt…'))
+                    subprocess.run([qdbus, *shlex.split(progress), 'setLabelText',
+                        textwrap.fill(label, 72) + '\n' + textwrap.fill(str(log), 72)], capture_output=True)
+                time.sleep(0.5)
+            if process.returncode:
+                raise RuntimeError('Rebuild failed. See ' + str(log))
+        finally:
+            if process.poll() is None:
+                stop_session(process)
+            if progress and qdbus:
+                subprocess.run([qdbus, *shlex.split(progress), 'close'], capture_output=True)
+    if interactive:
+        dialog('--msgbox', tr(
+            'Compilación finalizada. Se aplicaron los cheats de cheats.txt. Ya podés volver a abrir Engage Recomp.',
+            'Compilation finished. Cheats from cheats.txt were applied. You can launch Engage Recomp again now.'
+        ))
+
+
 def main():
     parser = argparse.ArgumentParser()
-    for flag in ('install', 'play', 'settings', 'prepare-shaders', 'no-shaders', 'force', 'noninteractive', 'no-dlc'):
+    for flag in ('install', 'play', 'settings', 'prepare-shaders', 'no-shaders', 'force', 'noninteractive', 'no-dlc', 'rebuild', 'rebuild-worker'):
         parser.add_argument('--' + flag, action='store_true')
-    for flag in ('root', 'exefs', 'romfs', 'dlc', 'worker', 'appimage', 'reuse-gamelib'):
+    for flag in ('root', 'exefs', 'romfs', 'dlc', 'worker', 'appimage', 'reuse-gamelib', 'cheats'):
         parser.add_argument('--' + flag, type=Path)
     args = parser.parse_args()
     if args.dlc and args.no_dlc: parser.error('--dlc and --no-dlc are mutually exclusive')
@@ -598,11 +688,23 @@ def main():
             (staged / 'engagegame.so.id').write_text('engage-030-perf\n')
         else:
             print('Generating and compiling game library', flush=True)
-            output = build(BUNDLE, args.worker / 'compile', staged / 'exefs')
+            cheats_path = getattr(args, 'cheats', None)
+            output = build(BUNDLE, args.worker / 'compile', staged / 'exefs', cheats_path=cheats_path)
             shutil.copy2(output, staged / output.name)
             shutil.copy2(output.with_suffix('.so.id'), staged / 'engagegame.so.id')
+            if output.with_suffix('.so.cheats').is_file():
+                shutil.copy2(output.with_suffix('.so.cheats'), staged / 'engagegame.so.cheats')
+        return
+    if args.rebuild_worker:
+        _run_rebuild_worker(Installation(args.root or Path.home() / 'Games/Engage-Recomp'))
         return
     if args.prepare_shaders: return prepare_shaders_cli(args)
+    if args.rebuild:
+        installation = Installation(args.root or Path.home() / 'Games/Engage-Recomp')
+        with installation.lock():
+            installation.recover()
+            rebuild_gamelib(installation, interactive=not args.noninteractive)
+        return
     if args.install or not (args.play or args.settings): return install(args)
     installation = Installation(args.root or Path.home() / 'Games/Engage-Recomp')
     with installation.lock() as lock_fd:
@@ -614,6 +716,8 @@ def main():
         extracted = installation.root / 'extracted'
         if not (extracted / 'engagegame.so').is_file():
             raise ValueError(tr('Primero ejecutá el instalador para esta carpeta.', 'Run the installer for this folder first.'))
+        rebuild_marker = installation.root / '.rebuild-requested'
+        rebuild_marker.unlink(missing_ok=True)
         env = _mesa_cache_env(installation.root)
         env.update(LARECOMP_DATA_ROOT=str(installation.root),
             LARECOMP_GAME_LIB=str(extracted / 'engagegame.so'),
@@ -624,6 +728,7 @@ def main():
         process = subprocess.Popen([str(BUNDLE / 'engage-recomp'), str(extracted), '--play'],
             cwd=installation.root, env=env, pass_fds=(lock_fd,))
         progress = None
+        status = 0
         try:
             if complete_frames:
                 progress = subprocess.Popen(
@@ -631,11 +736,16 @@ def main():
                      str(installation.root), str(process.pid), str(BUNDLE / 'icon.png')],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             status = process.wait()
-            if status: raise subprocess.CalledProcessError(status, 'engage-recomp')
         finally:
             if progress is not None:
                 if progress.poll() is None: progress.terminate()
                 progress.wait()
+        if status == 42 or rebuild_marker.is_file():
+            rebuild_marker.unlink(missing_ok=True)
+            rebuild_gamelib(installation, interactive=not args.noninteractive)
+            return
+        if status:
+            raise subprocess.CalledProcessError(status, 'engage-recomp')
 
 
 if __name__ == '__main__':
@@ -643,5 +753,5 @@ if __name__ == '__main__':
     except KeyboardInterrupt: sys.exit(130)
     except Exception as error:
         traceback.print_exc()
-        if '--noninteractive' not in sys.argv and '--worker' not in sys.argv: dialog('--error', str(error))
+        if '--noninteractive' not in sys.argv and '--worker' not in sys.argv and '--rebuild-worker' not in sys.argv: dialog('--error', str(error))
         sys.exit(1)

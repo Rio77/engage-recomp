@@ -11,6 +11,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL_RUNTIME_HOOK = True
+CHUNKS_FILTER = None
 sys.path.insert(0, str(ROOT / "source/tools"))
 from nso import Nso
 import gen
@@ -51,7 +52,12 @@ def main():
         gen.PATCHES[address] = timing_instruction
     remaining = set(owners)
     updates = {}
-    for path in (ROOT / "generated/main").glob("main_*.c"):
+    chunks = sorted((ROOT / "generated/main").glob("main_*.c"))
+    if CHUNKS_FILTER is not None:
+        chunks = [c for c in chunks if c.name in CHUNKS_FILTER]
+        if not chunks:
+            return
+    for path in chunks:
         text = path.read_text()
         updated = text
         for begin in remaining.copy():
@@ -73,8 +79,10 @@ def main():
             remaining.remove(begin)
         if updated != text:
             updates[path] = '#include "engage_timing.h"\n' + updated
-    if remaining:
+    if remaining and CHUNKS_FILTER is None:
         raise ValueError(f"Missing timing sites: {remaining}")
+    if CHUNKS_FILTER is not None and not updates:
+        return
     runtime = ROOT / "source/runtime"
     (runtime / "engage_timing.h").write_text(
         '#pragma once\n#include "cpu.h"\nvoid engage_timing_site(Cpu *, uint64_t);\nvoid engage_present_pace(void);\n')

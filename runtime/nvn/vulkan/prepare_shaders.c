@@ -675,12 +675,20 @@ int vk_prepare_shaders(const PrepareOpts *opts) {
     uint32_t *vs_out_mask = calloc(hdr.nshaders ? hdr.nshaders : 1, sizeof(uint32_t));
     uint64_t *vs_xlat = calloc(hdr.nshaders ? hdr.nshaders : 1, sizeof(uint64_t));
     uint64_t *cs_xlat = calloc(hdr.ncompute ? hdr.ncompute : 1, sizeof(uint64_t));
-    uint64_t *fx_list = calloc(hdr.npairs ? hdr.npairs : 1, sizeof(uint64_t));
+    size_t cap_fx = (size_t)hdr.npairs + (size_t)hdr.npsos + 16;
+    uint64_t *fx_list = calloc(cap_fx, sizeof(uint64_t));
+    uint8_t *fx_alpha = calloc(cap_fx, 1);
     size_t n_fx = 0;
-    U64Set seen_fs = {0}, seen_spv = {0};
+    typedef struct { uint64_t xh[2]; uint32_t vs_out_mask, pad; } WarmPairDiskRec;
+    size_t cap_wp = (size_t)hdr.npairs + (size_t)hdr.npsos + 16;
+    WarmPairDiskRec *wp_list = calloc(cap_wp, sizeof *wp_list);
+    size_t n_wp = 0;
+    U64Set seen_fs = {0}, seen_spv = {0}, seen_fx = {0}, seen_wp = {0};
     U64Map fs_xlat = {0};
     u64set_init(&seen_fs, 16384);
     u64set_init(&seen_spv, 16384);
+    u64set_init(&seen_fx, 16384);
+    u64set_init(&seen_wp, 16384);
     u64map_init(&fs_xlat, 16384);
 
     SpvQueue spvq;
@@ -732,21 +740,33 @@ int vk_prepare_shaders(const PrepareOpts *opts) {
 
         if (vs_state[vi] == 1 && !g_stop_requested) {
             uint64_t pair_sig = pack_pair_sig(fi, vs_out_mask[vi]);
+            uint64_t fh = 0;
             if (u64set_add(&seen_fs, pair_sig)) {
                 ShaderKey fkey = {0};
                 fkey.glsl = 1;
                 fkey.flip_y = flip_y;
                 fkey.vs_out_mask = vs_out_mask[vi];
-                uint64_t fh = 0;
                 ShaderInfo *si = vk_translate_cached(fs->code, shader_max_code(fs), STAGE_FRAGMENT, &fkey, &fh);
                 if (si && si->msl) {
                     u64map_put(&fs_xlat, pair_sig, fh);
-                    if (n_fx < hdr.npairs) fx_list[n_fx++] = fh;
+                    if (n_fx < cap_fx && u64set_add(&seen_fx, fh)) {
+                        fx_alpha[n_fx] = (strstr(si->msl, "discard") != NULL || strstr(si->msl, "demote") != NULL) ? 1 : 0;
+                        fx_list[n_fx++] = fh;
+                    }
                     maybe_queue_spv(&spvq, &seen_spv, si->msl, STAGE_FRAGMENT, fs->meta.dm_key);
                 } else {
                     xlat_fail++;
                 }
                 maxwell_free(si);
+            } else {
+                u64map_get(&fs_xlat, pair_sig, &fh);
+            }
+            if (fh && n_wp < cap_wp) {
+                uint64_t wpk = (vs_xlat[vi] * 0x9E3779B97F4A7C15ull) ^ fh;
+                wpk = fnv_mix(wpk, &vs_out_mask[vi], sizeof(uint32_t));
+                if (u64set_add(&seen_wp, wpk)) {
+                    wp_list[n_wp++] = (WarmPairDiskRec){.xh = {vs_xlat[vi], fh}, .vs_out_mask = vs_out_mask[vi], .pad = 0};
+                }
             }
         }
 
@@ -818,7 +838,7 @@ int vk_prepare_shaders(const PrepareOpts *opts) {
 
         const bool use_gpl = vk_gpl_supported();
         size_t max_jobs = (size_t)hdr.npsos * 3 + (size_t)hdr.ncompute +
-                          (use_gpl ? ((size_t)hdr.nshaders + n_fx + 16) : 0);
+                          (use_gpl ? ((size_t)hdr.nshaders + cap_fx * 2 + 16) : 0);
         PipeJob *jobs = calloc(max_jobs ? max_jobs : 1, sizeof *jobs);
         U64Set seen_jobs = {0};
         u64set_init(&seen_jobs, 8192);
@@ -880,6 +900,10 @@ int vk_prepare_shaders(const PrepareOpts *opts) {
                     size_t nw = 0;
                     uint32_t *spv = vk_glsl_to_spirv_ex(si->msl, STAGE_FRAGMENT, "fs", &nw, NULL);
                     free(spv);
+                    if (n_fx < cap_fx && u64set_add(&seen_fx, fxh)) {
+                        fx_alpha[n_fx] = (strstr(si->msl, "discard") != NULL || strstr(si->msl, "demote") != NULL) ? 1 : 0;
+                        fx_list[n_fx++] = fxh;
+                    }
                 } else {
                     fxh = 0;
                 }
@@ -895,6 +919,9 @@ int vk_prepare_shaders(const PrepareOpts *opts) {
                 p_idx = nprogs++;
                 prog_slots[p_idx] = (OfflineProgSlot){.vxh = vxh, .fxh = fxh, .vs_out_mask = omask, .op = NULL};
                 u64map_put(&prog_map, pk, p_idx);
+            }
+            if (n_wp < cap_wp && u64set_add(&seen_wp, pk)) {
+                wp_list[n_wp++] = (WarmPairDiskRec){.xh = {vxh, fxh}, .vs_out_mask = omask, .pad = 0};
             }
             pso_prog_idx[pi] = (uint32_t)p_idx;
         }
@@ -966,8 +993,15 @@ int vk_prepare_shaders(const PrepareOpts *opts) {
                 uint64_t tag = ((uint64_t)JOB_LIB_FS << 56) | (1ull << 8);
                 uint64_t h = fnv_mix(fnv_mix(0xcbf29ce484222325ull, &tag, sizeof tag), &fxh, sizeof fxh);
                 if (!h) h = 1;
-                if (!u64set_add(&seen_jobs, h)) continue;
-                jobs[njobs++] = (PipeJob){.job_kind = JOB_LIB_FS, .samples = 1, .a2c = 0, .hash = h, .cxh = fxh};
+                if (u64set_add(&seen_jobs, h))
+                    jobs[njobs++] = (PipeJob){.job_kind = JOB_LIB_FS, .samples = 1, .a2c = 0, .hash = h, .cxh = fxh};
+                if (fx_alpha[fi] && njobs < max_jobs) {
+                    uint64_t tag_a2c = ((uint64_t)JOB_LIB_FS << 56) | (1ull << 8) | 1ull;
+                    uint64_t ha = fnv_mix(fnv_mix(0xcbf29ce484222325ull, &tag_a2c, sizeof tag_a2c), &fxh, sizeof fxh);
+                    if (!ha) ha = 1;
+                    if (u64set_add(&seen_jobs, ha))
+                        jobs[njobs++] = (PipeJob){.job_kind = JOB_LIB_FS, .samples = 1, .a2c = 1, .hash = ha, .cxh = fxh};
+                }
             }
             for (size_t gi = 0, ng = njobs; gi < ng && njobs + 2 <= max_jobs; gi++) {
                 if (jobs[gi].job_kind != JOB_GFX) continue;
@@ -1058,6 +1092,19 @@ int vk_prepare_shaders(const PrepareOpts *opts) {
         free(skip_set.tab);
     }
 
+    if (!g_stop_requested && n_wp > 0) {
+        mkdir("cache", 0755);
+        FILE *wf = fopen("cache/warm_pairs.bin.tmp", "wb");
+        if (wf) {
+            uint32_t whdr[4] = {0x53525057u, 1u, (uint32_t)sizeof(WarmPairDiskRec), (uint32_t)n_wp};
+            bool ok = fwrite(whdr, sizeof whdr, 1, wf) == 1 &&
+                      fwrite(wp_list, sizeof *wp_list, n_wp, wf) == n_wp;
+            if (fclose(wf) != 0) ok = false;
+            if (ok) { remove("cache/warm_pairs.bin"); if (rename("cache/warm_pairs.bin.tmp", "cache/warm_pairs.bin") != 0) remove("cache/warm_pairs.bin.tmp"); }
+            else remove("cache/warm_pairs.bin.tmp");
+        }
+    }
+
     free(threads);
 
     bool cancelled = g_stop_requested != 0;
@@ -1084,12 +1131,16 @@ int vk_prepare_shaders(const PrepareOpts *opts) {
 
     free(seen_fs.tab);
     free(seen_spv.tab);
+    free(seen_fx.tab);
+    free(seen_wp.tab);
     free(fs_xlat.tab);
     free(vs_state);
     free(vs_out_mask);
     free(vs_xlat);
     free(cs_xlat);
     free(fx_list);
+    free(fx_alpha);
+    free(wp_list);
     for (uint32_t i = 0; i < hdr.nshaders; i++) free(shaders[i].code);
     free(shaders);
     free(pairs);

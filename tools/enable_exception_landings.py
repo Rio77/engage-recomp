@@ -16,6 +16,8 @@ from reemit_main_functions import (
     unwind_records,
 )
 
+CHUNKS_FILTER = None
+
 
 FRAMES = {
     0x351F2B0: 0x351F500,
@@ -155,7 +157,12 @@ def main():
     definitions = re.compile(r"^void(?: __attribute__\(\(optnone\)\))? f_([0-9a-f]+)\(Cpu \*c\) \{", re.MULTILINE)
     remaining = {BASE + addr for addr in selected}
     updates = {}
-    for chunk in sorted(generated.glob("main_*.c")):
+    chunks = sorted(generated.glob("main_*.c"))
+    if CHUNKS_FILTER is not None:
+        chunks = [c for c in chunks if c.name in CHUNKS_FILTER]
+        if not chunks:
+            return
+    for chunk in chunks:
         source = chunk.read_text()
         for begin in sorted(remaining & {int(addr, 16) for addr in definitions.findall(source)}):
             end_offset, frame = selected[begin - BASE]
@@ -204,7 +211,7 @@ def main():
             print(f"{chunk.name}: {begin:#x}–{end:#x}, {calls} native landing checkpoints", flush=True)
         if not remaining:
             break
-    if remaining:
+    if remaining and CHUNKS_FILTER is None:
         raise ValueError(f"Missing native frames {remaining!r}")
     runtime = ROOT / "source/runtime"
     (runtime / "engage_unwind.h").write_text(HEADER)

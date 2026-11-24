@@ -10,6 +10,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parent.parent
+CHUNKS_FILTER = None
 BASE = 0x7000000000
 BUILD = "8c08b9719e085f91847b5e0f935d9488"
 LARGE_EXTENTS = {
@@ -163,7 +164,12 @@ def main():
             raise ValueError("Requested address is not a verified split function")
     print(f"Discovered {len(remaining)} split functions with computed branches", flush=True)
     definition = re.compile(r"^void(?: __attribute__\(\(optnone\)\))? f_([0-9a-f]+)\(Cpu \*c\) \{", re.MULTILINE)
-    for chunk in sorted(generated.glob("main_*.c")):
+    chunks = sorted(generated.glob("main_*.c"))
+    if CHUNKS_FILTER is not None:
+        chunks = [c for c in chunks if c.name in CHUNKS_FILTER]
+        if not chunks:
+            return
+    for chunk in chunks:
         source = chunk.read_text()
         updated = source
         present = {int(match, 16) for match in definition.findall(source)}
@@ -208,6 +214,8 @@ def main():
             chunk.write_text(updated)
         if not remaining:
             return
+    if CHUNKS_FILTER is not None:
+        return
     raise ValueError(f"Missing generated functions: {remaining!r}")
 
 

@@ -6,6 +6,7 @@ Usage: gen.py <name> <nso> <base> <outdir> [--hle hle_symbols.txt] [--chunk N] [
 """
 import argparse
 import bisect
+import json
 import multiprocessing
 import os
 import platform
@@ -628,6 +629,8 @@ def main():
     args = ap.parse_args()
 
     t0 = time.time()
+    VARIANTS.clear()
+    VARIANTS.update((a, ('rando_word', ws)) for a, ws in RANDO_CODE.items())
     m = Module(args.name, args.nso, args.base, args.simd)
     if args.name == 'main':
         import cheats
@@ -637,7 +640,7 @@ def main():
             VARIANTS[off] = ('cheat_word', ws)
         if cv:
             print(f'[gen] {path}: {len(cv)} instruction(s) with cheat variants', file=sys.stderr)
-        # what got compiled in, for the runtime (a cheat added since needs `make gen` again: the menu says so)
+        # what got compiled in, for the runtime (a cheat added since needs rebuild: the menu says so)
         os.makedirs(args.outdir, exist_ok=True)
         write_if_changed(os.path.join(args.outdir, 'cheat_variants.txt'),
                          ''.join(f'{off:x} {w:08x}\n' for off, ws in sorted(cv.items()) for w in ws))
@@ -766,14 +769,16 @@ def main():
     # below keeps the address order; only the order the files are written in changes.
     BIG = 0x4000  # bytes of guest code (4096 instructions)
     big = sorted((a for a in order if entries[a][0] - a >= BIG), key=lambda a: a - entries[a][0])
-    seq = big + [a for a in order if entries[a][0] - a < BIG]
-    parts = []  # the parts of a long function (emit_function), each written as a function of its own
+    small = [a for a in order if entries[a][0] - a < BIG]
+    seq = big + small
+    parts = []  # (code_str, refs, owner_addr, part_idx) of a split BIG function
     emit_pool = None
     emit_iter = None
     if _parallel_scan_emit_enabled() and nworkers > 1 and len(seq) >= 256:
         global _FORK_EMIT_STATE
         _FORK_EMIT_STATE = (m, entries, hle)
-        ebatches = [seq[j:j + 128] for j in range(0, len(seq), 128)]
+        ebatches = ([big[j:j + 4] for j in range(0, len(big), 4)]
+                    + [small[j:j + 128] for j in range(0, len(small), 128)])
         emit_pool = multiprocessing.get_context('fork').Pool(processes=nworkers)
         emit_iter = (item for sub in emit_pool.imap(_fork_emit_worker, ebatches) for item in sub)
 
@@ -789,43 +794,53 @@ def main():
         m._parts = []
         return a, '\n'.join(lines), r, pts
 
+    chunk_records = []
     try:
         while ci < len(seq) or pending or parts:
-            body, refs, size, fns = [], set(), 0, []
+            body, refs, size, fns, chunk_items = [], set(), 0, [], []
             while (pending or parts or ci < len(seq)) and len(fns) < args.chunk and size < args.chunk_bytes:
                 if pending:
-                    a, code_str, r = pending
+                    a, code_str, r, item_kind, owner_a, part_idx = pending
                     pending = None
                 elif parts:
-                    code_str, r = parts.pop(0)
+                    code_str, r, owner_a, part_idx = parts.pop(0)
                     a = None
+                    item_kind = 'part'
                 else:
                     a, code_str, r, pts = next_emitted()
                     ci += 1
+                    owner_a, part_idx = a, None
                     if pts and entries[a][0] - a < BIG:
                         # Keep small split functions and their parts in the same chunk so post-passes
                         # (reemit / exception landings) never leave orphaned _p* definitions behind.
                         for p_str, p_refs in pts:
                             code_str += '\n' + p_str
                             r = r | p_refs
+                        item_kind = 'whole'
                     else:
-                        parts += pts
+                        for idx_p, (p_str, p_refs) in enumerate(pts):
+                            parts.append((p_str, p_refs, a, idx_p))
+                        item_kind = 'main' if pts else 'whole'
                 n = len(code_str) + 1
                 if n > args.big_fn and fns:  # (a big function gets a file of its own: they compile in parallel)
-                    pending = (a, code_str, r)
+                    pending = (a, code_str, r, item_kind, owner_a, part_idx)
                     break
                 body.append(code_str)
                 size += n
                 fns.append(a)
                 refs |= r
+                chunk_items.append([item_kind, f'{owner_a:#x}', part_idx])
                 if n > args.big_fn:
                     break
-            path = os.path.join(args.outdir, f'{args.name}_{nchunks:03d}.c')
+            chunk_name = f'{args.name}_{nchunks:03d}.c'
+            path = os.path.join(args.outdir, chunk_name)
             text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
             text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
             text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
             text += ['\n'.join(body), '\n']
             write_if_changed(path, ''.join(text))
+            if args.name == 'main':
+                chunk_records.append({'file': chunk_name, 'items': chunk_items})
             nchunks += 1
             # (the start screen's setup reads these for its progress bar: runtime/gamebuild.c)
             print(f'{args.name}: progress {ci}/{len(order)} files {nchunks}', file=sys.stderr, flush=True)
@@ -838,6 +853,17 @@ def main():
         mm = re.fullmatch(re.escape(args.name) + r'_(\d{3})\.c', fn)
         if mm and int(mm.group(1)) >= nchunks:
             os.remove(os.path.join(args.outdir, fn))
+    if args.name == 'main':
+        chunks_meta = {
+            'format': 1,
+            'build_id': m.nso.build_id,
+            'simd': args.simd,
+            'big_threshold': BIG,
+            'entries': {f'{a:#x}': f'{entries[a][0]:#x}' for a in order},
+            'hle': {f'{a:#x}': sym for a, sym in sorted(hle.items())},
+            'chunks': chunk_records,
+        }
+        write_if_changed(os.path.join(args.outdir, 'main_chunks.json'), json.dumps(chunks_meta))
     import io
     with io.StringIO() as f:
         f.write('#include "cpu.h"\n')
@@ -852,6 +878,123 @@ def main():
         f.write(f'const uint64_t {args.name}_fn_count = {len(order)};\n')
         write_if_changed(os.path.join(args.outdir, f'{args.name}_table.c'), f.getvalue())
     print(f'{args.name}: wrote {nchunks} chunks, {time.time() - t0:.0f}s total', file=sys.stderr)
+
+
+def _read_variants_file(path):
+    variants = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2:
+                    off = int(parts[0], 16)
+                    word = int(parts[1], 16)
+                    variants.setdefault(off, []).append(word)
+    except FileNotFoundError:
+        return None
+    return variants
+
+
+def update_main_chunks(nso_path, outdir, cheats_path, simd='c'):
+    """Incrementally re-emit only the main_*.c chunks affected by changes in cheats.txt.
+
+    Returns the list of regenerated chunk filenames (e.g. ['main_042.c']), or None if a
+    full generation is required (missing/incompatible metadata). Keeps VARIANTS populated
+    for subsequent main post-passes (reemit, exception landings, timing).
+    """
+    meta_path = os.path.join(outdir, 'main_chunks.json')
+    if not os.path.isfile(meta_path):
+        return None
+    old_cv = _read_variants_file(os.path.join(outdir, 'cheat_variants.txt'))
+    if old_cv is None:
+        return None
+    with open(meta_path) as f:
+        meta = json.load(f)
+    if meta.get('format') != 1 or meta.get('simd') != simd:
+        return None
+
+    base = 0x7000000000
+    m = Module('main', nso_path, base, simd)
+    if m.nso.build_id != meta.get('build_id'):
+        return None
+
+    import cheats
+    VARIANTS.clear()
+    VARIANTS.update((a, ('rando_word', ws)) for a, ws in RANDO_CODE.items())
+    new_cv = cheats.code_variants(cheats_path, lambda off: m.in_text(base + off))
+    for off, ws in new_cv.items():
+        VARIANTS[off] = ('cheat_word', ws)
+
+    dirty_offs = [off for off in (set(old_cv) | set(new_cv)) if old_cv.get(off) != new_cv.get(off)]
+    variants_text = ''.join(f'{off:x} {w:08x}\n' for off, ws in sorted(new_cv.items()) for w in ws)
+    if not dirty_offs:
+        write_if_changed(os.path.join(outdir, 'cheat_variants.txt'), variants_text)
+        return []
+
+    entries = {int(k, 16): int(v, 16) for k, v in meta['entries'].items()}
+    hle = {int(k, 16): sym for k, sym in meta['hle'].items()}
+    sorted_begins = sorted(entries)
+    big_threshold = int(meta.get('big_threshold', 0x4000))
+
+    dirty_owners = set()
+    for off in dirty_offs:
+        addr = base + off
+        idx = bisect.bisect_right(sorted_begins, addr) - 1
+        if idx < 0:
+            return None
+        begin = sorted_begins[idx]
+        if addr >= entries[begin]:
+            return None
+        dirty_owners.add(begin)
+
+    dirty_chunks = [c for c in meta['chunks'] if any(int(item[1], 16) in dirty_owners for item in c['items'])]
+    emitted = {}
+    for c in dirty_chunks:
+        for _, owner_hex, _ in c['items']:
+            owner_a = int(owner_hex, 16)
+            if owner_a in emitted:
+                continue
+            end = entries[owner_a]
+            labels, _, tables = m.scan(owner_a, end)
+            lines = m.emit_function(owner_a, end, labels, tables, hle)
+            r = getattr(m, '_refs', set())
+            m._refs = set()
+            pts = [('\n'.join(b), pr) for b, pr in m._parts]
+            m._parts = []
+            code_str = '\n'.join(lines)
+            if pts and end - owner_a < big_threshold:
+                for p_str, p_refs in pts:
+                    code_str += '\n' + p_str
+                    r = r | p_refs
+                pts = []
+            emitted[owner_a] = (code_str, r, pts)
+
+    written = []
+    for c in dirty_chunks:
+        body, refs, fns = [], set(), []
+        for item_kind, owner_hex, part_idx in c['items']:
+            owner_a = int(owner_hex, 16)
+            code_str, r, pts = emitted[owner_a]
+            if item_kind == 'part':
+                if part_idx is None or part_idx >= len(pts):
+                    return None
+                p_str, p_refs = pts[part_idx]
+                body.append(p_str)
+                refs |= p_refs
+            else:
+                body.append(code_str)
+                refs |= r
+                fns.append(owner_a)
+        text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
+        text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
+        text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
+        text += ['\n'.join(body), '\n']
+        write_if_changed(os.path.join(outdir, c['file']), ''.join(text))
+        written.append(c['file'])
+
+    write_if_changed(os.path.join(outdir, 'cheat_variants.txt'), variants_text)
+    print(f'[gen] updated {len(written)} main chunk(s) for cheats: {", ".join(written)}', file=sys.stderr)
+    return written
 
 
 if __name__ == '__main__':

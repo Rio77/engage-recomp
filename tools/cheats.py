@@ -62,15 +62,16 @@ def code_variants(path, in_text):
     if not path or not os.path.exists(path):
         return out
     for name, words in parse(path):
+        zero_regs = 0xFFFF  # registers known to remain 0 before any opcode writes to them
         for t, op in opcodes(words):
             w = op[0]
             width, mem, reg = (w >> 24) & 0xF, (w >> 20) & 0xF, (w >> 16) & 0xF
-            if t != 0 or width != 4 or mem != 0 or reg != 0:  # (a register offset: not known before it runs)
-                continue
-            off = ((w & 0xFF) << 32) | op[1]
-            if not in_text(off):
-                continue
-            vs = out.setdefault(off, [])
-            if op[2] not in vs:
-                vs.append(op[2])
+            if t == 0 and width == 4 and mem == 0 and (zero_regs & (1 << reg)):
+                off = ((w & 0xFF) << 32) | op[1]
+                if in_text(off):
+                    vs = out.setdefault(off, [])
+                    if op[2] not in vs:
+                        vs.append(op[2])
+            if (t == 3 and width == 0) or t in (4, 5, 7) or (t == 6 and ((w >> 12) & 0xF) != 0):
+                zero_regs &= ~(1 << reg)
     return out

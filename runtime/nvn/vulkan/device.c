@@ -33,6 +33,10 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 
 static void vk_configure_mesa_cache(void) {
 #ifdef __linux__
+    const char *fov = getenv("ENGAGE_ALLOW_FOSSILIZE");
+    if (!fov || strcmp(fov, "1") != 0) {
+        setenv("DISABLE_VK_LAYER_VALVE_steam_fossilize_1", "1", 0);
+    }
     const char *ov = getenv("ENGAGE_MESA_CACHE_OVERRIDE");
     if (ov && !strcmp(ov, "0")) return;
     const char *dis = getenv("MESA_SHADER_CACHE_DISABLE");
@@ -44,6 +48,10 @@ static void vk_configure_mesa_cache(void) {
     snprintf(mesa_dir, sizeof mesa_dir, "%s/cache/mesa_cache", root);
     mkdir(cache_dir, 0755);
     mkdir(mesa_dir, 0755);
+    unsetenv("MESA_GLSL_CACHE_DIR");
+    unsetenv("MESA_DISK_CACHE_READ_ONLY_FOZ_DBS");
+    unsetenv("MESA_DISK_CACHE_READ_ONLY_FOZ_DBS_DYNAMIC_LIST");
+    unsetenv("MESA_DISK_CACHE_COMBINE_RW_WITH_RO_FOZ");
     setenv("MESA_SHADER_CACHE_DIR", mesa_dir, 1);
     setenv("MESA_DISK_CACHE_SINGLE_FILE", "0", 1);
     setenv("MESA_SHADER_CACHE_MAX_SIZE", "2G", 0);
@@ -781,6 +789,8 @@ static void backend_present_locked(NvnTexture *t) {
     if (slow_ms > 0 && total_frames > 2600 && (!slow_until || (long)total_frames < slow_until)) SDL_Delay((Uint32)slow_ms);
     extern void fnprof_frame(uint64_t frame);
     fnprof_frame(total_frames);
+    extern void cheatvm_frame(void);
+    cheatvm_frame();
     extern void reboot_test_frame(uint64_t frame);  // runtime/main.c (LARECOMP_REBOOT_AT)
     reboot_test_frame(total_frames);
     extern void vk_level_change_check(void);

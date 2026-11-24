@@ -21,6 +21,9 @@ cache/
 *.key
 *.pem
 hosts.yml
+cheats.txt
+*.so.cheats
+.rebuild-requested
 core
 core.*
 *.core

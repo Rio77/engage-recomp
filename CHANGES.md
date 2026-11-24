@@ -24,6 +24,15 @@
   en `zig cc`, `scan()`/`emit_function()` paralelos vía `fork` en `gen.py`,
   recorrido único + copia paralela de RomFS con `os.scandir`/`FICLONE` y
   `syncfs()` en `install_core.py`.
+- Reduce el sobrecoste gráfico por fotograma mediante deduplicación de
+  constantes/copias GPU, fusión de pases con `LOAD_OP_CLEAR` completo y
+  barreras acotadas.
+- Aísla la caché de shaders en Modo Juego frente a Steam Fossilize y FOZ,
+  amplía el precalentamiento GPL offline (`cache/warm_pairs.bin` y variantes
+  `a2c=1`) y habilita fast-link GPL inline.
+- Añade soporte de cheats en formato Atmosphere (`cheats.txt`) con validación
+  segura de memoria invitada, opción **Quit → Close and Rebuild** con
+  recompilación incremental (`cache/gamelib-build/`) y aviso al finalizar.
 
 ## 0.2.0
 

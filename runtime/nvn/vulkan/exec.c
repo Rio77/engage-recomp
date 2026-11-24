@@ -321,25 +321,30 @@ void vk_full_barrier(VkCommandBuffer cb) {
 
 // Phase 7: targeted barrier between consecutive graphics render passes (avoids stalling compute/transfer/host
 // when no non-graphics work ran since the previous pass). Rollback: ENGAGE_FULL_PASS_BARRIER=1.
+static bool g_pass_wrote_shader;
 static void vk_pass_barrier(VkCommandBuffer cb) {
     static int force_full = -1;
     if (force_full < 0) force_full = getenv("ENGAGE_FULL_PASS_BARRIER") != NULL;
     if (force_full || g_need_full_barrier) {
         vk_full_barrier(cb);
+        g_pass_wrote_shader = false;
         return;
     }
+    VkPipelineStageFlags2 src_stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                       VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                       VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                       VK_PIPELINE_STAGE_2_CLEAR_BIT;
+    VkAccessFlags2 src_access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    if (g_pass_wrote_shader) {
+        src_stages |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+        src_access |= VK_ACCESS_2_SHADER_WRITE_BIT;
+    }
+    g_pass_wrote_shader = false;
     VkMemoryBarrier2 mb = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
-                        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
-                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                        VK_PIPELINE_STAGE_2_CLEAR_BIT |
-                        VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-        .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                         VK_ACCESS_2_SHADER_WRITE_BIT |
-                         VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .srcStageMask = src_stages,
+        .srcAccessMask = src_access,
         .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
@@ -438,9 +443,12 @@ void vk_gpuprof_report(void) {
     gp_n = 0;
 }
 
+static void flush_pending_clears(void);
+
 // Submit the pending work (if any). wait/signal: binary semaphores for presentation (may be null).
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra) {
     (void)extra;
+    flush_pending_clears();
     vk_end_pass();
     Sub *s = sub();
     if (!s->main_begun && !s->upload_begun && !wait && !signal) return;
@@ -859,24 +867,38 @@ VkSpan vk_transient_copy(const void *data, uint64_t size, uint64_t align) {
     return s;
 }
 
-// Per-draw constants that usually repeat the previous draw's (scale table, tint, driver constants): reuse that copy
-// while it's identical, within one submission. slot: one per kind of data.
+// Per-draw constants that usually repeat within a submission (scale table, tint, driver constants):
+// 128-entry CPU-RAM cache prevents A/B ping-pong misses and keeps descriptor buffers identical across draws.
 enum { DEDUPE_RSCALE_V, DEDUPE_RSCALE_F, DEDUPE_TINT, DEDUPE_DRV_V, DEDUPE_DRV_F, DEDUPE_DRV_C, DEDUPE_SLOTS };
+static uint64_t hash_words(uint64_t h, const void *p, size_t n);
+#define DEDUPE_TAB 128
 static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t align) {
-    static struct { uint64_t seq, size; uint8_t data[0x800]; VkSpan span; } last[DEDUPE_SLOTS];
+    static struct { uint64_t seq, size, h; int slot; uint8_t data[0x800]; VkSpan span; } tab[DEDUPE_TAB];
     uint64_t seq = vk_pending_seq();
-    if (size > sizeof last[0].data) return vk_transient_copy(data, size, align);
-    if (last[slot].seq == seq && last[slot].size == size && !memcmp(last[slot].data, data, size)) return last[slot].span;
+    if (size > sizeof tab[0].data) return vk_transient_copy(data, size, align);
+    uint64_t h = hash_words(0xcbf29ce484222325ull ^ ((uint64_t)slot * 0x9E3779B97F4A7C15ull) ^ size, data, size);
+    uint32_t idx = (uint32_t)(h ^ (h >> 17) ^ (h >> 33)) & (DEDUPE_TAB - 1);
+    if (tab[idx].seq == seq && tab[idx].slot == slot && tab[idx].size == size && tab[idx].h == h &&
+        !memcmp(tab[idx].data, data, size)) {
+        return tab[idx].span;
+    }
     VkSpan s = vk_transient_copy(data, size, align);
-    last[slot].seq = seq; last[slot].size = size; memcpy(last[slot].data, data, size); last[slot].span = s;
+    tab[idx].seq = seq;
+    tab[idx].slot = slot;
+    tab[idx].size = size;
+    tab[idx].h = h;
+    memcpy(tab[idx].data, data, size);
+    tab[idx].span = s;
     return s;
 }
 
-// Guest memory copied once per submission: draws binding the same range share the copy.
+// Guest memory copied once per submission: draws binding unchanged ranges across command lists share the copy.
 #define GCOPY_TAB 4096
-static struct { uint64_t addr, size, seq; VkSpan span; } gcopy[GCOPY_TAB];
-static uint64_t gcopy_gen;  // bumped to drop every shared copy (guest memory written mid-list)
-static void guest_copy_flush(void) { gcopy_gen++; }
+static struct { uint64_t addr, size, seq, h1, h2; uint32_t list_gen; bool valid_full; VkSpan span; } gcopy[GCOPY_TAB];
+static uint64_t gcopy_gen;      // bumped on hard reset (exec_reset)
+static uint32_t gcopy_list_gen = 1;  // bumped at list boundaries / UBO updates to trigger RAM recheck
+static void guest_copy_flush(void) { gcopy_list_gen++; }
+static void guest_copy_hard_reset(void) { gcopy_gen++; gcopy_list_gen = 1; }
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     if (!size) size = 16;
     if (!addr) {
@@ -886,9 +908,23 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     }
     uint64_t seq = vk_pending_seq() + (gcopy_gen << 40), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
-    if (gcopy[slot].seq == seq && gcopy[slot].addr == addr && gcopy[slot].size == size) return gcopy[slot].span;
+    bool valid_full = guest_mem_validate_range(addr, size, 1, GMEM_PERM_R) == GMEM_OK;
+    if (gcopy[slot].seq == seq && gcopy[slot].addr == addr && gcopy[slot].size == size) {
+        if (gcopy[slot].list_gen == gcopy_list_gen) return gcopy[slot].span;
+        if (valid_full && gcopy[slot].valid_full) {
+            uint64_t cur_h1 = hash_words(0xcbf29ce484222325ull, (const void *)(uintptr_t)addr, size);
+            uint64_t cur_h2 = hash_words(0x9E3779B97F4A7C15ull, (const void *)(uintptr_t)addr, size);
+            if (cur_h1 == gcopy[slot].h1 && cur_h2 == gcopy[slot].h2) {
+                gcopy[slot].list_gen = gcopy_list_gen;
+                return gcopy[slot].span;
+            }
+        }
+    }
     VkSpan s;
-    if (guest_mem_validate_range(addr, size, 1, GMEM_PERM_R) == GMEM_OK) {
+    uint64_t h1 = 0, h2 = 0;
+    if (valid_full) {
+        h1 = hash_words(0xcbf29ce484222325ull, (const void *)(uintptr_t)addr, size);
+        h2 = hash_words(0x9E3779B97F4A7C15ull, (const void *)(uintptr_t)addr, size);
         s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
     } else {
         s = vk_transient(size, 256);
@@ -902,7 +938,11 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
             off += chunk;
         }
     }
-    gcopy[slot].addr = addr; gcopy[slot].size = size; gcopy[slot].seq = seq; gcopy[slot].span = s;
+    gcopy[slot].addr = addr; gcopy[slot].size = size; gcopy[slot].seq = seq;
+    gcopy[slot].h1 = h1; gcopy[slot].h2 = h2;
+    gcopy[slot].list_gen = gcopy_list_gen;
+    gcopy[slot].valid_full = valid_full;
+    gcopy[slot].span = s;
     return s;
 }
 
@@ -1076,6 +1116,11 @@ typedef struct { uint64_t addr, size; } Range;
 static struct {
     RtState rt;
     bool rt_dirty;
+    uint32_t clear_color_mask;
+    float clear_color_val[8][4];
+    bool clear_depth, clear_stencil;
+    float clear_depth_val;
+    uint32_t clear_stencil_val;
     NvnProgram *program;           // what draws / dispatches use: stage_prog combined (bind_program)
     NvnProgram *stage_prog[6];     // bound per stage: vertex, fragment, geometry, tess control, tess eval, compute
     uint8_t blend[8][8];
@@ -1505,7 +1550,11 @@ static void begin_pass(void) {
         ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         bool fresh = (int)renderer_texture_level_fresh(t) | (int)renderer_texture_frame_fresh(t);  // both: each marks its state
-        if (renderer_texture_first_write(t) || fresh) {
+        bool first_w = renderer_texture_first_write(t);
+        if (st.clear_color_mask & (1u << i)) {
+            ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            memcpy(ca[i].clearValue.color.float32, st.clear_color_val[i], 16);
+        } else if (first_w || fresh) {
             ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             ca[i].clearValue.color.float32[3] = fresh ? 0.0f : 1.0f;
         }
@@ -1528,8 +1577,24 @@ static void begin_pass(void) {
             VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
                                            .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
                                            .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-            if (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) { da = a; has_d = true; pass_depth = b->format; }
-            if (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) { sa = a; has_s = true; pass_stencil = b->format; }
+            if (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                da = a;
+                if (st.clear_depth) {
+                    da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    da.clearValue.depthStencil.depth = st.clear_depth_val;
+                }
+                has_d = true;
+                pass_depth = b->format;
+            }
+            if (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {
+                sa = a;
+                if (st.clear_stencil) {
+                    sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    sa.clearValue.depthStencil.stencil = st.clear_stencil_val;
+                }
+                has_s = true;
+                pass_stencil = b->format;
+            }
             uint32_t lv = st.rt.has_dview && (st.rt.dview.setmask & 1) ? st.rt.dview.base_level : 0;
             uint32_t ew = level_extent(b->width, lv), eh = level_extent(b->height, lv);
             if (!w) { renderer_texture_scale(st.rt.depth, &pass_sx, &pass_sy); w = ew; }
@@ -1538,6 +1603,8 @@ static void begin_pass(void) {
             if (!pass_ncolor) pass_samples = b->samples;
         }
     }
+    st.clear_color_mask = 0;
+    st.clear_depth = st.clear_stencil = false;
     if (!w) { pass_sx = pass_sy = 1; minw = minh = 16; }
     pass_w = minw; pass_h = minh;
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = 1,
@@ -1548,6 +1615,10 @@ static void begin_pass(void) {
     in_pass = true;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
+}
+
+static void flush_pending_clears(void) {
+    if (st.clear_color_mask || st.clear_depth || st.clear_stencil) begin_pass();
 }
 
 static void pass_size(int *w, int *h) {
@@ -2531,6 +2602,30 @@ static VkResult gpl_build_pipeline(const PipeKey *k, VkPipeline *out_pipe) {
     return vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, out_pipe);
 }
 
+static bool gpl_lib_cached(const void *key, uint32_t size) {
+    uint64_t h = hash_words(0xcbf29ce484222325ull, key, size);
+    uint32_t bucket = (uint32_t)(h % LIB_BUCKETS);
+    pthread_mutex_lock(&gpl_lock);
+    bool ready = false;
+    for (GplLib *b = gpl_libs[bucket]; b; b = b->next) {
+        if (b->hash == h && b->size == size && !memcmp(b->key, key, size)) {
+            ready = !b->building && b->pipe != VK_NULL_HANDLE;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gpl_lock);
+    return ready;
+}
+
+static bool gpl_stage_libs_hot(const PipeKey *k) {
+    if (!g_vk.gpl || !k || !k->prog || !k->prog->half_layout[0] || !k->prog->half_layout[1]) return false;
+    GplPrKey prk = {.kind = LIB_PR, .vxh = k->prog->xh[0], .fallback_vs = k->prog->xh[0] ? 0 : (uintptr_t)k->prog->vs,
+                    .poly_fill = k->poly_fill};
+    GplFsKey fsk = {.kind = LIB_FS, .fxh = k->prog->xh[1], .fallback_fs = k->prog->xh[1] ? 0 : (uintptr_t)k->prog->fs,
+                    .samples = k->samples ? k->samples : 1, .a2c = k->a2c};
+    return gpl_lib_cached(&prk, sizeof prk) && gpl_lib_cached(&fsk, sizeof fsk);
+}
+
 static bool warm_mode_gpl(void) {
     static int mode = -1;
     if (mode < 0) {
@@ -2702,6 +2797,18 @@ static void warm_build(void *arg) {  // one recorded program and its pipelines (
         if (atomic_load(&p->state) == 1) build_pipeline_ex(w->pipes[i], use_gpl);
         else set_state(&w->pipes[i]->state, 2);
     }
+    if (use_gpl && w->npipes == 0 && atomic_load(&p->state) == 1 && p->half_layout[0] && p->half_layout[1]) {
+        PipeKey pk = {.prog = p, .samples = 1, .a2c = 0, .poly_fill = 1};
+        GplPrKey prk = {.kind = LIB_PR, .vxh = p->xh[0], .fallback_vs = p->xh[0] ? 0 : (uintptr_t)p->vs, .poly_fill = 1};
+        gpl_lib_get(LIB_PR, &pk, &prk, sizeof prk);
+        GplFsKey fsk = {.kind = LIB_FS, .fxh = p->xh[1], .fallback_fs = p->xh[1] ? 0 : (uintptr_t)p->fs, .samples = 1, .a2c = 0};
+        gpl_lib_get(LIB_FS, &pk, &fsk, sizeof fsk);
+        if (p->fi && p->fi->msl && (strstr(p->fi->msl, "discard") || strstr(p->fi->msl, "demote"))) {
+            pk.a2c = 1;
+            fsk.a2c = 1;
+            gpl_lib_get(LIB_FS, &pk, &fsk, sizeof fsk);
+        }
+    }
     warm_done(1);
 }
 
@@ -2733,62 +2840,92 @@ static void warm_start(void) {
     if (started || warm_off()) return;
     started = true;
     warm_cs_start();
-    FILE *f = fopen("cache/warm.bin", "rb");
-    if (!f) return;
-    uint32_t hdr[4] = {0};
-    if (fread(hdr, sizeof hdr, 1, f) != 1 || hdr[0] != WARM_MAGIC || hdr[1] != WARM_VERSION || hdr[2] != sizeof(WarmRec)) {
-        fclose(f);
-        LOG("[shader] cache/warm.bin is from another version: starting a new one\n");
-        remove("cache/warm.bin");
-        return;
-    }
     warm_t0 = SDL_GetTicksNS();
-    WarmRec r;
-    warm_pipes = calloc(WARM_PIPES, sizeof *warm_pipes);
-    WarmRec *live = malloc(WARM_PIPES * sizeof *live);  // (records whose translations are still cached)
-    int nlive = 0, ndead = 0;
-    pthread_mutex_lock(&warm_lock);
-    while (fread(&r, sizeof r, 1, f) == 1 && nwarm_pipes < WARM_PIPES) {
-        // (a translator update retires every cached translation: their records go too, rewritten below)
-        bool have = warm_prog_slot(r.xh[0], r.xh[1], false) != NULL;
-        if (!have) {
-            char p0[64], p1[64];
-            struct stat sb;
-            snprintf(p0, sizeof p0, "cache/xlat/%016llx.bin", (unsigned long long)r.xh[0]);
-            snprintf(p1, sizeof p1, "cache/xlat/%016llx.bin", (unsigned long long)r.xh[1]);
-            if (stat(p0, &sb) || stat(p1, &sb)) { ndead++; continue; }
+    FILE *f = fopen("cache/warm.bin", "rb");
+    if (f) {
+        uint32_t hdr[4] = {0};
+        if (fread(hdr, sizeof hdr, 1, f) != 1 || hdr[0] != WARM_MAGIC || hdr[1] != WARM_VERSION || hdr[2] != sizeof(WarmRec)) {
+            fclose(f);
+            LOG("[shader] cache/warm.bin is from another version: starting a new one\n");
+            remove("cache/warm.bin");
+        } else {
+            WarmRec r;
+            warm_pipes = calloc(WARM_PIPES, sizeof *warm_pipes);
+            WarmRec *live = malloc(WARM_PIPES * sizeof *live);  // (records whose translations are still cached)
+            int nlive = 0, ndead = 0;
+            pthread_mutex_lock(&warm_lock);
+            while (fread(&r, sizeof r, 1, f) == 1 && nwarm_pipes < WARM_PIPES) {
+                bool have = warm_prog_slot(r.xh[0], r.xh[1], false) != NULL;
+                if (!have) {
+                    char p0[64], p1[64];
+                    struct stat sb;
+                    snprintf(p0, sizeof p0, "cache/xlat/%016llx.bin", (unsigned long long)r.xh[0]);
+                    snprintf(p1, sizeof p1, "cache/xlat/%016llx.bin", (unsigned long long)r.xh[1]);
+                    if (stat(p0, &sb) || stat(p1, &sb)) { ndead++; continue; }
+                }
+                if (g_vk.dyn_vi) pipe_key_strip_vi(&r.k);
+                if (!warm_seen_add(hash_words(0xcbf29ce484222325ull, &r, sizeof r))) continue;
+                WarmProg *w = warm_prog_slot(r.xh[0], r.xh[1], true);
+                if (!w) continue;
+                live[nlive++] = r;
+                if (!w->p) {
+                    w->p = calloc(1, sizeof *w->p);
+                    w->p->warm = true;
+                    w->p->xh[0] = r.xh[0];
+                    w->p->xh[1] = r.xh[1];
+                    w->vs_out_mask = r.vs_out_mask;
+                }
+                Pipe *pp = calloc(1, sizeof *pp);
+                pp->k = r.k;
+                pp->k.prog = w->p;
+                if (w->npipes == w->cap) { w->cap = w->cap ? w->cap * 2 : 4; w->pipes = realloc(w->pipes, w->cap * sizeof *w->pipes); }
+                w->pipes[w->npipes++] = pp;
+                warm_pipes[nwarm_pipes++] = pp;
+                warm_insert(pp);
+            }
+            fclose(f);
+            if (ndead) {  // (the file without them)
+                FILE *o = fopen("cache/warm.bin.tmp", "wb");
+                bool ok = o && fwrite(hdr, sizeof hdr, 1, o) == 1 && (int)fwrite(live, sizeof *live, nlive, o) == nlive;
+                if (o && fclose(o)) ok = false;
+                if (ok) { remove("cache/warm.bin"); ok = !rename("cache/warm.bin.tmp", "cache/warm.bin"); }
+                if (!ok) remove("cache/warm.bin.tmp");
+                LOG("[shader] prewarm: %d records dropped (their translations are from an older translator)\n", ndead);
+            }
+            pthread_mutex_unlock(&warm_lock);
+            free(live);
         }
-        if (g_vk.dyn_vi) pipe_key_strip_vi(&r.k);
-        if (!warm_seen_add(hash_words(0xcbf29ce484222325ull, &r, sizeof r))) continue;
-        WarmProg *w = warm_prog_slot(r.xh[0], r.xh[1], true);
-        if (!w) continue;
-        live[nlive++] = r;
-        if (!w->p) {
-            w->p = calloc(1, sizeof *w->p);
-            w->p->warm = true;
-            w->p->xh[0] = r.xh[0];
-            w->p->xh[1] = r.xh[1];
-            w->vs_out_mask = r.vs_out_mask;
+    }
+    {   // Additional (VS, FS) shader pairs from --prepare-shaders: warm modules + GPL stage libs so unseen state combos fast-link inline.
+        typedef struct { uint64_t xh[2]; uint32_t vs_out_mask, pad; } WarmPairRec;
+        FILE *pf = fopen("cache/warm_pairs.bin", "rb");
+        if (pf) {
+            uint32_t phdr[4] = {0};
+            if (fread(phdr, sizeof phdr, 1, pf) == 1 && phdr[0] == 0x53525057u && phdr[1] == 1u && phdr[2] == sizeof(WarmPairRec)) {
+                WarmPairRec pr;
+                int npairs_added = 0;
+                while (fread(&pr, sizeof pr, 1, pf) == 1 && nwarm_progs < WARM_PROGS / 2 - 64) {
+                    if (!pr.xh[0] || !pr.xh[1]) continue;
+                    if (warm_prog_slot(pr.xh[0], pr.xh[1], false)) continue;
+                    char p0[64], p1[64];
+                    struct stat sb;
+                    snprintf(p0, sizeof p0, "cache/xlat/%016llx.bin", (unsigned long long)pr.xh[0]);
+                    snprintf(p1, sizeof p1, "cache/xlat/%016llx.bin", (unsigned long long)pr.xh[1]);
+                    if (stat(p0, &sb) || stat(p1, &sb)) continue;
+                    WarmProg *w = warm_prog_slot(pr.xh[0], pr.xh[1], true);
+                    if (!w) continue;
+                    w->p = calloc(1, sizeof *w->p);
+                    w->p->warm = true;
+                    w->p->xh[0] = pr.xh[0];
+                    w->p->xh[1] = pr.xh[1];
+                    w->vs_out_mask = pr.vs_out_mask;
+                    npairs_added++;
+                }
+                if (npairs_added) LOG("[shader] prewarm: +%d prepared shader pairs queued for GPL stage cache\n", npairs_added);
+            }
+            fclose(pf);
         }
-        Pipe *pp = calloc(1, sizeof *pp);
-        pp->k = r.k;
-        pp->k.prog = w->p;
-        if (w->npipes == w->cap) { w->cap = w->cap ? w->cap * 2 : 4; w->pipes = realloc(w->pipes, w->cap * sizeof *w->pipes); }
-        w->pipes[w->npipes++] = pp;
-        warm_pipes[nwarm_pipes++] = pp;
-        warm_insert(pp);
     }
-    fclose(f);
-    if (ndead) {  // (the file without them)
-        FILE *o = fopen("cache/warm.bin.tmp", "wb");
-        bool ok = o && fwrite(hdr, sizeof hdr, 1, o) == 1 && (int)fwrite(live, sizeof *live, nlive, o) == nlive;
-        if (o && fclose(o)) ok = false;
-        if (ok) { remove("cache/warm.bin"); ok = !rename("cache/warm.bin.tmp", "cache/warm.bin"); }
-        if (!ok) remove("cache/warm.bin.tmp");
-        LOG("[shader] prewarm: %d records dropped (their translations are from an older translator)\n", ndead);
-    }
-    pthread_mutex_unlock(&warm_lock);
-    free(live);
     if (!nwarm_progs) return;
     LOG("[shader] prewarm: building %d programs, %d pipelines from earlier sessions (mode=%s)\n",
         nwarm_progs, nwarm_pipes, warm_mode_gpl() ? "gpl" : "mono");
@@ -3118,6 +3255,7 @@ static void resolve_feedback(Prog *pr) {
             }
             stat_feedback_copies++;
             if (ct_on()) LOG("[ct] snapshot %p %ux%u (was %s, si %d)\n", (void *)t, src->width, src->height, si >= 0 ? snap_why[si] : "new", si);
+            flush_pending_clears();
             vk_end_pass();
             TexBackend *dst = snapshot_image(t, src);
             VkCommandBuffer cb = vk_cmd();
@@ -3174,7 +3312,78 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
     return (VkDescriptorBufferInfo){s.buf, s.off, size > max ? max : size};
 }
 
-// Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
+// Persistent UBO slab cache for immutable shader compiler constants (`cbuf k=1` / `ss->const_snap`).
+// Keeps buffer/offset invariant across draws so `g_desc_cache` and `SS_DESC` hit cleanly without per-draw ring copies.
+#define CSNAP_CHUNK_SIZE (4ull << 20)
+#define CSNAP_TAB 4096
+typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used; } ConstChunk;
+static ConstChunk *csnap_chunks;
+static int ncsnap_chunks, csnap_active = -1;
+static struct { uint64_t h1, h2, size; VkSpan span; } csnap_tab[CSNAP_TAB];
+
+static void csnap_reset(void) {
+    for (int i = 0; i < ncsnap_chunks; i++)
+        if (csnap_chunks[i].buf) vmaDestroyBuffer(g_vk.vma, csnap_chunks[i].buf, csnap_chunks[i].mem);
+    free(csnap_chunks);
+    csnap_chunks = NULL;
+    ncsnap_chunks = 0;
+    csnap_active = -1;
+    memset(csnap_tab, 0, sizeof csnap_tab);
+}
+
+static VkSpan csnap_span(const void *data, uint64_t size) {
+    if (!size) size = 16;
+    if (size > CSNAP_CHUNK_SIZE) return vk_transient_copy(data, size, 256);
+    uint64_t h1 = hash_words(0xcbf29ce484222325ull, data, size);
+    uint64_t h2 = hash_words(0x9E3779B97F4A7C15ull ^ size, data, size);
+    if (!h1) h1 = 1;
+    uint32_t slot = (uint32_t)(h1 ^ (h1 >> 32)) & (CSNAP_TAB - 1);
+    for (int probe = 0; probe < 16; probe++, slot = (slot + 1) & (CSNAP_TAB - 1)) {
+        if (csnap_tab[slot].size == size && csnap_tab[slot].h1 == h1 && csnap_tab[slot].h2 == h2)
+            return csnap_tab[slot].span;
+        if (!csnap_tab[slot].size) break;
+    }
+    VkSpan s = {0};
+    bool fit = false;
+    if (csnap_active >= 0) {
+        ConstChunk *c = &csnap_chunks[csnap_active];
+        uint64_t off = (c->used + 255ull) & ~255ull;
+        if (off + size <= c->size) {
+            memcpy(c->ptr + off, data, size);
+            c->used = off + size;
+            s = (VkSpan){c->buf, off, c->ptr + off};
+            fit = true;
+        }
+    }
+    if (!fit) {
+        ConstChunk *arr = realloc(csnap_chunks, (size_t)(ncsnap_chunks + 1) * sizeof *csnap_chunks);
+        if (!arr) return vk_transient_copy(data, size, 256);
+        csnap_chunks = arr;
+        ConstChunk *c = &csnap_chunks[ncsnap_chunks];
+        memset(c, 0, sizeof *c);
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = CSNAP_CHUNK_SIZE,
+                                 .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                               VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info;
+        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &c->buf, &c->mem, &info) != VK_SUCCESS)
+            return vk_transient_copy(data, size, 256);
+        c->ptr = info.pMappedData;
+        c->size = CSNAP_CHUNK_SIZE;
+        c->used = size;
+        memcpy(c->ptr, data, size);
+        s = (VkSpan){c->buf, 0, c->ptr};
+        csnap_active = ncsnap_chunks++;
+    }
+    csnap_tab[slot].h1 = h1;
+    csnap_tab[slot].h2 = h2;
+    csnap_tab[slot].size = size;
+    csnap_tab[slot].span = s;
+    return s;
+}
+
+// Constant buffer k of a stage (renderer.m bind_cbufs), copied into persistent/transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     if (k == 0) {
         uint32_t drv[0x800 / 4] = {0};
@@ -3202,11 +3411,8 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     if (k == 1) {  // compiler constants stored after the shader code
         NvnShaderStage *ss = &st.program->stages[stage];
         uint64_t size = ss->const_size ? ss->const_size : (si->cbuf_size[1] ? si->cbuf_size[1] : 16);
-        if (ss->const_snap && size <= ss->const_snap_size) {
-            VkSpan sp = vk_transient(size, 256);
-            memcpy(sp.ptr, ss->const_snap, size);
-            return ubo_span(sp, size);
-        }
+        if (ss->const_snap && size <= ss->const_snap_size)
+            return ubo_span(csnap_span(ss->const_snap, size), size);
         return ubo_span(guest_copy(ss->code_addr + ss->const_offset, size), size);  // (constant: shared per submission)
     }
     int idx = k - 3;  // cbuf_base
@@ -3856,7 +4062,8 @@ void vk_exec_reset(void) {
     memset(pipe_tab, 0, sizeof pipe_tab);
     for (int i = 0; i < nwarm_pipes; i++) warm_insert(warm_pipes[i]);  // (by content: still valid)
     g_cs_n = 0;
-    gcopy_gen++;
+    guest_copy_hard_reset();
+    csnap_reset();
     pthread_mutex_lock(&g_alias_pool_lock);
     for (int i = 0; i < ALIAS_POOL_MAX; i++) {
         if (g_alias_pools[i].active && g_alias_pools[i].buf) {
@@ -4873,7 +5080,11 @@ static void draw_(CmdRec *r, bool indexed) {
         pp->k = k;
         pipe_tab[pslot].key = ph;
         pipe_tab[pslot].pipe = pp;
-        run_job(build_pipeline, pp);
+        if (g_vk.gpl && !sync_shaders() && gpl_stage_libs_hot(&k)) {
+            build_pipeline(pp);
+        } else {
+            run_job(build_pipeline, pp);
+        }
     }
     if (!wait_built(&pp->state, &pp->waited_ns)) SKIP(SK_PIPE, "state %d\n", atomic_load(&pp->state));
     ss_enabled();
@@ -5117,8 +5328,8 @@ static void draw_(CmdRec *r, bool indexed) {
         ss.desc_set[1] = fset;
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);
     }
-    if (pr->vi->uses_gmem_store) vc_mark_sbufs(0);
-    if (pr->fi->uses_gmem_store) vc_mark_sbufs(1);
+    if (pr->vi->uses_gmem_store) { vc_mark_sbufs(0); g_pass_wrote_shader = true; }
+    if (pr->fi->uses_gmem_store) { vc_mark_sbufs(1); g_pass_wrote_shader = true; }
 
     uint64_t prof_t2_ = prof ? SDL_GetTicksNS() : 0;
     // ---- indices (copied; the largest index bounds the vertex data copied below)
@@ -6132,20 +6343,28 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_SET_RENDER_TARGETS: {
             const struct { uint64_t tex[8]; NvnTextureView views[8]; uint8_t has_view[8]; uint64_t depth;
                            NvnTextureView dview; uint8_t has_dview; } *rt = x;
-            RtState prev = st.rt;  // the same targets again: keep the pass (a restart = full barrier + reload)
-            memset(&st.rt, 0, sizeof st.rt);
-            st.rt.ncolor = (int)r->x[0] > 8 ? 8 : (int)r->x[0];
-            for (int i = 0; i < st.rt.ncolor; i++) {
-                st.rt.color[i] = (NvnTexture *)(uintptr_t)rt->tex[i];
-                st.rt.cview[i] = rt->views[i];
-                st.rt.has_cview[i] = rt->has_view[i];
+            RtState next_rt;
+            memset(&next_rt, 0, sizeof next_rt);
+            next_rt.ncolor = (int)r->x[0] > 8 ? 8 : (int)r->x[0];
+            for (int i = 0; i < next_rt.ncolor; i++) {
+                next_rt.color[i] = (NvnTexture *)(uintptr_t)rt->tex[i];
+                if (rt->has_view[i]) {
+                    next_rt.cview[i] = rt->views[i];
+                    next_rt.has_cview[i] = 1;
+                }
             }
-            st.rt.depth = (NvnTexture *)(uintptr_t)rt->depth;
-            st.rt.dview = rt->dview;
-            st.rt.has_dview = rt->has_dview;
+            next_rt.depth = (NvnTexture *)(uintptr_t)rt->depth;
+            if (rt->has_dview) {
+                next_rt.dview = rt->dview;
+                next_rt.has_dview = 1;
+            }
             static int always = -1;
             if (always < 0) always = getenv("LARECOMP_VK_PASS_RESTART") != NULL;
-            if (always || memcmp(&prev, &st.rt, sizeof prev)) st.rt_dirty = true;
+            if (always || memcmp(&st.rt, &next_rt, sizeof next_rt)) {
+                flush_pending_clears();
+                st.rt = next_rt;
+                st.rt_dirty = true;
+            }
             break;
         }
         case CMD_SET_VIEWPORTS:
@@ -6181,7 +6400,20 @@ static void exec_list(uint64_t handle, int depth) {
                 LOG("[ct] clear-color %p mask %#x sc %d %d %d %d\n", (void *)st.rt.color[index], (uint32_t)r->x[2], st.scissor[0][0], st.scissor[0][1],
                     st.scissor[0][2], st.scissor[0][3]);
             if (index < st.rt.ncolor && st.rt.color[index]) alias_before_write(st.rt.color[index], 0, "clear");
-            if (index < st.rt.ncolor && st.rt.color[index]) clear(index, (int)r->x[5], x, (uint32_t)r->x[2], false, 0, false, 0, 0);
+            if (index >= 0 && index < st.rt.ncolor && st.rt.color[index]) {
+                NvnTexture *ct = st.rt.color[index];
+                bool full_sc = st.scissor[0][0] <= 0 && st.scissor[0][1] <= 0 &&
+                               (int64_t)st.scissor[0][0] + st.scissor[0][2] >= (int64_t)ct->width &&
+                               (int64_t)st.scissor[0][1] + st.scissor[0][3] >= (int64_t)ct->height;
+                if ((!in_pass || st.rt_dirty) && ((uint32_t)r->x[2] & 0xF) == 0xF && full_sc &&
+                    (int)r->x[5] == 0 && !rt_kind(ct->format)) {
+                    st.clear_color_mask |= 1u << index;
+                    memcpy(st.clear_color_val[index], x, 16);
+                    st.rt_dirty = true;
+                } else {
+                    clear(index, (int)r->x[5], x, (uint32_t)r->x[2], false, 0, false, 0, 0);
+                }
+            }
             break;
         }
         case CMD_CLEAR_TEXTURE: {
@@ -6190,6 +6422,7 @@ static void exec_list(uint64_t handle, int depth) {
             NvnTexture *t = (NvnTexture *)(uintptr_t)ct->tex;
             if (!t) break;
             snap_reason = "clear-texture"; snapshots_invalidate(NULL);
+            flush_pending_clears();
             alias_before_write(t, 0, "clear");
             RtState saved = st.rt;
             int32_t sc[4];
@@ -6215,7 +6448,7 @@ static void exec_list(uint64_t handle, int depth) {
             if (ct_on() && st.rt.depth)
                 LOG("[ct] clear-depth %p d%d s%d sc %d %d %d %d\n", (void *)st.rt.depth, r->x[0] != 0, r->x[2] != 0, st.scissor[0][0],
                     st.scissor[0][1], st.scissor[0][2], st.scissor[0][3]);
-            if (st.rt.depth && naliases) {  // (copy aliases: which aspects of the depth target this clear replaces whole)
+            if (st.rt.depth) {
                 NvnTexture *d = st.rt.depth;
                 bool whole = st.scissor[0][0] <= 0 && st.scissor[0][1] <= 0 && (int64_t)st.scissor[0][0] + st.scissor[0][2] >= (int64_t)d->width &&
                              (int64_t)st.scissor[0][1] + st.scissor[0][3] >= (int64_t)d->height &&
@@ -6223,22 +6456,30 @@ static void exec_list(uint64_t handle, int depth) {
                                                    ((st.rt.dview.setmask & 2) && st.rt.dview.min_layer)));
                 for (int i = 0; i < st.rt.ncolor; i++)  // (the clear covers the smallest attachment only)
                     if (st.rt.color[i] && (st.rt.color[i]->width < d->width || st.rt.color[i]->height < d->height)) whole = false;
-                VkImageAspectFlags full = 0;
-                if (whole && r->x[0] != 0) full |= VK_IMAGE_ASPECT_DEPTH_BIT;
-                if (whole && renderer_format_has_stencil(d->format) && (r->x[2] & 0xFF) == 0xFF) full |= VK_IMAGE_ASPECT_STENCIL_BIT;
-                if (!renderer_format_has_stencil(d->format)) full |= VK_IMAGE_ASPECT_STENCIL_BIT;
-                if (ct_on())
-                    LOG("[ct] alias clear %p full %#x (whole %d, x0 %llu x1 %#llx x2 %#llx, dview %d/%#x, ncolor %d)\n", (void *)d, full, whole,
-                        (unsigned long long)r->x[0], (unsigned long long)r->x[1], (unsigned long long)r->x[2], st.rt.has_dview,
-                        st.rt.dview.setmask, st.rt.ncolor);
-                alias_before_write(d, full, "clear");
-            }
-            if (st.rt.depth) {
-                bool has_stencil = renderer_format_has_stencil(st.rt.depth->format);
-                clear(-1, 0, NULL, 0, r->x[0] != 0, r->f[0], has_stencil && r->x[2] != 0, (uint32_t)r->x[1], (uint32_t)r->x[2]);
+                if (naliases) {  // (copy aliases: which aspects of the depth target this clear replaces whole)
+                    VkImageAspectFlags full = 0;
+                    if (whole && r->x[0] != 0) full |= VK_IMAGE_ASPECT_DEPTH_BIT;
+                    if (whole && renderer_format_has_stencil(d->format) && (r->x[2] & 0xFF) == 0xFF) full |= VK_IMAGE_ASPECT_STENCIL_BIT;
+                    if (!renderer_format_has_stencil(d->format)) full |= VK_IMAGE_ASPECT_STENCIL_BIT;
+                    if (ct_on())
+                        LOG("[ct] alias clear %p full %#x (whole %d, x0 %llu x1 %#llx x2 %#llx, dview %d/%#x, ncolor %d)\n", (void *)d, full, whole,
+                            (unsigned long long)r->x[0], (unsigned long long)r->x[1], (unsigned long long)r->x[2], st.rt.has_dview,
+                            st.rt.dview.setmask, st.rt.ncolor);
+                    alias_before_write(d, full, "clear");
+                }
+                bool has_stencil = renderer_format_has_stencil(d->format);
+                bool clr_d = r->x[0] != 0;
+                bool clr_s = has_stencil && r->x[2] != 0;
+                if ((!in_pass || st.rt_dirty) && whole && (!clr_s || (r->x[2] & 0xFF) == 0xFF)) {
+                    if (clr_d) { st.clear_depth = true; st.clear_depth_val = r->f[0]; }
+                    if (clr_s) { st.clear_stencil = true; st.clear_stencil_val = (uint32_t)r->x[1]; }
+                    st.rt_dirty = true;
+                } else {
+                    clear(-1, 0, NULL, 0, clr_d, r->f[0], clr_s, (uint32_t)r->x[1], (uint32_t)r->x[2]);
+                }
             }
             break;
-        case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); g_need_full_barrier = true; break;
+        case CMD_DISPATCH: flush_pending_clears(); dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); g_need_full_barrier = true; break;
         case CMD_DRAW_ARRAYS: draw(r, false); break;
         case CMD_DRAW_ELEMENTS: draw(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:
@@ -6292,10 +6533,10 @@ static void exec_list(uint64_t handle, int depth) {
             }
             break;
         }
-        case CMD_COPY_TEXTURE_TO_TEXTURE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); g_need_full_barrier = true; break; }
-        case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); g_need_full_barrier = true; break; }
-        case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); g_need_full_barrier = true; break;
-        case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3]); g_need_full_barrier = true; break;
+        case CMD_COPY_TEXTURE_TO_TEXTURE: { flush_pending_clears(); const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); g_need_full_barrier = true; break; }
+        case CMD_DOWNSAMPLE: { flush_pending_clears(); const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); g_need_full_barrier = true; break; }
+        case CMD_COPY_BUFFER_TO_TEXTURE: flush_pending_clears(); copy_buffer_to_texture(r->x[0], x); g_need_full_barrier = true; break;
+        case CMD_COPY_TEXTURE_TO_BUFFER: flush_pending_clears(); copy_texture_to_buffer(x, r->x[3]); g_need_full_barrier = true; break;
         case CMD_CLEAR_BUFFER: {  // (buffer address, size, 32-bit value): as the copies, on the CPU once the GPU is idle
             static int nlog;
             if (nlog++ < 8) LOG("[nvn] ClearBuffer %llx size %llu value %#x\n", (unsigned long long)r->x[0], (unsigned long long)r->x[1], (uint32_t)r->x[2]);

@@ -17,6 +17,7 @@
 #include <pthread.h>
 
 #include "../hle.h"
+#include "../guest_mem.h"
 #include "cheatvm.h"
 #include "../gamebuild.h"
 
@@ -153,15 +154,20 @@ static void load(void) {
     // check each: known opcodes, and its code writes compiled in
     for (int i = 0; i < g_ncheats; i++) {
         Cheat *ch = &g_cheats[i];
+        uint16_t zero_regs = 0xFFFF;
         for (int k = 0; k < ch->n;) {
             int n = op_len(ch->w[k]);
             if (!n || k + n > ch->n) { ch->bad = true; break; }
             uint32_t w = ch->w[k];
-            if ((w >> 28) == 0 && ((w >> 24) & 0xF) == 4 && ((w >> 20) & 0xF) == 0 && ((w >> 16) & 0xF) == 0) {
+            uint32_t t = w >> 28;
+            int width = (w >> 24) & 0xF, mem = (w >> 20) & 0xF, reg = (w >> 16) & 0xF;
+            if (t == 0 && width == 4 && mem == 0 && (zero_regs & (1u << reg))) {
                 uint64_t a = 0x7000000000ull + ((uint64_t)(w & 0xFF) << 32 | ch->w[k + 1]);
                 if (in_main_text(a) && !compiled(a, ch->w[k + 2])) ch->needs_gen = true;
                 if (in_main_text(a) && ch->ncode < 32) ch->code[ch->ncode++] = a;
             }
+            if ((t == 3 && width == 0) || t == 4 || t == 5 || t == 7 || (t == 6 && ((w >> 12) & 0xF) != 0))
+                zero_regs &= (uint16_t)~(1u << reg);
             k += n;
         }
         for (int j = 0; j < g_npending; j++)
@@ -169,8 +175,7 @@ static void load(void) {
         for (int j = 0; j < i && ch->on && !ch->master; j++)  // (two that exclude each other were on: the first stays)
             if (g_cheats[j].on && conflict(&g_cheats[j], ch)) ch->on = false;
         LOG("[cheats] %s%s%s%s\n", ch->name, ch->on ? " (on)" : "", ch->bad ? " (unsupported opcode: not run)" : "",
-            !ch->needs_gen ? "" : gamebuild_available() ? " (its code patch isn't compiled in: Settings > Game Files > Rebuild game code)"
-                                                        : " (its code patch isn't compiled in: make gen-main, then make)");
+            !ch->needs_gen ? "" : " (its code patch isn't compiled in: F1 > Quit > Close and Rebuild)");
     }
     for (int i = 0; i < g_ncheats; i++)
         for (int j = 0; j < g_ncheats; j++)
@@ -216,30 +221,28 @@ static uint64_t region_base(int mem) {
     }
 }
 
-static bool mem_ok(uint64_t a, int n) { return a >= GUEST_LO && a + (uint64_t)n <= GUEST_HI; }
-
 static uint64_t rd(uint64_t a, int width) {
-    if (!mem_ok(a, width)) return 0;
+    if (width != 1 && width != 2 && width != 4 && width != 8) return 0;
     uint64_t v = 0;
-    memcpy(&v, (const void *)(uintptr_t)a, (size_t)width);
+    if (guest_mem_read_checked(a, &v, (size_t)width, 1) != GMEM_OK) return 0;
     return v;
 }
 
 static void wr(uint64_t a, uint64_t v, int width, int owner) {
     if (width == 4 && in_main_text(a)) { code_write(a, (uint32_t)v, owner); return; }
-    if (!mem_ok(a, width) || (width != 1 && width != 2 && width != 4 && width != 8)) return;
+    if (width != 1 && width != 2 && width != 4 && width != 8) return;
     static int log = -1, nlog;
     if (log < 0) log = getenv("LARECOMP_CHEAT_LOG") != NULL;
     if (log && nlog < 500) {  // (debug) each memory write a cheat makes that changes something
         uint64_t old = 0;
-        memcpy(&old, (void *)(uintptr_t)a, (size_t)width);
-        if (old != (width == 8 ? v : v & ((1ull << (width * 8)) - 1))) {
+        if (guest_mem_read_checked(a, &old, (size_t)width, 1) == GMEM_OK &&
+            old != (width == 8 ? v : v & ((1ull << (width * 8)) - 1))) {
             nlog++;
             LOG("[cheats] %s: %u bytes at %llx (heap +%llx): %llx -> %llx\n", g_cheats[owner].name, width, (unsigned long long)a,
                 (unsigned long long)(a - HEAP_BASE), (unsigned long long)old, (unsigned long long)v);
         }
     }
-    memcpy((void *)(uintptr_t)a, &v, (size_t)width);
+    (void)guest_mem_write_checked(a, &v, (size_t)width, 1);
 }
 
 static uint64_t mask(uint64_t v, int width) { return width >= 8 ? v : v & ((1ull << (width * 8)) - 1); }

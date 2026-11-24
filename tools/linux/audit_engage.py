@@ -12,8 +12,8 @@ def audit(root, appdir=False):
         relative = file.relative_to(root)
         if relative.parts[0] in ('build', '.git', 'reports') and not appdir: continue
         if any(p in forbidden for p in relative.parts): errors.append(str(relative))
-        if file.is_file() and (file.name in ('hosts.yml', 'id_ed25519', 'id_rsa') or
-            re.search(r'(?:game|main|sdk|subsdk0)\.so(?:\.id)?$', file.name)):
+        if file.is_file() and (file.name in ('hosts.yml', 'id_ed25519', 'id_rsa', 'cheats.txt') or
+            re.search(r'(?:game|main|sdk|subsdk0)\.so(?:\.id|\.cheats)?$', file.name)):
             errors.append(str(relative))
         if file.is_file() and file.suffix in ('.py', '.sh', '.md', '.txt', '.c', '.h', '.json') and file.stat().st_size < 4_000_000:
             text = file.read_text(errors='replace')

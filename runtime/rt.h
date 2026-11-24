@@ -72,7 +72,7 @@ int ipc_handle_request(Cpu *c, uint32_t handle);
 uint32_t ipc_connect_named_port(const char *name);
 
 // ---- in-place reboot (main.c): switch seeds or go back to the start screen without leaving the process
-enum { RT_REBOOT_NONE, RT_REBOOT_GAME, RT_REBOOT_TITLE };  // GAME: boot again at once (new seed); TITLE: start screen
+enum { RT_REBOOT_NONE, RT_REBOOT_GAME, RT_REBOOT_TITLE, RT_REBOOT_REBUILD };  // GAME/TITLE: in-place; REBUILD: exit for rebuild
 void rt_request_reboot(int kind);  // any thread; the window loop (ui_run) returns it and main() carries it out
 int rt_reboot_requested(void);
 extern volatile int g_rt_unwind;   // set while guest threads are being stopped (kernel.c)

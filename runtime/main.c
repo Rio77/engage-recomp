@@ -85,7 +85,8 @@ __attribute__((constructor(101))) static void reserve_guest_space(void) {
 // services, HLE features, seed data, audio), empties the kernel, wipes guest memory, and boots again.
 static _Atomic int g_reboot;
 void rt_request_reboot(int kind) {
-    LOG("[reboot] requested (%s)\n", kind == RT_REBOOT_TITLE ? "start screen" : "boot");
+    LOG("[reboot] requested (%s)\n",
+        kind == RT_REBOOT_TITLE ? "start screen" : kind == RT_REBOOT_REBUILD ? "close and rebuild" : "boot");
     g_reboot = kind;
 }
 int rt_reboot_requested(void) { return g_reboot; }
@@ -265,6 +266,11 @@ int main(int argc, char **argv) {
         }
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();
+        if (kind == RT_REBOOT_REBUILD) {
+            FILE *mf = fopen(".rebuild-requested", "wb");
+            if (mf) fclose(mf);
+            return 42;
+        }
         title = false;  // Engage reboots into its own title, never the inherited FE3H importer.
     }
 }
