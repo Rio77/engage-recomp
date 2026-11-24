@@ -15,6 +15,7 @@
 #include <pthread.h>
 
 #include "../hle.h"
+#include "../platform.h"
 #include "../rando.h"
 #include "../ipc.h"
 #include "../romfs_build.h"
@@ -42,19 +43,39 @@ static pthread_mutex_t g_base_lock = PTHREAD_MUTEX_INITIALIZER;
 #else
 #define BASE_FDS 256
 #endif
-static struct { int file, fd; uint64_t used; } g_base_fds[BASE_FDS];
+static struct { int file, fd, refs; uint64_t used; } g_base_fds[BASE_FDS];
 static uint64_t g_base_tick;
 
-static int base_file_fd(int i) {  // (g_base_lock held)
-    int slot = 0;
+// Caller holds g_base_lock. Returns a slot index with refs incremented, or -1 (uncached temp fd in *out_fd).
+static int base_acquire_fd(int i, int *out_fd) {
+    int slot = -1;
     for (int k = 0; k < BASE_FDS; k++) {
-        if (g_base_fds[k].fd > 0 && g_base_fds[k].file == i) { g_base_fds[k].used = ++g_base_tick; return g_base_fds[k].fd; }
-        if (g_base_fds[k].used < g_base_fds[slot].used) slot = k;
+        if (g_base_fds[k].fd > 0 && g_base_fds[k].file == i) {
+            g_base_fds[k].used = ++g_base_tick;
+            g_base_fds[k].refs++;
+            *out_fd = g_base_fds[k].fd;
+            return k;
+        }
+        if (g_base_fds[k].refs == 0 && (slot < 0 || g_base_fds[k].used < g_base_fds[slot].used)) {
+            slot = k;
+        }
     }
-    if (g_base_fds[slot].fd > 0) close(g_base_fds[slot].fd);
     int fd = open(g_base.files[i].path, O_RDONLY);
-    g_base_fds[slot].file = i, g_base_fds[slot].fd = fd > 0 ? fd : 0, g_base_fds[slot].used = ++g_base_tick;
-    return fd;
+    if (fd <= 0) {
+        *out_fd = fd;
+        return -1;
+    }
+    if (slot >= 0) {
+        if (g_base_fds[slot].fd > 0) close(g_base_fds[slot].fd);
+        g_base_fds[slot].file = i;
+        g_base_fds[slot].fd = fd;
+        g_base_fds[slot].refs = 1;
+        g_base_fds[slot].used = ++g_base_tick;
+        *out_fd = fd;
+        return slot;
+    }
+    *out_fd = fd;  // all cached slots actively in pread(): caller closes uncached temp fd
+    return -1;
 }
 
 static uint64_t base_size(void) {
@@ -85,19 +106,27 @@ static ssize_t base_pread(void *dst_, uint64_t n, uint64_t off) {
         if (g_base.files[mid].start + g_base.files[mid].size > off) first = mid, hi = mid - 1;
         else lo = mid + 1;
     }
-    pthread_mutex_lock(&g_base_lock);
     for (int i = first; i < g_base.nfiles && g_base.files[i].start < end; i++) {
         const RomfsLayoutFile *f = &g_base.files[i];
         uint64_t a = off > f->start ? off : f->start, b = end < f->start + f->size ? end : f->start + f->size;
         if (a >= b) continue;
-        int fd = base_file_fd(i);
-        if (fd <= 0 || pread(fd, dst + (a - off), b - a, (off_t)(a - f->start)) != (ssize_t)(b - a)) {
+        int fd = -1, slot;
+        pthread_mutex_lock(&g_base_lock);
+        slot = base_acquire_fd(i, &fd);
+        pthread_mutex_unlock(&g_base_lock);
+        ssize_t got = fd > 0 ? pread(fd, dst + (a - off), b - a, (off_t)(a - f->start)) : -1;
+        if (slot >= 0) {
+            pthread_mutex_lock(&g_base_lock);
+            g_base_fds[slot].refs--;
             pthread_mutex_unlock(&g_base_lock);
+        } else if (fd > 0) {
+            close(fd);
+        }
+        if (got != (ssize_t)(b - a)) {
             LOG("[fs] can't read %s\n", f->path);
             return -1;
         }
     }
-    pthread_mutex_unlock(&g_base_lock);
     return (ssize_t)n;
 }
 
@@ -116,17 +145,22 @@ static void base_open(void) {
         if (g_base_fd < 0 && g_romfs_dir && !strcmp(g_base_dir, g_romfs_dir)) return;
         base_close();
     }
-    char path[1100], why[256] = "";
+    char path[1100], id_path[1200], parent[1100], *slash, why[256] = "";
     struct stat sb;
-    if (stat(g_romfs_dir, &sb) == 0 && S_ISDIR(sb.st_mode) && romfs_layout(g_romfs_dir, &g_base, why, sizeof why)) {
+    snprintf(parent, sizeof parent, "%s", g_romfs_dir);
+    slash = strrchr(parent, '/');
+    id_path[0] = 0;
+    if (slash) {
+        *slash = 0;
+        snprintf(id_path, sizeof id_path, "%s/.install-id", parent);
+    }
+    mkdir("cache", 0755);
+    if (stat(g_romfs_dir, &sb) == 0 && S_ISDIR(sb.st_mode) &&
+        romfs_layout_cached(g_romfs_dir, "cache/romfs-layout.bin", id_path, &g_base, why, sizeof why)) {
         snprintf(g_base_dir, sizeof g_base_dir, "%s", g_romfs_dir);
         LOG("[fs] romfs: %d files served from %s\n", g_base.nfiles, g_romfs_dir);
         // Delete only after a complete layout exists, and only our installed image.
-        char parent[1100], *slash;
-        snprintf(parent, sizeof parent, "%s", g_romfs_dir);
-        slash = strrchr(parent, '/');
         if (slash && g_base.nfiles >= 1000) {
-            *slash = 0;
             snprintf(path, sizeof path, "%s/romfs.bin", parent);
             if (stat(path, &sb) == 0 && rt_remove_game_file(parent, "romfs.bin"))
                 LOG("[fs] removed redundant romfs.bin after layout validation\n");

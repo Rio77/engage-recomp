@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Engage Recomp installation and launch frontend. SPDX-License-Identifier: MIT"""
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import argparse
+import ctypes
+import fcntl
 import json
 import os
 import re
@@ -18,7 +21,7 @@ from engage_build import build
 from install_core import Installation, atomic_json, digest
 from processes import stop_session
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 BUNDLE = Path(__file__).resolve().parents[2] / 'bin'
 ES = os.environ.get('LANG', '').startswith('es')
 SHADER_CACHE_RESERVE = 512 * 1024**2
@@ -79,9 +82,72 @@ def validate_dlc(source):
     return imports
 
 
+_FICLONE = 0x40049409
+
+
+def _fast_copy_file(src: Path, dst: Path):
+    try:
+        sfd = os.open(src, os.O_RDONLY)
+        try:
+            dfd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                fcntl.ioctl(dfd, _FICLONE, sfd)
+                return
+            except OSError:
+                pass
+            finally:
+                os.close(dfd)
+        finally:
+            os.close(sfd)
+    except OSError:
+        pass
+    shutil.copyfile(src, dst)
+
+
+def _copy_tree_parallel(src: Path, dst: Path):
+    dst.mkdir(parents=True, exist_ok=True)
+    files = []
+    stack = [(src, dst)]
+    while stack:
+        cur_s, cur_d = stack.pop()
+        with os.scandir(cur_s) as it:
+            for entry in it:
+                if entry.is_symlink():
+                    raise ValueError('Game dump must not contain symbolic links')
+                target = cur_d / entry.name
+                if entry.is_dir(follow_symlinks=False):
+                    target.mkdir(parents=True, exist_ok=True)
+                    stack.append((Path(entry.path), target))
+                elif entry.is_file(follow_symlinks=False):
+                    files.append((Path(entry.path), target))
+    if not files:
+        return
+    workers = min(8, os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_fast_copy_file, s, d) for s, d in files]
+        for f in futures:
+            f.result()
+
+
+def _scan_no_symlinks_bytes(root: Path) -> int:
+    total = 0
+    stack = [root]
+    while stack:
+        cur = stack.pop()
+        with os.scandir(cur) as it:
+            for entry in it:
+                if entry.is_symlink():
+                    raise ValueError('Game dump must not contain symbolic links')
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+    return total
+
+
 def copy_dlc(imports, target):
     for ident, romfs in imports:
-        shutil.copytree(romfs, target / ident / 'romfs')
+        _copy_tree_parallel(romfs, target / ident / 'romfs')
 
 
 def validate(exefs, romfs):
@@ -96,8 +162,10 @@ def validate(exefs, romfs):
         if not (romfs / name).is_dir(): raise ValueError('Expected complete Engage RomFS: ' + name)
     for name in ('Data/data.unity3d', 'Data/Managed/Metadata/global-metadata.dat'):
         if not (romfs / name).is_file(): raise ValueError('Missing base game data: ' + name)
+    total = 0
     for root in (exefs, romfs):
-        if any(p.is_symlink() for p in root.rglob('*')): raise ValueError('Game dump must not contain symbolic links')
+        total += _scan_no_symlinks_bytes(root)
+    return total
 
 
 def launchers(root, app):
@@ -423,15 +491,19 @@ def install(args):
         raise ValueError('Choose an empty dedicated installation folder')
     exefs = args.exefs or choose('ExeFS — Engage 2.0.0', Path.home())
     romfs = args.romfs or choose('RomFS — Engage 2.0.0', exefs.parent)
-    validate(exefs, romfs)
+    base_bytes = validate(exefs, romfs)
     dlc = args.dlc
     if not dlc and not args.no_dlc and not args.noninteractive: dlc = choose_dlc(exefs.parent)
     imports = validate_dlc(dlc) if dlc else []
-    sources = [exefs, romfs] + [folder for _, folder in imports]
+    if not isinstance(base_bytes, int):
+        base_bytes = _scan_no_symlinks_bytes(exefs) + _scan_no_symlinks_bytes(romfs)
+    dlc_folders = [folder for _, folder in imports]
+    sources = [exefs, romfs] + dlc_folders
     if any(root.resolve().is_relative_to(folder.resolve()) or folder.resolve().is_relative_to(root.resolve()) for folder in sources):
         raise ValueError('The installation folder must be outside your source dump')
     parent = next(path for path in (root, *root.parents) if path.exists())
-    required = sum(p.stat().st_size for folder in sources for p in folder.rglob('*') if p.is_file()) + 8 * 1024**3 + SHADER_CACHE_RESERVE
+    dlc_bytes = sum(_scan_no_symlinks_bytes(folder) for folder in dlc_folders)
+    required = base_bytes + dlc_bytes + 8 * 1024**3 + SHADER_CACHE_RESERVE
     if shutil.disk_usage(parent).free < required:
         raise ValueError(tr('Espacio libre insuficiente para copiar y compilar: ',
             'Insufficient free space to copy and compile: ') + str(round(required / 1024**3, 1)) + ' GiB')
@@ -451,7 +523,7 @@ def install(args):
         existing_lib = installation.root / 'extracted/engagegame.so'
         existing_id = installation.root / 'extracted/engagegame.so.id'
         if (not args.force and existing_lib.is_file() and not existing_lib.is_symlink()
-                and existing_id.is_file() and existing_id.read_text(encoding='ascii', errors='ignore').strip() == 'engage-200-bringup'):
+                and existing_id.is_file() and existing_id.read_text(encoding='ascii', errors='ignore').strip() == 'engage-030-perf'):
             command += ['--reuse-gamelib', str(existing_lib)]
         with log.open('w') as stream:
             process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
@@ -513,9 +585,9 @@ def main():
     if args.worker:
         staged = args.worker / 'data/extracted'
         print('Copying ExeFS', flush=True)
-        shutil.copytree(args.exefs, staged / 'exefs')
+        _copy_tree_parallel(args.exefs, staged / 'exefs')
         print('Copying RomFS', flush=True)
-        shutil.copytree(args.romfs, staged / 'romfs')
+        _copy_tree_parallel(args.romfs, staged / 'romfs')
         if args.dlc:
             print('Copying DLC', flush=True)
             copy_dlc(validate_dlc(args.dlc), staged / 'dlc')
@@ -523,7 +595,7 @@ def main():
         if reuse and reuse.is_file() and not reuse.is_symlink():
             print('Reusing verified game library', flush=True)
             shutil.copy2(reuse, staged / 'engagegame.so')
-            (staged / 'engagegame.so.id').write_text('engage-200-bringup\n')
+            (staged / 'engagegame.so.id').write_text('engage-030-perf\n')
         else:
             print('Generating and compiling game library', flush=True)
             output = build(BUNDLE, args.worker / 'compile', staged / 'exefs')

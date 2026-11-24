@@ -6,6 +6,7 @@ Usage: gen.py <name> <nso> <base> <outdir> [--hle hle_symbols.txt] [--chunk N] [
 """
 import argparse
 import bisect
+import multiprocessing
 import os
 import platform
 import re
@@ -358,6 +359,8 @@ class Module:
     # part sets c->pc and tail-calls that part, which starts with a switch on c->pc to the right label.
     SPLIT_AT = 0x4000
     SPLIT_PART = 0x2000
+    SPLIT_ALL_LABELS_AT = 0x800
+    SPLIT_ALL_LABELS_PART = 0x400
 
     def emit_function(self, entry, end, labels, tables, hle, dispatch_targets=None):
         self._parts = []
@@ -386,8 +389,7 @@ class Module:
                         labels.add(v.target)
 
         def fn_attr(lo, hi):
-            # Massive all-instruction switch dispatchers trigger O(N^3) CFG blowups in LLVM -O1.
-            return ' __attribute__((optnone))' if (all_labels and (hi - lo) >= 0x400) else ''
+            return ''
 
         def outside(t):
             if not self.in_text(t):
@@ -406,7 +408,9 @@ class Module:
                 out.append(f'    __attribute__((musttail)) return {router}(c);')
             out.append('}')
 
-        if end - entry < self.SPLIT_AT:
+        split_at = self.SPLIT_ALL_LABELS_AT if (all_labels and self.SPLIT_ALL_LABELS_AT) else self.SPLIT_AT
+        split_part = self.SPLIT_ALL_LABELS_PART if (all_labels and self.SPLIT_ALL_LABELS_AT) else self.SPLIT_PART
+        if end - entry < split_at:
             out = [f'void{fn_attr(entry, end)} {fname(entry)}(Cpu *c) {{']
             out.append(f'    FN_ENTER({hx(entry)});')
 
@@ -418,8 +422,8 @@ class Module:
             return out
 
         out = [f'void {fname(entry)}(Cpu *c) {{']
-        bounds = list(range(entry, end, self.SPLIT_PART)) + [end]
-        if end - bounds[-2] < self.SPLIT_PART // 4 and len(bounds) > 2:  # (no small last part)
+        bounds = list(range(entry, end, split_part)) + [end]
+        if end - bounds[-2] < split_part // 4 and len(bounds) > 2:  # (no small last part)
             del bounds[-2]
         nparts = len(bounds) - 1
         pname = lambda k: f'{fname(entry)}_p{k}'
@@ -566,6 +570,36 @@ if False:  # LA randomizer patches: off for FE3H
 VARIANTS = {a: ('rando_word', ws) for a, ws in RANDO_CODE.items()}
 
 
+_FORK_SCAN_MOD = None
+_FORK_EMIT_STATE = None
+
+
+def _fork_scan_worker(batch):
+    m = _FORK_SCAN_MOD
+    res = []
+    for a, end in batch:
+        res.append((a, end, m.scan(a, end)))
+    return res, dict(m.stats)
+
+
+def _fork_emit_worker(batch):
+    m, entries, hle = _FORK_EMIT_STATE
+    out = []
+    for a in batch:
+        end, labels, tables = entries[a]
+        lines = m.emit_function(a, end, labels, tables, hle)
+        r = getattr(m, '_refs', set())
+        m._refs = set()
+        parts = [('\n'.join(b), pr) for b, pr in m._parts]
+        m._parts = []
+        out.append((a, '\n'.join(lines), r, parts))
+    return out
+
+
+def _parallel_scan_emit_enabled():
+    return hasattr(os, 'fork') and os.environ.get('ENGAGE_GEN_SERIAL', '0') not in ('1', 'true', 'yes')
+
+
 def write_if_changed(path, text):
     """Leaves unchanged chunks untouched so make only recompiles what a patch affected."""
     try:
@@ -680,16 +714,35 @@ def main():
                     start_set.add(t)
     scanned = {}
     rounds = 0
+    nworkers = min(8, os.cpu_count() or 1)
     while True:
         rounds += 1
         order = sorted(start_set)
-        new = set()
+        todo = []
         for i, a in enumerate(order):
             end = order[i + 1] if i + 1 < len(order) else m.hi
             key = (a, end)
             if key not in scanned:
-                scanned[key] = m.scan(a, end)
-            new |= scanned[key][1] - start_set
+                todo.append(key)
+        new = set()
+        if _parallel_scan_emit_enabled() and nworkers > 1 and len(todo) >= 1024:
+            global _FORK_SCAN_MOD
+            _FORK_SCAN_MOD = m
+            bsize = max(256, len(todo) // (nworkers * 4))
+            batches = [todo[j:j + bsize] for j in range(0, len(todo), bsize)]
+            with multiprocessing.get_context('fork').Pool(processes=nworkers) as pool:
+                for res, st in pool.map(_fork_scan_worker, batches):
+                    for k, v in st.items():
+                        m.stats[k] += v
+                    for a, end, val in res:
+                        scanned[(a, end)] = val
+                        new |= val[1] - start_set
+            _FORK_SCAN_MOD = None
+        else:
+            for key in todo:
+                val = m.scan(key[0], key[1])
+                scanned[key] = val
+                new |= val[1] - start_set
         if not new:
             break
         start_set |= new
@@ -715,42 +768,72 @@ def main():
     big = sorted((a for a in order if entries[a][0] - a >= BIG), key=lambda a: a - entries[a][0])
     seq = big + [a for a in order if entries[a][0] - a < BIG]
     parts = []  # the parts of a long function (emit_function), each written as a function of its own
-    while ci < len(seq) or pending or parts:
-        body, refs, size, fns = [], set(), 0, []
-        while (pending or parts or ci < len(seq)) and len(fns) < args.chunk and size < args.chunk_bytes:
-            if pending:
-                a, lines, r = pending
-                pending = None
-            elif parts:
-                lines, r = parts.pop(0)
-                a = None
-            else:
-                a = seq[ci]
-                ci += 1
-                end, labels, tables = entries[a]
-                lines = m.emit_function(a, end, labels, tables, hle)
-                r = getattr(m, '_refs', set())
-                m._refs = set()
-                parts += m._parts
-            n = sum(len(l) + 1 for l in lines)
-            if n > args.big_fn and fns:  # (a big function gets a file of its own: they compile in parallel)
-                pending = (a, lines, r)
-                break
-            body += lines
-            size += n
-            fns.append(a)
-            refs |= r
-            if n > args.big_fn:
-                break
-        path = os.path.join(args.outdir, f'{args.name}_{nchunks:03d}.c')
-        text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
-        text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
-        text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
-        text += ['\n'.join(body), '\n']
-        write_if_changed(path, ''.join(text))
-        nchunks += 1
-        # (the start screen's setup reads these for its progress bar: runtime/gamebuild.c)
-        print(f'{args.name}: progress {ci}/{len(order)} files {nchunks}', file=sys.stderr, flush=True)
+    emit_pool = None
+    emit_iter = None
+    if _parallel_scan_emit_enabled() and nworkers > 1 and len(seq) >= 256:
+        global _FORK_EMIT_STATE
+        _FORK_EMIT_STATE = (m, entries, hle)
+        ebatches = [seq[j:j + 128] for j in range(0, len(seq), 128)]
+        emit_pool = multiprocessing.get_context('fork').Pool(processes=nworkers)
+        emit_iter = (item for sub in emit_pool.imap(_fork_emit_worker, ebatches) for item in sub)
+
+    def next_emitted():
+        if emit_iter is not None:
+            return next(emit_iter)
+        a = seq[ci]
+        end, labels, tables = entries[a]
+        lines = m.emit_function(a, end, labels, tables, hle)
+        r = getattr(m, '_refs', set())
+        m._refs = set()
+        pts = [('\n'.join(b), pr) for b, pr in m._parts]
+        m._parts = []
+        return a, '\n'.join(lines), r, pts
+
+    try:
+        while ci < len(seq) or pending or parts:
+            body, refs, size, fns = [], set(), 0, []
+            while (pending or parts or ci < len(seq)) and len(fns) < args.chunk and size < args.chunk_bytes:
+                if pending:
+                    a, code_str, r = pending
+                    pending = None
+                elif parts:
+                    code_str, r = parts.pop(0)
+                    a = None
+                else:
+                    a, code_str, r, pts = next_emitted()
+                    ci += 1
+                    if pts and entries[a][0] - a < BIG:
+                        # Keep small split functions and their parts in the same chunk so post-passes
+                        # (reemit / exception landings) never leave orphaned _p* definitions behind.
+                        for p_str, p_refs in pts:
+                            code_str += '\n' + p_str
+                            r = r | p_refs
+                    else:
+                        parts += pts
+                n = len(code_str) + 1
+                if n > args.big_fn and fns:  # (a big function gets a file of its own: they compile in parallel)
+                    pending = (a, code_str, r)
+                    break
+                body.append(code_str)
+                size += n
+                fns.append(a)
+                refs |= r
+                if n > args.big_fn:
+                    break
+            path = os.path.join(args.outdir, f'{args.name}_{nchunks:03d}.c')
+            text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
+            text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
+            text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
+            text += ['\n'.join(body), '\n']
+            write_if_changed(path, ''.join(text))
+            nchunks += 1
+            # (the start screen's setup reads these for its progress bar: runtime/gamebuild.c)
+            print(f'{args.name}: progress {ci}/{len(order)} files {nchunks}', file=sys.stderr, flush=True)
+    finally:
+        if emit_pool is not None:
+            emit_pool.close()
+            emit_pool.join()
+        _FORK_EMIT_STATE = None
     for fn in os.listdir(args.outdir):  # an earlier run's extra chunks
         mm = re.fullmatch(re.escape(args.name) + r'_(\d{3})\.c', fn)
         if mm and int(mm.group(1)) >= nchunks:

@@ -8,9 +8,23 @@
 #include "hle.h"
 #include "platform.h"
 
-volatile int g_fnprof = 1;  // Generated function-entry rendezvous
+volatile int g_fnprof = 0;  // Dynamic rendezvous: enabled only on GC pause or profiling/tracing
 static _Atomic bool profile_entries;
+static _Atomic bool g_fnprof_pause;
+static _Atomic bool g_fnprof_env;
 extern void engage_thread_pause_poll(uint64_t pc);
+
+static void fnprof_sync_active(void) {
+    bool on = atomic_load_explicit(&g_fnprof_pause, memory_order_acquire) ||
+              atomic_load_explicit(&profile_entries, memory_order_acquire) ||
+              atomic_load_explicit(&g_fnprof_env, memory_order_acquire);
+    __atomic_store_n(&g_fnprof, on ? 1 : 0, __ATOMIC_SEQ_CST);
+}
+
+void fnprof_set_pause_active(bool active) {
+    atomic_store_explicit(&g_fnprof_pause, active, memory_order_release);
+    fnprof_sync_active();
+}
 
 #define NSLOT (1 << 18)
 static struct { _Atomic uint64_t addr; _Atomic uint64_t count; } slots[NSLOT];
@@ -107,9 +121,14 @@ void fnprof_frame(uint64_t frame) {
         if (e && sscanf(e, "%ld:%ld", &from, &to) != 2) from = -1;
     }
     if (from < 0) return;
-    if ((long)frame == from) { profile_entries = true; LOG("[fnprof] on at frame %llu\n", (unsigned long long)frame); }
+    if ((long)frame == from) {
+        atomic_store_explicit(&profile_entries, true, memory_order_release);
+        fnprof_sync_active();
+        LOG("[fnprof] on at frame %llu\n", (unsigned long long)frame);
+    }
     if ((long)frame != to) return;
-    profile_entries = false;
+    atomic_store_explicit(&profile_entries, false, memory_order_release);
+    fnprof_sync_active();
     uint64_t (*rows)[2] = malloc(sizeof(uint64_t[2]) * NSLOT);
     int n = 0;
     for (int i = 0; i < NSLOT; i++)
@@ -127,5 +146,8 @@ void fnprof_frame(uint64_t frame) {
 // LARECOMP_FNPROF=0:<to>: profile from process start (threads the game starts before the first frame)
 __attribute__((constructor)) static void fnprof_early(void) {
     const char *e = getenv("LARECOMP_FNPROF");
-    if (e && e[0] == '0' && e[1] == ':') profile_entries = true;
+    if (e && e[0] == '0' && e[1] == ':') atomic_store_explicit(&profile_entries, true, memory_order_release);
+    const char *tr = getenv("ENGAGE_TRACE_EXCEPTIONS");
+    if (tr && *tr && strcmp(tr, "0") != 0) atomic_store_explicit(&g_fnprof_env, true, memory_order_release);
+    fnprof_sync_active();
 }

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=Install Engage Recomp 0.2.0
-Name[es]=Instalar Engage Recomp 0.2.0
+Name=Install Engage Recomp 0.3.0
+Name[es]=Instalar Engage Recomp 0.3.0
 Exec=python3 -c "import pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]).resolve().parent; sys.exit(subprocess.call(['sh',str(p/'Install.sh')]))" %k
 Icon=engage-recomp
 Terminal=false

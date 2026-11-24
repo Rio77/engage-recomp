@@ -1,5 +1,30 @@
 # Engage Recomp
 
+## 0.3.0
+
+- Desactiva `g_fnprof` durante la ejecución normal (activándose dinámicamente
+  solo bajo depuración/pausa) y reemplaza la búsqueda binaria de saltos
+  indirectos en `dispatch.c` por un índice directo de dos niveles O(1) junto
+  con caché TLS ampliada a 32768 entradas.
+- Elimina `__attribute__((optnone))` de la generación de código para optimizar
+  las 524 funciones que quedaban en `-O0`, divide funciones `all_labels` y
+  `LARGE_EXTENTS` en partes pequeñas para evitar explosiones CFG en LLVM, y
+  agrega `-g0` en `engage_build.py` y `Makefile` (reduciendo `engagegame.so`
+  de 1.95 GiB a 406 MiB sin secciones DWARF innecesarias).
+- Ejecuta el envío y grabación de Vulkan en un hilo dedicado asíncrono
+  (`ENGAGE_VK_ASYNC_SUBMIT`, con respaldo por variable de entorno), desbloqueando
+  paralelismo entre la CPU invitada y el backend gráfico.
+- Reparte los hilos del kernel emulado entre los núcleos lógicos 0–2 de Horizon
+  OS (`GetCurrentProcessorNumber` / `SetThreadCoreMask`) e implementa caché en
+  hilo del TID en diagnóstico NVN.
+- Cachea la disposición de RomFS en `cache/romfs-layout.bin` validada por marca
+  de tiempo e `.install-id` (eliminando la pausa inicial de ~8.4 s al recorrer
+  206,874 archivos) y libera `g_base_lock` durante `pread()` en `fs.c`.
+- Acelera el instalador y la generación de código usando los 8 hilos del CPU
+  en `zig cc`, `scan()`/`emit_function()` paralelos vía `fork` en `gen.py`,
+  recorrido único + copia paralela de RomFS con `os.scandir`/`FICLONE` y
+  `syncfs()` en `install_core.py`.
+
 ## 0.2.0
 
 - Corrige el oscurecimiento del pasto durante impactos físicos y mágicos. El

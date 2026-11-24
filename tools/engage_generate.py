@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Frozen generator entry point: user-owned Engage modules and guarded patches."""
 import argparse
+import multiprocessing
 import os
 from pathlib import Path
 import sys
 
 
 def main():
+    multiprocessing.freeze_support()
     parser = argparse.ArgumentParser()
     parser.add_argument('--workspace', type=Path, required=True)
     parser.add_argument('--exefs', type=Path, required=True)

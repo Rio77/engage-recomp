@@ -62,6 +62,8 @@ void nvn_command_finalize(uint64_t handle) {
     pthread_mutex_unlock(&command_copies_lock);
 }
 RT_ON_RESET(command_copies_reset) {
+    extern void vk_async_drain(void) __attribute__((weak));
+    if (vk_async_drain) vk_async_drain();
     pthread_mutex_lock(&command_copies_lock);
     for (CommandCopy *p = command_copies; p; p = p->next) p->retired = true;
     copies_collect();

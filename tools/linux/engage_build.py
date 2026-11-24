@@ -41,7 +41,7 @@ def build(bundle: Path, workspace: Path, exefs: Path):
         ZIG_LOCAL_CACHE_DIR=str(workspace / 'zig-cache/local'))
     resume = os.environ.get('ENGAGE_GAMELIB_RESUME', '0').strip() not in ('', '0', 'false', 'no')
     compiler = [str(bundle / 'zig/zig'), 'cc', '-target', 'x86_64-linux-gnu',
-        '-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label',
+        '-O1', '-g0', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label',
         '-fvisibility=hidden', '-mcpu=x86_64_v3', '-fPIC', '-I' + str(source)]
     # Check the shipped compiler before spending time on the full translation.
     t_start = time.monotonic()
@@ -67,17 +67,17 @@ def build(bundle: Path, workspace: Path, exefs: Path):
     jobs.sort(key=lambda pair: pair[0].stat().st_size, reverse=True)
     def pick_workers():
         cpus = os.cpu_count() or 4
-        avail_gib = 8
+        avail_mib = 8192
         try:
             with open('/proc/meminfo', 'r', encoding='ascii', errors='ignore') as mf:
                 for line in mf:
                     if line.startswith('MemAvailable:'):
-                        avail_gib = max(2, int(line.split()[1]) // (1024 * 1024))
+                        avail_mib = max(2048, int(line.split()[1]) // 1024)
                         break
         except OSError:
             pass
-        # Each zig cc worker uses ~40-160 MB RSS; leave generous headroom for the OS.
-        return max(1, min(16, cpus, max(4, avail_gib // 2)))
+        # Each zig cc worker uses ~200-350 MB RSS; allow all logical threads when RAM permits.
+        return max(1, min(16, cpus, max(4, avail_mib // 450)))
     workers = pick_workers()
     print(f'Compiling {len(jobs)} units (-O1) with {workers} workers (gen {t_gen - t_start:.1f}s)', flush=True)
     def compile_one(pair):
@@ -85,7 +85,7 @@ def build(bundle: Path, workspace: Path, exefs: Path):
         if resume and target.exists() and target.stat().st_size > 0:
             return
         temporary = target.with_suffix('.o.tmp')
-        flags = ['-DGAMELIB_ID="engage-200-bringup"'] if target == entry else []
+        flags = ['-DGAMELIB_ID="engage-030-perf"'] if target == entry else []
         print('Compiling ' + file.name, flush=True)
         subprocess.run(compiler + flags + ['-c', str(file), '-o', str(temporary)], env=environment, check=True)
         temporary.replace(target)
@@ -105,7 +105,7 @@ def build(bundle: Path, workspace: Path, exefs: Path):
     subprocess.run(compiler + ['-shared', '@' + str(response), '-o', str(temporary)], env=environment, check=True)
     verify_library(temporary)
     temporary.replace(output)
-    output.with_suffix('.so.id').write_text('engage-200-bringup\n')
+    output.with_suffix('.so.id').write_text('engage-030-perf\n')
     t_end = time.monotonic()
     print(f'Built engagegame.so in {t_end - t_start:.1f}s (gen {t_gen - t_start:.1f}s, cc {t_comp - t_gen:.1f}s, link {t_end - t_comp:.1f}s)', flush=True)
     return output

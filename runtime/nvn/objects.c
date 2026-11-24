@@ -530,6 +530,17 @@ NVN(nvnQueueFenceSync) {
         nvn_diag_record(NVN_EV_LOOKUP_FAIL, NVN_OBJ_SYNC, 0, A(1), 0, 0, 0, 0, c->x[30], false, 0, 0);
         return;
     }
+#ifndef __APPLE__
+    extern bool vk_async_submit_on(void) __attribute__((weak));
+    extern bool vk_async_enqueue_fence(uint64_t guest, uint64_t token, uint64_t epoch) __attribute__((weak));
+    if (vk_async_submit_on && vk_async_enqueue_fence && vk_async_submit_on()) {
+        uint64_t token = 0, epoch = 0;
+        nvn_sync_pack_handle(A(1), &token, &epoch);
+        atomic_store_explicit(&s->seq, 0, memory_order_release);
+        atomic_store_explicit(&s->signaled, 0, memory_order_release);
+        if (vk_async_enqueue_fence(token ? 0 : A(1), token, epoch)) return;
+    }
+#endif
     atomic_store_explicit(&s->seq, renderer_fence_seq(), memory_order_release);
     atomic_store_explicit(&s->signaled, 1, memory_order_release);
 }
@@ -601,20 +612,27 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
         uint64_t timeout_ns = A(1);
         int sig = atomic_load_explicit(&sync->signaled, memory_order_acquire);
         if (!sig && timeout_ns > 0) {
-            uint64_t cap = timeout_ns > 2000000000ull ? 2000000000ull : timeout_ns;
-            struct timespec ts0, now;
-            clock_gettime(CLOCK_MONOTONIC, &ts0);
-            uint64_t elapsed = 0;
-            while (!sig && elapsed < cap) {
-                struct timespec slp = {0, 100000};
-                nanosleep(&slp, NULL);
-                sig = atomic_load_explicit(&sync->signaled, memory_order_acquire);
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                elapsed = (uint64_t)(now.tv_sec - ts0.tv_sec) * 1000000000ull +
-                          (uint64_t)(now.tv_nsec - ts0.tv_nsec);
-            }
-            if (sig && timeout_ns != UINT64_MAX) {
-                timeout_ns = timeout_ns > elapsed ? timeout_ns - elapsed : 0;
+            extern int vk_async_wait_signaled(_Atomic int *flag, uint64_t timeout_ns, uint64_t *rem_ns) __attribute__((weak));
+            if (vk_async_wait_signaled) {
+                uint64_t rem = timeout_ns;
+                sig = vk_async_wait_signaled(&sync->signaled, timeout_ns, &rem);
+                timeout_ns = rem;
+            } else {
+                uint64_t cap = timeout_ns > 2000000000ull ? 2000000000ull : timeout_ns;
+                struct timespec ts0, now;
+                clock_gettime(CLOCK_MONOTONIC, &ts0);
+                uint64_t elapsed = 0;
+                while (!sig && elapsed < cap) {
+                    struct timespec slp = {0, 100000};
+                    nanosleep(&slp, NULL);
+                    sig = atomic_load_explicit(&sync->signaled, memory_order_acquire);
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    elapsed = (uint64_t)(now.tv_sec - ts0.tv_sec) * 1000000000ull +
+                              (uint64_t)(now.tv_nsec - ts0.tv_nsec);
+                }
+                if (sig && timeout_ns != UINT64_MAX) {
+                    timeout_ns = timeout_ns > elapsed ? timeout_ns - elapsed : 0;
+                }
             }
         }
         if (!sig) { RET(2); return; }
@@ -631,7 +649,11 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (whole < 0) whole = getenv("LARECOMP_SYNC_ALL") ? 1 : 0;
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
-    else if (sync) renderer_wait_seq(atomic_load_explicit(&sync->seq, memory_order_acquire));
+    else if (sync) {
+        extern void vk_async_drain(void) __attribute__((weak));
+        if (!atomic_load_explicit(&sync->signaled, memory_order_acquire) && vk_async_drain) vk_async_drain();
+        renderer_wait_seq(atomic_load_explicit(&sync->seq, memory_order_acquire));
+    }
     RET(0);
 }
 NVN(nvnSyncCreateGLSync) { RET(0); }

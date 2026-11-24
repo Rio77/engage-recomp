@@ -55,17 +55,24 @@ static int diag_mode(void) {
 }
 
 static uint64_t diag_line_limit(void) {
+    static _Atomic uint64_t cached = 0;
+    uint64_t v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (v) return v;
+    v = 500;
     const char *e = getenv("ENGAGE_NVN_DIAG_LIMIT");
     if (e && *e) {
-        long v = strtol(e, NULL, 10);
-        if (v > 0) return (uint64_t)v;
+        long parsed = strtol(e, NULL, 10);
+        if (parsed > 0) v = (uint64_t)parsed;
     }
-    return 500;
+    atomic_store_explicit(&cached, v, memory_order_relaxed);
+    return v;
 }
 
 static uint32_t current_tid(void) {
 #if defined(__linux__)
-    return (uint32_t)syscall(SYS_gettid);
+    static _Thread_local uint32_t tls_tid = 0;
+    if (!tls_tid) tls_tid = (uint32_t)syscall(SYS_gettid);
+    return tls_tid;
 #else
     return (uint32_t)(uintptr_t)pthread_self();
 #endif

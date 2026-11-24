@@ -6,6 +6,7 @@
 // Executes recorded NVN command lists with Vulkan (port of renderer.m; same structure, same behaviour).
 #include <SDL3/SDL_cpuinfo.h>
 #include <SDL3/SDL_timer.h>
+#include <errno.h>
 #include <float.h>
 #include <math.h>
 #include <stdarg.h>
@@ -510,10 +511,160 @@ void vk_backend_lock(void) {
 }
 void vk_backend_unlock(void) { pthread_mutex_unlock(&backend_mu); }
 
-void renderer_submit(void) {
+void renderer_submit_now(void) {
     vk_backend_lock();
     vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
     vk_backend_unlock();
+}
+
+// ---- Phase 2: Dedicated asynchronous Vulkan execution & submission worker ----
+// Offloads exec_list recording, descriptor updates, texture uploads, and vkQueueSubmit2
+// off the guest CPU thread while strictly preserving NVN FIFO submission/fence ordering.
+typedef enum { VK_WORK_EXEC = 1, VK_WORK_SUBMIT = 2, VK_WORK_FENCE = 3 } VkWorkKind;
+typedef struct {
+    VkWorkKind kind;
+    uint64_t handle;
+    const void *commands;
+    uint64_t token;
+    uint64_t epoch;
+} VkWorkItem;
+
+#define VK_WORK_CAP 2048u
+static VkWorkItem vk_work_q[VK_WORK_CAP];
+static uint32_t vk_work_head, vk_work_tail, vk_work_count;
+static bool vk_work_busy;
+static pthread_mutex_t vk_work_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t vk_work_not_empty = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t vk_work_not_full = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t vk_work_idle_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t vk_work_fence_cv;
+static pthread_once_t vk_work_once = PTHREAD_ONCE_INIT;
+static _Thread_local bool vk_in_worker;
+
+static void backend_execute_acquired(const void *commands, uint64_t handle);
+uint64_t renderer_fence_seq(void);
+extern void nvn_sync_set_seq_token(uint64_t guest, uint64_t token, uint64_t epoch, uint64_t seq);
+
+bool vk_async_submit_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("ENGAGE_VK_ASYNC_SUBMIT");
+        on = (e && strcmp(e, "0") == 0) ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static void *vk_work_loop(void *arg) {
+    (void)arg;
+    vk_in_worker = true;
+    for (;;) {
+        pthread_mutex_lock(&vk_work_mu);
+        while (vk_work_count == 0) {
+            vk_work_busy = false;
+            pthread_cond_broadcast(&vk_work_idle_cv);
+            pthread_cond_wait(&vk_work_not_empty, &vk_work_mu);
+        }
+        vk_work_busy = true;
+        VkWorkItem item = vk_work_q[vk_work_head];
+        vk_work_head = (vk_work_head + 1u) % VK_WORK_CAP;
+        vk_work_count--;
+        pthread_cond_signal(&vk_work_not_full);
+        pthread_mutex_unlock(&vk_work_mu);
+
+        if (item.kind == VK_WORK_EXEC) {
+            backend_execute_acquired(item.commands, item.handle);
+        } else if (item.kind == VK_WORK_SUBMIT) {
+            renderer_submit_now();
+        } else if (item.kind == VK_WORK_FENCE) {
+            vk_backend_lock();
+            uint64_t fseq = renderer_fence_seq();
+            vk_backend_unlock();
+            nvn_sync_set_seq_token(item.handle, item.token, item.epoch, fseq);
+            pthread_mutex_lock(&vk_work_mu);
+            pthread_cond_broadcast(&vk_work_fence_cv);
+            pthread_mutex_unlock(&vk_work_mu);
+        }
+    }
+    return NULL;
+}
+
+static void vk_work_init(void) {
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+#ifdef __linux__
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+#endif
+    pthread_cond_init(&vk_work_fence_cv, &attr);
+    pthread_condattr_destroy(&attr);
+    pthread_t th;
+    if (pthread_create(&th, NULL, vk_work_loop, NULL) == 0) pthread_detach(th);
+}
+
+static void vk_work_push(const VkWorkItem *item) {
+    pthread_once(&vk_work_once, vk_work_init);
+    pthread_mutex_lock(&vk_work_mu);
+    while (vk_work_count == VK_WORK_CAP) pthread_cond_wait(&vk_work_not_full, &vk_work_mu);
+    vk_work_q[vk_work_tail] = *item;
+    vk_work_tail = (vk_work_tail + 1u) % VK_WORK_CAP;
+    vk_work_count++;
+    pthread_cond_signal(&vk_work_not_empty);
+    pthread_mutex_unlock(&vk_work_mu);
+}
+
+void vk_async_drain(void) {
+    if (vk_in_worker) return;
+    pthread_once(&vk_work_once, vk_work_init);
+    pthread_mutex_lock(&vk_work_mu);
+    while (vk_work_count > 0 || vk_work_busy) pthread_cond_wait(&vk_work_idle_cv, &vk_work_mu);
+    pthread_mutex_unlock(&vk_work_mu);
+}
+
+bool vk_async_enqueue_fence(uint64_t guest, uint64_t token, uint64_t epoch) {
+    if (!vk_async_submit_on() || vk_in_worker) return false;
+    VkWorkItem item = {VK_WORK_FENCE, guest, NULL, token, epoch};
+    vk_work_push(&item);
+    return true;
+}
+
+int vk_async_wait_signaled(_Atomic int *flag, uint64_t timeout_ns, uint64_t *rem_ns) {
+    pthread_once(&vk_work_once, vk_work_init);
+    struct timespec ts0, now, end;
+#ifdef __linux__
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts0);
+#endif
+    uint64_t cap = timeout_ns > 2000000000ull ? 2000000000ull : timeout_ns;
+    end.tv_sec = ts0.tv_sec + (time_t)((ts0.tv_nsec + cap) / 1000000000ull);
+    end.tv_nsec = (long)((ts0.tv_nsec + cap) % 1000000000ull);
+    pthread_mutex_lock(&vk_work_mu);
+    int sig = atomic_load_explicit(flag, memory_order_acquire);
+    while (!sig) {
+        int rc = pthread_cond_timedwait(&vk_work_fence_cv, &vk_work_mu, &end);
+        sig = atomic_load_explicit(flag, memory_order_acquire);
+        if (sig || rc == ETIMEDOUT) break;
+    }
+    pthread_mutex_unlock(&vk_work_mu);
+    if (rem_ns) {
+#ifdef __linux__
+        clock_gettime(CLOCK_MONOTONIC, &now);
+#else
+        clock_gettime(CLOCK_REALTIME, &now);
+#endif
+        uint64_t elapsed = (uint64_t)(now.tv_sec - ts0.tv_sec) * 1000000000ull +
+                           (uint64_t)(now.tv_nsec - ts0.tv_nsec);
+        if (timeout_ns != UINT64_MAX) *rem_ns = sig ? (timeout_ns > elapsed ? timeout_ns - elapsed : 0) : 0;
+    }
+    return sig;
+}
+
+void renderer_submit(void) {
+    if (vk_async_submit_on() && !vk_in_worker) {
+        VkWorkItem item = {VK_WORK_SUBMIT, 0, NULL, 0, 0};
+        vk_work_push(&item);
+        return;
+    }
+    renderer_submit_now();
 }
 
 bool vk_batch_submits_on(void) {
@@ -526,13 +677,15 @@ bool vk_batch_submits_on(void) {
 }
 
 void renderer_flush(void) {
-    renderer_submit();
+    vk_async_drain();
+    renderer_submit_now();
     if (!wait_why) wait_why = "flush";
     vk_wait_seq(submit_seq);
 }
 
 void renderer_sync(void) {
-    if (vk_batch_submits_on()) renderer_submit();
+    vk_async_drain();
+    if (vk_batch_submits_on()) renderer_submit_now();
     pthread_mutex_lock(&seq_lock);
     uint64_t s = submit_seq;
     pthread_mutex_unlock(&seq_lock);
@@ -553,7 +706,8 @@ void renderer_wait_seq(uint64_t seq) {
     uint64_t s = submit_seq;
     pthread_mutex_unlock(&seq_lock);
     if (seq > s && vk_batch_submits_on()) {
-        renderer_submit();  // materialize pending work before waiting on its fence
+        vk_async_drain();
+        renderer_submit_now();  // materialize pending work before waiting on its fence
         pthread_mutex_lock(&seq_lock); s = submit_seq; pthread_mutex_unlock(&seq_lock);
     }
     wait_why = seq > s ? "SyncWait (fence not submitted yet)" : "SyncWait";
@@ -571,7 +725,8 @@ int renderer_wait_seq_timeout(uint64_t seq, uint64_t timeout_ns) {
     uint64_t submitted = submit_seq;
     pthread_mutex_unlock(&seq_lock);
     if (seq > submitted && vk_batch_submits_on()) {
-        renderer_submit();
+        vk_async_drain();
+        renderer_submit_now();
         pthread_mutex_lock(&seq_lock);
         submitted = submit_seq;
         pthread_mutex_unlock(&seq_lock);
@@ -6168,15 +6323,8 @@ static void exec_list(uint64_t handle, int depth) {
     }
 }
 
-void backend_execute(uint64_t handle) {
+static void backend_execute_acquired(const void *commands, uint64_t handle) {
     vk_backend_lock();
-    const void *commands = nvn_command_acquire(handle, NULL);
-    if (!commands) {
-        static int nlog;
-        if (nlog++ < 16) LOG("[nvn-diag] skipped expired command handle %llx at queue submit\n", (unsigned long long)handle);
-        vk_backend_unlock();
-        return;
-    }
     PROF_T0();
     exec_list((uintptr_t)commands, 0);
     PROF_ADD(prof_exec);
@@ -6184,8 +6332,23 @@ void backend_execute(uint64_t handle) {
     static int sync_submit = -1;
     if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
     if (sync_submit) renderer_flush();
-    else if (!vk_batch_submits_on()) renderer_submit();
+    else if (!vk_batch_submits_on()) renderer_submit_now();
     else guest_copy_flush();  // batched lists: CPU may mutate guest UBOs between submissions
     nvn_command_release(handle);
     vk_backend_unlock();
+}
+
+void backend_execute(uint64_t handle) {
+    const void *commands = nvn_command_acquire(handle, NULL);
+    if (!commands) {
+        static int nlog;
+        if (nlog++ < 16) LOG("[nvn-diag] skipped expired command handle %llx at queue submit\n", (unsigned long long)handle);
+        return;
+    }
+    if (vk_async_submit_on() && !vk_in_worker) {
+        VkWorkItem item = {VK_WORK_EXEC, handle, commands, 0, 0};
+        vk_work_push(&item);
+        return;
+    }
+    backend_execute_acquired(commands, handle);
 }

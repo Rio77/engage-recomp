@@ -171,22 +171,32 @@ def main():
                 code = module.emit_function(begin, end, labels, tables, {}, dispatch_targets=landing_pads)
             finally:
                 module.SPLIT_AT = original_split
-            if module._parts:
-                raise ValueError(f"Unexpected split exception frame {begin:#x}")
-            restore_texture_dispatch(module, begin, code)
+            parts = list(getattr(module, "_parts", []))
+            module._parts = []
+            restore_texture_dispatch(module, begin, code, parts=parts)
+            all_refs = set(module._refs)
             route_missing_calls(code, module._refs - entries)
+            for p_lines, p_refs in parts:
+                route_missing_calls(p_lines, p_refs - entries)
+                all_refs |= p_refs
             calls = 0
-            for i, line in enumerate(code):
-                call = re.search(r"c->x\[30\] = (0x[0-9a-f]+)ull; .*?(?:f_[0-9a-f]+|rt_dispatch)\(c\);$", line)
-                if call and any(lo <= int(call[1], 16) - 4 < hi for lo, hi in ranges):
-                    code[i] = f"    ENGAGE_EH_CALL(c, {begin:#x}ull, {end:#x}ull, {line.strip()});"
-                    calls += 1
+            for blk in [code] + [p_lines for p_lines, _ in parts]:
+                for i, line in enumerate(blk):
+                    call = re.search(r"c->x\[30\] = (0x[0-9a-f]+)ull; .*?(?:f_[0-9a-f]+|rt_dispatch)\(c\);$", line)
+                    if call and any(lo <= int(call[1], 16) - 4 < hi for lo, hi in ranges):
+                        blk[i] = f"    ENGAGE_EH_CALL(c, {begin:#x}ull, {end:#x}ull, {line.strip()});"
+                        calls += 1
             if not calls and begin - BASE in FRAMES:
                 raise ValueError(f"No call sites in exception frame {begin:#x}")
+            all_lines = list(code)
+            for p_lines, _ in parts:
+                all_lines.extend(p_lines)
+            replacement = "\n".join(all_lines)
             pattern = re.compile(rf"^void(?: __attribute__\(\(optnone\)\))? f_{begin:x}\(Cpu \*c\) \{{\n.*?^\}}", re.MULTILINE | re.DOTALL)
-            prototypes = "".join(f"void f_{addr:x}(Cpu *c);\n" for addr in sorted(module._refs & entries))
-            if "\n".join(code) != pattern.search(source).group():
-                source = pattern.sub(lambda _: prototypes + "\n".join(code), source, count=1)
+            prototypes = "".join(f"void f_{addr:x}(Cpu *c);\n" for addr in sorted(all_refs & entries))
+            source = re.sub(rf"^void f_{begin:x}_(?:p\d+|r)\(Cpu \*c\);\n", "", source, flags=re.MULTILINE)
+            source = re.sub(rf"^void f_{begin:x}_(?:p\d+|r)\(Cpu \*c\) \{{\n.*?^\}}\n?", "", source, flags=re.MULTILINE | re.DOTALL)
+            source = pattern.sub(lambda _: prototypes + replacement, source, count=1)
             if '#include "engage_unwind.h"' not in source:
                 source = '#include "engage_unwind.h"\n' + source
             updates[chunk] = source

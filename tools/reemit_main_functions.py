@@ -118,7 +118,7 @@ def prepare_texture_dispatch_labels(module, begin, labels, tables):
     tables[BASE + site] = targets
 
 
-def restore_texture_dispatch(module, begin, code):
+def restore_texture_dispatch(module, begin, code, parts=None):
     """Preserve the local 69-entry texture-format jump table in a clean build."""
     if begin != BASE + 0x7CE1C8:
         return
@@ -127,18 +127,24 @@ def restore_texture_dispatch(module, begin, code):
         raise ValueError("Unexpected texture dispatch instruction")
     targets = sorted({BASE + first + 4 * struct.unpack_from("<H", module.nso.image, table + 2*i)[0]
                       for i in range(count)})
-    text = "\n".join(code)
+    blocks = [code] + ([p_lines for p_lines, _ in parts] if parts else [])
+    text = "\n".join(line for blk in blocks for line in blk)
     if len(targets) != 68 or any(f"L_{target:x}:;" not in text for target in targets):
         raise ValueError("Texture dispatch table does not match the generated labels")
     marker = f"L_{BASE + site:x}:;"
-    index = code.index(marker)
-    if code[index + 1].lstrip().startswith("switch (c->x[8])"):
-        found = sorted(int(value, 16) for value in re.findall(r"case (0x[0-9a-f]+)ull:", code[index + 1]))
-        if found != targets:
-            raise ValueError("Unexpected generated texture dispatch cases")
+    for blk in blocks:
+        if marker not in blk:
+            continue
+        index = blk.index(marker)
+        if blk[index + 1].lstrip().startswith("switch (c->x[8])"):
+            found = sorted(int(value, 16) for value in re.findall(r"case (0x[0-9a-f]+)ull:", blk[index + 1]))
+            if found != targets:
+                raise ValueError("Unexpected generated texture dispatch cases")
+            return
+        cases = " ".join(f"case {target:#x}ull: goto L_{target:x};" for target in targets)
+        blk.insert(index + 1, "    switch (c->x[8]) { " + cases + " default: break; }")
         return
-    cases = " ".join(f"case {target:#x}ull: goto L_{target:x};" for target in targets)
-    code.insert(index + 1, "    switch (c->x[8]) { " + cases + " default: break; }")
+    raise ValueError("Texture dispatch marker not found")
 
 
 def main():
@@ -173,20 +179,28 @@ def main():
             if not tables:
                 raise ValueError(f"No indirect jump table found at {begin:#x}")
             original_split = module.SPLIT_AT
-            if begin - BASE in LARGE_EXTENTS:
-                module.SPLIT_AT = end - begin + 1
             try:
                 code = module.emit_function(begin, end, labels, tables, {})
             finally:
                 module.SPLIT_AT = original_split
-            if module._parts:
-                raise ValueError(f"Unexpected split function at {begin:#x}")
-            restore_texture_dispatch(module, begin, code)
+            parts = list(getattr(module, "_parts", []))
+            module._parts = []
+            restore_texture_dispatch(module, begin, code, parts=parts)
+            all_refs = set(module._refs)
             route_missing_calls(code, module._refs - entries)
+            for p_lines, p_refs in parts:
+                route_missing_calls(p_lines, p_refs - entries)
+                all_refs |= p_refs
             prototypes = "".join(f"void f_{addr:x}(Cpu *c);\n"
-                                 for addr in sorted(module._refs & entries))
-            replacement = "\n".join(code)
+                                 for addr in sorted(all_refs & entries))
+            all_lines = list(code)
+            for p_lines, _ in parts:
+                all_lines.extend(p_lines)
+            replacement = "\n".join(all_lines)
             if match.group() != replacement:
+                updated = re.sub(rf"^void f_{begin:x}_(?:p\d+|r)\(Cpu \*c\);\n", "", updated, flags=re.MULTILINE)
+                updated = re.sub(rf"^void f_{begin:x}_(?:p\d+|r)\(Cpu \*c\) \{{\n.*?^\}}\n?", "", updated, flags=re.MULTILINE | re.DOTALL)
+                match = pattern.search(updated)
                 updated = updated[:match.start()] + prototypes + replacement + updated[match.end():]
             remaining.remove(begin)
             print(f"{chunk.name}: {begin:#x}–{end:#x}, {len(tables)} table(s)", flush=True)

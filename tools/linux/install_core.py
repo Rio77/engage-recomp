@@ -4,6 +4,7 @@ SPDX-License-Identifier: MIT
 """
 from __future__ import annotations
 import contextlib
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -45,6 +46,23 @@ def digest(path: Path):
 
 
 def sync_tree(root):
+    # On Linux, syncfs() commits all buffered data/metadata on the mount in one syscall
+    # instead of 200,000+ individual file fsyncs over RomFS.
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        syncfs = getattr(libc, 'syncfs', None)
+        if syncfs is not None:
+            syncfs.argtypes = [ctypes.c_int]
+            syncfs.restype = ctypes.c_int
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+                if syncfs(fd) == 0:
+                    return
+            finally:
+                os.close(fd)
+    except OSError:
+        pass
     for directory, _, names in os.walk(root, topdown=False, followlinks=False):
         for name in names:
             p = Path(directory) / name

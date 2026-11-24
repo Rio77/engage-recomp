@@ -695,6 +695,8 @@ static void backend_present_locked(NvnTexture *t);
 void vk_backend_lock(void);
 void vk_backend_unlock(void);
 void backend_present(NvnTexture *t) {  // (one thread at a time in the backend: exec.c vk_backend_lock)
+    extern void vk_async_drain(void);
+    vk_async_drain();
     vk_backend_lock();
     backend_present_locked(t);
     vk_backend_unlock();
@@ -760,7 +762,8 @@ static void backend_present_locked(NvnTexture *t) {
         vk_frame_end(shot ? "build/window.png" : NULL);
         if (shot && getenv("LARECOMP_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
     } else {
-        renderer_submit();
+        extern void renderer_submit_now(void);
+        renderer_submit_now();
     }
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);

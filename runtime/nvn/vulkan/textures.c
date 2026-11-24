@@ -490,8 +490,10 @@ static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void backend_texture_destroyed(NvnTexture *t) {
     if (!t) return;
+    extern void vk_async_drain(void);
     extern void vk_backend_lock(void);
     extern void vk_backend_unlock(void);
+    vk_async_drain();
     vk_backend_lock();
     TexBackend *b = t->backend;
     if (b) {

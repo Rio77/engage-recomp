@@ -19,10 +19,13 @@ typedef struct {
     RomfsLayoutFile *files;  // sorted by start; the bytes between files read as zeros
     int nfiles;
     uint64_t size;  // the whole image
+    char *path_slab;  // optional single-slab storage for files[i].path when loaded from binary cache
 } RomfsLayout;
 
 // Lays out the RomFS image of the folder `dir`. false = failed (why: a short message).
 bool romfs_layout(const char *dir, RomfsLayout *out, char *why, size_t why_size);
+bool romfs_layout_cached(const char *dir, const char *cache_path, const char *install_id_path,
+                         RomfsLayout *out, char *why, size_t why_size);
 void romfs_layout_free(RomfsLayout *l);
 
 // Bytes of file data under dir (the image is about this plus its tables).

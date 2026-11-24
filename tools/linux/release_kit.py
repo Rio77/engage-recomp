@@ -10,7 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 BASE = ROOT / 'build/linux/x86_64'
 OUT = ROOT / 'build/dist'
-VERSION = 'Engage-Recomp-0.2.0'
+VERSION = 'Engage-Recomp-0.3.0'
 
 def sha(path):
     result = hashlib.sha256()

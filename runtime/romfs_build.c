@@ -239,9 +239,183 @@ fail:
 }
 
 void romfs_layout_free(RomfsLayout *l) {
-    for (int i = 0; i < l->nfiles; i++) free(l->files[i].path);
+    if (l->path_slab) free(l->path_slab);
+    else for (int i = 0; i < l->nfiles; i++) free(l->files[i].path);
     free(l->files), free(l->tables);
     memset(l, 0, sizeof *l);
+}
+
+typedef struct {
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+    uint64_t size;
+    uint64_t ino;
+} RomfsStampEntry;
+
+typedef struct {
+    char magic[8];  // "ROMLAYT1"
+    uint32_t version;
+    uint32_t nfiles;
+    uint32_t dir_len;
+    uint32_t reserved;
+    uint64_t tables_off;
+    uint64_t tables_size;
+    uint64_t image_size;
+    uint64_t slab_bytes;
+    RomfsStampEntry stamps[4];  // dir, dir/Data, dir/StreamingAssets, install_id_path
+    uint8_t install_id[32];
+    uint8_t header[ROMFS_DATA_START];
+} RomfsCacheHeader;
+
+typedef struct {
+    uint64_t start;
+    uint64_t size;
+    uint64_t path_off;
+} RomfsCacheFile;
+
+static void fill_stamp_stat(const char *path, RomfsStampEntry *e) {
+    memset(e, 0, sizeof *e);
+    struct stat sb;
+    if (!path || !*path || stat(path, &sb) != 0) return;
+    e->mtime_sec = (int64_t)sb.st_mtime;
+#if defined(__linux__)
+    e->mtime_nsec = (int64_t)sb.st_mtim.tv_nsec;
+#elif defined(__APPLE__)
+    e->mtime_nsec = (int64_t)sb.st_mtimespec.tv_nsec;
+#endif
+    e->size = (uint64_t)sb.st_size;
+    e->ino = (uint64_t)sb.st_ino;
+}
+
+static void build_romfs_stamp(const char *dir, const char *install_id_path,
+                              RomfsStampEntry stamps[4], uint8_t install_id[32]) {
+    char sub[1200];
+    fill_stamp_stat(dir, &stamps[0]);
+    snprintf(sub, sizeof sub, "%s/Data", dir);
+    fill_stamp_stat(sub, &stamps[1]);
+    snprintf(sub, sizeof sub, "%s/StreamingAssets", dir);
+    fill_stamp_stat(sub, &stamps[2]);
+    fill_stamp_stat(install_id_path, &stamps[3]);
+    memset(install_id, 0, 32);
+    if (install_id_path && *install_id_path) {
+        FILE *f = fopen(install_id_path, "rb");
+        if (f) { size_t r = fread(install_id, 1, 32, f); (void)r; fclose(f); }
+    }
+}
+
+static bool try_load_romfs_cache(const char *dir, const char *cache_path, const char *install_id_path,
+                                 RomfsLayout *out) {
+    if (!cache_path || !*cache_path) return false;
+    FILE *f = fopen(cache_path, "rb");
+    if (!f) return false;
+    RomfsCacheHeader hdr;
+    if (fread(&hdr, sizeof hdr, 1, f) != 1 || memcmp(hdr.magic, "ROMLAYT1", 8) != 0 || hdr.version != 1u) {
+        fclose(f);
+        return false;
+    }
+    size_t dlen = strlen(dir);
+    if (hdr.dir_len != dlen || hdr.nfiles == 0 || hdr.tables_size == 0 || hdr.slab_bytes == 0 ||
+        hdr.tables_size > (256ull << 20) || hdr.slab_bytes > (256ull << 20) || hdr.nfiles > 2000000u) {
+        fclose(f);
+        return false;
+    }
+    char *stored_dir = malloc(dlen + 1);
+    if (!stored_dir || fread(stored_dir, 1, dlen, f) != dlen || memcmp(stored_dir, dir, dlen) != 0) {
+        free(stored_dir);
+        fclose(f);
+        return false;
+    }
+    free(stored_dir);
+    RomfsStampEntry cur_stamps[4];
+    uint8_t cur_id[32];
+    build_romfs_stamp(dir, install_id_path, cur_stamps, cur_id);
+    if (memcmp(hdr.stamps, cur_stamps, sizeof cur_stamps) != 0 || memcmp(hdr.install_id, cur_id, 32) != 0) {
+        fclose(f);
+        return false;
+    }
+    memset(out, 0, sizeof *out);
+    memcpy(out->header, hdr.header, ROMFS_DATA_START);
+    out->tables_off = hdr.tables_off;
+    out->tables_size = hdr.tables_size;
+    out->size = hdr.image_size;
+    out->nfiles = (int)hdr.nfiles;
+    out->tables = malloc(hdr.tables_size);
+    out->path_slab = malloc(hdr.slab_bytes);
+    out->files = calloc(hdr.nfiles, sizeof *out->files);
+    RomfsCacheFile *recs = malloc((size_t)hdr.nfiles * sizeof *recs);
+    if (!out->tables || !out->path_slab || !out->files || !recs) {
+        free(recs); romfs_layout_free(out); fclose(f); return false;
+    }
+    if (fread(out->tables, 1, hdr.tables_size, f) != hdr.tables_size ||
+        fread(out->path_slab, 1, hdr.slab_bytes, f) != hdr.slab_bytes ||
+        fread(recs, sizeof *recs, hdr.nfiles, f) != hdr.nfiles) {
+        free(recs); romfs_layout_free(out); fclose(f); return false;
+    }
+    fclose(f);
+    for (uint32_t i = 0; i < hdr.nfiles; i++) {
+        if (recs[i].path_off >= hdr.slab_bytes) {
+            free(recs); romfs_layout_free(out); return false;
+        }
+        out->files[i].start = recs[i].start;
+        out->files[i].size = recs[i].size;
+        out->files[i].path = out->path_slab + recs[i].path_off;
+    }
+    out->path_slab[hdr.slab_bytes - 1] = 0;
+    free(recs);
+    return true;
+}
+
+static void save_romfs_cache(const char *dir, const char *cache_path, const char *install_id_path,
+                             const RomfsLayout *in) {
+    if (!cache_path || !*cache_path || in->nfiles <= 0) return;
+    char tmp[1200];
+    snprintf(tmp, sizeof tmp, "%s.tmp.%d", cache_path, (int)getpid());
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    uint64_t slab_bytes = 0;
+    for (int i = 0; i < in->nfiles; i++) slab_bytes += strlen(in->files[i].path) + 1;
+    RomfsCacheHeader hdr;
+    memset(&hdr, 0, sizeof hdr);
+    memcpy(hdr.magic, "ROMLAYT1", 8);
+    hdr.version = 1u;
+    hdr.nfiles = (uint32_t)in->nfiles;
+    hdr.dir_len = (uint32_t)strlen(dir);
+    hdr.tables_off = in->tables_off;
+    hdr.tables_size = in->tables_size;
+    hdr.image_size = in->size;
+    hdr.slab_bytes = slab_bytes;
+    build_romfs_stamp(dir, install_id_path, hdr.stamps, hdr.install_id);
+    memcpy(hdr.header, in->header, ROMFS_DATA_START);
+    RomfsCacheFile *recs = malloc((size_t)in->nfiles * sizeof *recs);
+    char *slab = malloc(slab_bytes);
+    if (!recs || !slab) { free(recs); free(slab); fclose(f); remove(tmp); return; }
+    uint64_t off = 0;
+    for (int i = 0; i < in->nfiles; i++) {
+        size_t len = strlen(in->files[i].path) + 1;
+        memcpy(slab + off, in->files[i].path, len);
+        recs[i].start = in->files[i].start;
+        recs[i].size = in->files[i].size;
+        recs[i].path_off = off;
+        off += len;
+    }
+    bool ok = fwrite(&hdr, sizeof hdr, 1, f) == 1 &&
+              fwrite(dir, 1, hdr.dir_len, f) == hdr.dir_len &&
+              fwrite(in->tables, 1, in->tables_size, f) == in->tables_size &&
+              fwrite(slab, 1, slab_bytes, f) == slab_bytes &&
+              fwrite(recs, sizeof *recs, (size_t)in->nfiles, f) == (size_t)in->nfiles &&
+              fflush(f) == 0;
+    fclose(f);
+    free(recs);
+    free(slab);
+    if (!ok || rename(tmp, cache_path) != 0) remove(tmp);
+}
+
+bool romfs_layout_cached(const char *dir, const char *cache_path, const char *install_id_path,
+                         RomfsLayout *out, char *why, size_t why_size) {
+    if (try_load_romfs_cache(dir, cache_path, install_id_path, out)) return true;
+    if (!romfs_layout(dir, out, why, why_size)) return false;
+    save_romfs_cache(dir, cache_path, install_id_path, out);
+    return true;
 }
 
 // ------------------------------------------------------------------ copying the player's folder
