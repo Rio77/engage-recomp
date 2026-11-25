@@ -14,20 +14,66 @@
 
 typedef struct CommandCopy {
     void *data;
-    uint64_t size, lo, hi;
+    uint64_t size, cap, lo, hi;
     unsigned readers;
     bool retired;
     struct CommandCopy *next;
 } CommandCopy;
 static CommandCopy *command_copies;
+static CommandCopy *command_copy_free;
+static unsigned command_copy_free_n;
+#define COMMAND_COPY_FREE_MAX 256u
 static pthread_mutex_t command_copies_lock = PTHREAD_MUTEX_INITIALIZER;
 static void copies_collect(void) {
     CommandCopy **p = &command_copies;
     while (*p) {
         CommandCopy *entry = *p;
         if (!entry->retired || entry->readers) { p = &entry->next; continue; }
-        *p = entry->next; free(entry->data); free(entry);
+        *p = entry->next;
+        if (command_copy_free_n < COMMAND_COPY_FREE_MAX && entry->cap <= (512u << 10)) {
+            entry->next = command_copy_free;
+            command_copy_free = entry;
+            command_copy_free_n++;
+        } else {
+            free(entry->data);
+            free(entry);
+        }
     }
+}
+static CommandCopy *copy_alloc(uint64_t size) {
+    CommandCopy *best_prev = NULL, *prev = NULL, *cur = command_copy_free;
+    while (cur) {
+        if (cur->cap >= size) { best_prev = prev; break; }
+        prev = cur;
+        cur = cur->next;
+    }
+    CommandCopy *entry = NULL;
+    if (cur) {
+        if (best_prev) best_prev->next = cur->next;
+        else command_copy_free = cur->next;
+        command_copy_free_n--;
+        entry = cur;
+        entry->readers = 0;
+        entry->retired = false;
+        entry->lo = entry->hi = 0;
+        entry->next = NULL;
+    } else if (command_copy_free) {
+        entry = command_copy_free;
+        command_copy_free = entry->next;
+        command_copy_free_n--;
+        free(entry->data);
+        memset(entry, 0, sizeof *entry);
+    } else {
+        entry = calloc(1, sizeof *entry);
+        if (!entry) FATAL("nvn: command handle allocation failed\n");
+    }
+    if (entry->cap < size) {
+        entry->data = malloc(size);
+        if (!entry->data) FATAL("nvn: command copy allocation failed\n");
+        entry->cap = size;
+    }
+    entry->size = size;
+    return entry;
 }
 static void copies_reuse(uint64_t lo, uint64_t size) {
     if (!size || lo + size < lo) return;
@@ -67,6 +113,13 @@ RT_ON_RESET(command_copies_reset) {
     pthread_mutex_lock(&command_copies_lock);
     for (CommandCopy *p = command_copies; p; p = p->next) p->retired = true;
     copies_collect();
+    while (command_copy_free) {
+        CommandCopy *entry = command_copy_free;
+        command_copy_free = entry->next;
+        free(entry->data);
+        free(entry);
+    }
+    command_copy_free_n = 0;
     pthread_mutex_unlock(&command_copies_lock);
 }
 
@@ -166,14 +219,11 @@ NVN(nvnCommandBufferEndRecording) {
         c->x[0] = cb->guest; c->x[1] = 1; c->x[2] = 4096; c->x[3] = cb->callback_data;
         guest_call(c, cb->callback); memcpy(c->x, saved, sizeof saved);
     }
-    CommandCopy *copy = calloc(1, sizeof *copy);
-    if (!copy) FATAL("nvn: command handle allocation failed\n");
-    copy->data = malloc(cb->records_used); copy->size = cb->records_used;
-    if (!copy->data) FATAL("nvn: command copy allocation failed\n");
+    pthread_mutex_lock(&command_copies_lock);
+    CommandCopy *copy = copy_alloc(cb->records_used);
     memcpy(copy->data, cb->records, cb->records_used);
     copy->lo = cb->control + cb->control_used; copy->hi = copy->lo + CONTROL_PER_RECORDING;
     cb->control_used += CONTROL_PER_RECORDING;
-    pthread_mutex_lock(&command_copies_lock);
     copy->next = command_copies; command_copies = copy;
     pthread_mutex_unlock(&command_copies_lock);
     cb->recording = false;
@@ -214,8 +264,7 @@ static CmdRec *record_copy(Cpu *c, uint32_t op, int arg, uint32_t len) {
     CmdRec *r = record(c, op, len, &s);
     if (len) {
         if (saved) memcpy(r->extra, saved, len);
-        else if (s.x[arg] && guest_mem_validate_range(s.x[arg], len, 1, GMEM_PERM_R) == GMEM_OK)
-            memcpy(r->extra, (const void *)(uintptr_t)s.x[arg], len);
+        else if (src_ok) memcpy(r->extra, (const void *)(uintptr_t)s.x[arg], len);
         else memset(r->extra, 0, len);
     }
     free(saved);

@@ -21,7 +21,7 @@ from engage_build import build, save_incremental_cache
 from install_core import Installation, atomic_json, digest, sync_dir
 from processes import stop_session
 
-VERSION = '0.3.0'
+VERSION = '0.3.1'
 BUNDLE = Path(__file__).resolve().parents[2] / 'bin'
 ES = os.environ.get('LANG', '').startswith('es')
 SHADER_CACHE_RESERVE = 512 * 1024**2

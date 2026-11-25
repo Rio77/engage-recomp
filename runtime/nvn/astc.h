@@ -11,5 +11,9 @@
 void astc_decode_ldr(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh,
                      bool srgb, uint8_t *rgba_out);
 
+// Single-threaded variant for background pre-decode workers so they do not contend with astc_decode_ldr's pool.
+void astc_decode_ldr_single(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh,
+                            bool srgb, uint8_t *rgba_out);
+
 // One block -> bw*bh*4 bytes (rows of bw texels). Returns false for an error block (output magenta).
 bool astc_decode_block(const uint8_t block[16], uint32_t bw, uint32_t bh, bool srgb, uint8_t *rgba_out);

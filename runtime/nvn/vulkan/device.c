@@ -443,6 +443,10 @@ static bool create_device_ex(bool headless) {
         }
     }
     free(data);
+    if (!headless) {
+        extern void vk_textures_init(void);
+        vk_textures_init();
+    }
     return true;
 }
 

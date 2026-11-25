@@ -89,6 +89,7 @@ typedef struct TexBackend {
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented;
     bool native_storage;  // actual image-store target: preserve native texel coordinates
+    bool depth_reversed;  // depth clear/write direction inferred for D24-as-float EQUAL tolerance
     uint64_t touched_frame, frame_cleared;
     uint32_t level_gen;
     float sx, sy;

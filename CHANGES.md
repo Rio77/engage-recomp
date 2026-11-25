@@ -1,5 +1,23 @@
 # Engage Recomp
 
+## 0.3.1
+
+- Corrige el parpadeo negro en campos de flores y follaje con Reversed-Z
+  (`EQUAL`) aplicando tolerancia automática de profundidad sobre `D32_SFLOAT`
+  cuando emula `DEPTH24` (`exec.c`, `vk.h`).
+- Corrige la resolución de descriptores bindless en el traductor Maxwell
+  (`translate.c`), filtrando instrucciones sin destino GPR y propagando guardas
+  de predicado entre bloques (`MapBlend`, `MapCloud`, `SSAO`), reduciendo los
+  fallos de traducción de RomFS a 0 y eliminando draws omitidos de terreno/nubes.
+- Evita la promoción falsa a `dynamic` de texturas estáticas en `textures.c`,
+  añade decodificación ASTC asíncrona en segundo plano al registrar en pools
+  NVN (`astc.c`, `objects.c`, `device.c`) y amplía las rutas rápidas de
+  descriptores, constantes (`const_snap_id`) y barreras selectivas en `exec.c`.
+- Añade escalado dinámico suavizado (`ENGAGE_DYNAMIC_TIMING`) en
+  `engage_timing.c` para evitar cámara lenta ante caídas puntuales de FPS,
+  caché libre de copias de listas de comandos (`cmdbuf.c`) y limitación del
+  registro repetitivo de `audren:u`/`IAudioDevice` en `ipc.c`.
+
 ## 0.3.0
 
 - Desactiva `g_fnprof` durante la ejecución normal (activándose dinámicamente

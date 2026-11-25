@@ -1,6 +1,7 @@
 /* Check the Engage opcodes, their descriptor pair and the generated Vulkan shader. */
 #include "shader.h"
 #include <assert.h>
+#include <math.h>
 #include <shaderc/shaderc.h>
 #include <stdio.h>
 #include <string.h>
@@ -78,6 +79,38 @@ int main(void)
     diamond = maxwell_translate(blob, sizeof blob, STAGE_FRAGMENT, &key);
     assert(diamond && !diamond->msl);
     maxwell_free(diamond);
+
+    /* MapCloud (@P0 MOV + @P0 LOP.OR + @P0 TEX.B) must resolve when P0 is preserved. */
+    uint64_t mapcloud[8] = {0};
+    mapcloud[1] = 0x4c98078000000020ull | (2ull << 34) | ((0x190ull / 4ull) << 20);
+    mapcloud[2] = 0x4c47020000002020ull | (2ull << 34) | ((0x590ull / 4ull) << 20);
+    mapcloud[3] = 0xdeb8000000000000ull | (0xFull << 31) | (1ull << 29) | (32ull << 20) | (14ull << 8) | 14ull;
+    mapcloud[5] = 0xe30000000007000full;
+    uint8_t mc_blob[0x100] = {0};
+    mc_blob[0x30 + 0x48] = 0x7; /* omap_target: color0 */
+    memcpy(mc_blob + 0x80, mapcloud, sizeof mapcloud);
+    ShaderInfo *mc = maxwell_translate(mc_blob, sizeof mc_blob, STAGE_FRAGMENT, &key);
+    if (mc && !mc->msl) fprintf(stderr, "mapcloud err: %s\n", mc->error);
+    assert(mc && mc->msl);
+    assert(mc->ntex == 1);
+    assert(mc->tex[0].handle_offset == 0x190 && mc->tex[0].bindless_offset == 0x590);
+    shaderc_compilation_result_t mc_spv = shaderc_compile_into_spv(
+        compiler, mc->msl, strlen(mc->msl), shaderc_fragment_shader, "mapcloud", "main", NULL);
+    if (shaderc_result_get_compilation_status(mc_spv) != shaderc_compilation_status_success)
+        fputs(shaderc_result_get_error_message(mc_spv), stderr);
+    assert(shaderc_result_get_compilation_status(mc_spv) == shaderc_compilation_status_success);
+    shaderc_result_release(mc_spv);
+    maxwell_free(mc);
+
+    /* If P0 is overwritten (e.g. ISETP P0) between @P0 MOV and @P0 TEX.B, reject it. */
+    mapcloud[5] = mapcloud[3];
+    mapcloud[6] = 0xe30000000007000full;
+    mapcloud[3] = 0x5b6003800000ff00ull; /* ISETP P0 */
+    memcpy(mc_blob + 0x80, mapcloud, sizeof mapcloud);
+    ShaderInfo *mc_clobber = maxwell_translate(mc_blob, sizeof mc_blob, STAGE_FRAGMENT, &key);
+    assert(mc_clobber && !mc_clobber->msl);
+    maxwell_free(mc_clobber);
+
     shaderc_compiler_release(compiler);
     puts("PASS: TLD.B and TLD4.B translated and compiled with the expected descriptor pair");
 }

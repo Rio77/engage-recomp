@@ -4,6 +4,7 @@
 #include <float.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -488,12 +489,16 @@ static TexBackend *tex_backend(NvnTexture *t) {
 
 static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void predecode_cancel(NvnTexture *t);
+static void predecode_reset_all(void);
+
 void backend_texture_destroyed(NvnTexture *t) {
     if (!t) return;
     extern void vk_async_drain(void);
     extern void vk_backend_lock(void);
     extern void vk_backend_unlock(void);
     vk_async_drain();
+    predecode_cancel(t);
     vk_backend_lock();
     TexBackend *b = t->backend;
     if (b) {
@@ -511,9 +516,12 @@ void backend_texture_destroyed(NvnTexture *t) {
     vk_backend_unlock();
 }
 
+void backend_texture_destroyed(NvnTexture *t);
+
 // Reboot (device.c backend_reset; GPU idle): every game texture and its views go.
 static void vk_sampler_cache_reset(void);
 void vk_textures_reset(void) {
+    predecode_reset_all();
     int n = g_nlive;
     extern void vk_alias_reset(void);
     vk_alias_reset();
@@ -551,6 +559,346 @@ static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
     return h ^ n;
 }
 
+// ================================================================== background ASTC pre-decode
+// Static ASTC textures registered in NVN descriptor pools are decoded off the render thread before their first
+// draw so camera rotations and scene entrances avoid 100-1000 ms synchronous ASTC decode hitches.
+#define PREDEC_Q_CAP   2048
+#define PREDEC_TAB_CAP 4096
+#define PREDEC_MAX_BYTES (1024ull << 20)
+#define PREDEC_MAX_TEX_SRC (64ull << 20)
+#define PREDEC_MAX_TEX_RGBA (32ull << 20)
+#define PREDEC_WORKERS 3
+
+typedef struct {
+    bool active;
+    NvnTexture *t;
+    uint64_t addr, total, layer_size, rgba_total, full_hash, job_id;
+    TexLayout layout;
+    uint32_t format, width, height, layers, levels;
+    uint8_t bw, bh;
+    bool srgb;
+} PredecJob;
+
+enum { PREDEC_EMPTY = 0, PREDEC_INFLIGHT = 1, PREDEC_READY = 2 };
+typedef struct {
+    int state;
+    bool cancelled;
+    NvnTexture *t;
+    uint64_t addr, total, full_hash, job_id;
+    uint32_t format, layers, levels;
+    uint8_t bw, bh;
+    bool srgb;
+    uint8_t *rgba;
+    uint64_t rgba_total;
+    uint64_t seq_order;
+} PredecEnt;
+
+static pthread_mutex_t predec_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t predec_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t predec_copy_cond = PTHREAD_COND_INITIALIZER;
+static pthread_once_t predec_once = PTHREAD_ONCE_INIT;
+static PredecJob predec_q[PREDEC_Q_CAP];
+static int predec_q_head, predec_q_count;
+static PredecEnt predec_tab[PREDEC_TAB_CAP];
+static uint64_t predec_bytes_cached;
+static uint64_t predec_next_id = 1;
+static uint64_t predec_reset_gen = 1;
+static NvnTexture *predec_copying_tex;
+static bool predec_copying_cancel;
+static bool predec_enabled;
+static bool g_astc_hw_supported;
+static uint64_t prof_predec_hits, prof_predec_sync, prof_predec_drop;
+
+static uint64_t hash_full(const uint8_t *p, uint64_t n);
+
+static int predec_find_slot_locked(NvnTexture *t) {
+    uint64_t h = ((uint64_t)(uintptr_t)t * 0x9E3779B97F4A7C15ull);
+    uint32_t base = (uint32_t)(h ^ (h >> 32)) & (PREDEC_TAB_CAP - 1);
+    int first_free = -1;
+    for (int p = 0; p < 64; p++) {
+        int s = (int)((base + (uint32_t)p) & (PREDEC_TAB_CAP - 1));
+        if (predec_tab[s].state == PREDEC_EMPTY) return first_free >= 0 ? first_free : s;
+        if (predec_tab[s].t == t) return s;
+    }
+    return first_free;
+}
+
+static void predec_evict_lru_locked(size_t need) {
+    while (predec_bytes_cached + need > PREDEC_MAX_BYTES) {
+        int oldest = -1;
+        for (int i = 0; i < PREDEC_TAB_CAP; i++) {
+            if (predec_tab[i].state != PREDEC_READY) continue;
+            if (oldest < 0 || predec_tab[i].seq_order < predec_tab[oldest].seq_order) oldest = i;
+        }
+        if (oldest < 0) break;
+        free(predec_tab[oldest].rgba);
+        predec_bytes_cached -= predec_tab[oldest].rgba_total;
+        memset(&predec_tab[oldest], 0, sizeof predec_tab[oldest]);
+    }
+}
+
+static void predecode_cancel(NvnTexture *t) {
+    if (!t) return;
+    pthread_mutex_lock(&predec_mu);
+    for (int i = 0; i < predec_q_count; i++) {
+        int idx = (predec_q_head + i) % PREDEC_Q_CAP;
+        if (predec_q[idx].active && predec_q[idx].t == t) predec_q[idx].active = false;
+    }
+    while (predec_copying_tex == t) {
+        predec_copying_cancel = true;
+        pthread_cond_wait(&predec_copy_cond, &predec_mu);
+    }
+    uint64_t h = ((uint64_t)(uintptr_t)t * 0x9E3779B97F4A7C15ull);
+    uint32_t base = (uint32_t)(h ^ (h >> 32)) & (PREDEC_TAB_CAP - 1);
+    for (int p = 0; p < 64; p++) {
+        int s = (int)((base + (uint32_t)p) & (PREDEC_TAB_CAP - 1));
+        PredecEnt *e = &predec_tab[s];
+        if (e->state == PREDEC_EMPTY) break;
+        if (e->t != t) continue;
+        if (e->state == PREDEC_READY) {
+            free(e->rgba);
+            predec_bytes_cached -= e->rgba_total;
+            memset(e, 0, sizeof *e);
+        } else if (e->state == PREDEC_INFLIGHT) {
+            e->cancelled = true;
+        }
+    }
+    pthread_mutex_unlock(&predec_mu);
+}
+
+static void predecode_reset_all(void) {
+    pthread_mutex_lock(&predec_mu);
+    predec_reset_gen++;
+    predec_q_head = 0;
+    predec_q_count = 0;
+    while (predec_copying_tex != NULL) {
+        predec_copying_cancel = true;
+        pthread_cond_wait(&predec_copy_cond, &predec_mu);
+    }
+    for (int i = 0; i < PREDEC_TAB_CAP; i++) {
+        if (predec_tab[i].state == PREDEC_READY) {
+            free(predec_tab[i].rgba);
+            memset(&predec_tab[i], 0, sizeof predec_tab[i]);
+        } else if (predec_tab[i].state == PREDEC_INFLIGHT) {
+            predec_tab[i].cancelled = true;
+        }
+    }
+    predec_bytes_cached = 0;
+    pthread_mutex_unlock(&predec_mu);
+}
+
+static bool predec_calc_rgba_size(const TexLayout *layout, uint32_t layers, uint32_t levels, uint64_t *out_sz) {
+    uint64_t sum = 0;
+    for (uint32_t layer = 0; layer < layers; layer++) {
+        for (uint32_t lv = 0; lv < levels; lv++) {
+            LevelLayout l = tegra_level(layout, lv);
+            sum += (uint64_t)l.w * l.h * 4ull;
+        }
+    }
+    *out_sz = sum;
+    return sum > 0 && sum <= PREDEC_MAX_TEX_RGBA;
+}
+
+static void *predec_worker_fn(void *arg) {
+    (void)arg;
+    uint8_t *scratch = NULL;
+    size_t scratch_cap = 0;
+    for (;;) {
+        pthread_mutex_lock(&predec_mu);
+        while (predec_q_count == 0) pthread_cond_wait(&predec_cond, &predec_mu);
+        PredecJob j = predec_q[predec_q_head];
+        predec_q_head = (predec_q_head + 1) % PREDEC_Q_CAP;
+        predec_q_count--;
+        if (!j.active || atomic_load_explicit(&j.t->finalized, memory_order_acquire) || j.t->addr != j.addr || j.t->backend) {
+            pthread_mutex_unlock(&predec_mu);
+            continue;
+        }
+        int slot = predec_find_slot_locked(j.t);
+        if (slot < 0) {
+            predec_evict_lru_locked(0);
+            slot = predec_find_slot_locked(j.t);
+        }
+        if (slot < 0) { pthread_mutex_unlock(&predec_mu); continue; }
+        PredecEnt *e = &predec_tab[slot];
+        if (e->state == PREDEC_READY && e->t == j.t && e->addr == j.addr && e->total == j.total && e->format == j.format) {
+            pthread_mutex_unlock(&predec_mu);
+            continue;
+        }
+        if (e->state == PREDEC_INFLIGHT && e->t == j.t) {
+            pthread_mutex_unlock(&predec_mu);
+            continue;
+        }
+        if (e->state == PREDEC_READY) {
+            free(e->rgba);
+            predec_bytes_cached -= e->rgba_total;
+        }
+        uint64_t job_id = ++predec_next_id;
+        uint64_t my_reset_gen = predec_reset_gen;
+        *e = (PredecEnt){.state = PREDEC_INFLIGHT, .t = j.t, .addr = j.addr, .total = j.total,
+                           .job_id = job_id, .format = j.format, .layers = j.layers, .levels = j.levels,
+                           .bw = j.bw, .bh = j.bh, .srgb = j.srgb, .rgba_total = j.rgba_total};
+
+        // Guard memcpy of j.addr against concurrent backend_texture_destroyed(j.t).
+        predec_copying_tex = j.t;
+        predec_copying_cancel = false;
+        pthread_mutex_unlock(&predec_mu);
+
+        uint8_t *raw = NULL;
+        bool ok_copy = false;
+        if (guest_mem_validate_range(j.addr, j.total, 1, GMEM_PERM_R) == GMEM_OK) {
+            raw = malloc((size_t)j.total);
+            if (raw) {
+                memcpy(raw, (const void *)(uintptr_t)j.addr, (size_t)j.total);
+                ok_copy = true;
+            }
+        }
+
+        pthread_mutex_lock(&predec_mu);
+        bool aborted = predec_copying_cancel || my_reset_gen != predec_reset_gen;
+        predec_copying_tex = NULL;
+        predec_copying_cancel = false;
+        pthread_cond_broadcast(&predec_copy_cond);
+        if (!ok_copy || aborted || e->job_id != job_id || e->cancelled) {
+            if (e->job_id == job_id && e->state == PREDEC_INFLIGHT) memset(e, 0, sizeof *e);
+            pthread_mutex_unlock(&predec_mu);
+            free(raw);
+            continue;
+        }
+        pthread_mutex_unlock(&predec_mu);
+
+        uint64_t full_h = hash_full(raw, j.total);
+        if (!full_h) full_h = 1;
+        uint8_t *rgba_all = malloc((size_t)j.rgba_total);
+        bool ok_dec = rgba_all != NULL;
+        if (ok_dec) {
+            uint64_t out_off = 0;
+            for (uint32_t layer = 0; layer < j.layers && ok_dec; layer++) {
+                for (uint32_t lv = 0; lv < j.levels; lv++) {
+                    LevelLayout l = tegra_level(&j.layout, lv);
+                    size_t blk_bytes = (size_t)l.wb * l.hb * 16;
+                    if (blk_bytes > scratch_cap) {
+                        uint8_t *nb = realloc(scratch, blk_bytes);
+                        if (!nb) { ok_dec = false; break; }
+                        scratch = nb;
+                        scratch_cap = blk_bytes;
+                    }
+                    const uint8_t *src = raw + layer * j.layer_size + l.offset;
+                    tegra_deswizzle(src, scratch, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
+                    astc_decode_ldr_single(scratch, l.w, l.h, j.bw, j.bh, j.srgb, rgba_all + out_off);
+                    out_off += (uint64_t)l.w * l.h * 4ull;
+                }
+            }
+        }
+        free(raw);
+
+        pthread_mutex_lock(&predec_mu);
+        if (my_reset_gen != predec_reset_gen || e->job_id != job_id || e->cancelled || !ok_dec) {
+            if (e->job_id == job_id && e->state == PREDEC_INFLIGHT) memset(e, 0, sizeof *e);
+            pthread_mutex_unlock(&predec_mu);
+            free(rgba_all);
+            continue;
+        }
+        predec_evict_lru_locked((size_t)j.rgba_total);
+        e->state = PREDEC_READY;
+        e->full_hash = full_h;
+        e->rgba = rgba_all;
+        e->seq_order = ++predec_next_id;
+        predec_bytes_cached += j.rgba_total;
+        pthread_mutex_unlock(&predec_mu);
+    }
+    return NULL;
+}
+
+static void predecode_init_once(void) {
+    const char *e = getenv("ENGAGE_ASTC_PREDECODE");
+    if (e && strcmp(e, "0") == 0) return;
+    g_astc_hw_supported = format_supports(VK_FORMAT_ASTC_4x4_UNORM_BLOCK,
+                                          VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+    if (g_astc_hw_supported) return;
+    int started = 0;
+    for (int i = 0; i < PREDEC_WORKERS; i++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, predec_worker_fn, NULL) == 0) {
+            pthread_detach(th);
+            started++;
+        }
+    }
+    predec_enabled = started > 0;
+}
+
+static void vk_astc_predecode_hint(NvnTexture *t) {
+    if (!predec_enabled || !t || t->backend || !t->addr || t->target == 10) return;
+    if ((t->flags & 0x16) || t->samples > 1 || t->width < 16 || t->height < 16) return;
+    if (t->format < 0x79 || t->format > 0x94 || renderer_format_is_depth(t->format)) return;
+    const FormatInfo *fi = t->layout.fmt;
+    if (!fi || fi->bpb != 16 || fi->bw < 4 || fi->bh < 4) return;
+    uint64_t total = tegra_total_size(&t->layout);
+    if (!total || total > PREDEC_MAX_TEX_SRC) return;
+    if (guest_mem_validate_range(t->addr, total, 1, GMEM_PERM_R) != GMEM_OK) return;
+    if (texpatch_identify(t) >= 0) return;
+    uint32_t layers = t->layout.layers ? t->layout.layers : 1;
+    uint32_t depth = t->target == 2 ? (t->depth ? t->depth : 1) : 1;
+    if (depth > 1) return;
+    uint32_t max_m = 1, sz = t->width > t->height ? t->width : t->height;
+    while (sz > 1) { sz >>= 1; max_m++; }
+    uint32_t levels = t->levels ? t->levels : 1;
+    if (levels > max_m) levels = max_m;
+    if (t->layout.levels < levels) levels = t->layout.levels;
+    if (!levels) return;
+    uint64_t rgba_total = 0;
+    if (!predec_calc_rgba_size(&t->layout, layers, levels, &rgba_total)) return;
+
+    pthread_mutex_lock(&predec_mu);
+    if (predec_q_count >= PREDEC_Q_CAP) {
+        predec_q_head = (predec_q_head + 1) % PREDEC_Q_CAP;
+        predec_q_count--;
+        prof_predec_drop++;
+    }
+    int tail = (predec_q_head + predec_q_count) % PREDEC_Q_CAP;
+    predec_q[tail] = (PredecJob){
+        .active = true, .t = t, .addr = t->addr, .total = total,
+        .layer_size = tegra_layer_size(&t->layout), .rgba_total = rgba_total,
+        .layout = t->layout, .format = t->format, .width = t->width, .height = t->height,
+        .layers = layers, .levels = levels, .bw = fi->bw, .bh = fi->bh, .srgb = t->format >= 0x87,
+    };
+    predec_q_count++;
+    pthread_cond_signal(&predec_cond);
+    pthread_mutex_unlock(&predec_mu);
+}
+
+static uint8_t *predecode_take(NvnTexture *t, uint64_t addr, uint64_t total, uint32_t layers, uint32_t levels,
+                               uint8_t bw, uint8_t bh, bool srgb, uint64_t *out_full_hash) {
+    if (!predec_enabled || !t) return NULL;
+    uint8_t *rgba = NULL;
+    pthread_mutex_lock(&predec_mu);
+    uint64_t h = ((uint64_t)(uintptr_t)t * 0x9E3779B97F4A7C15ull);
+    uint32_t base = (uint32_t)(h ^ (h >> 32)) & (PREDEC_TAB_CAP - 1);
+    for (int p = 0; p < 64; p++) {
+        int s = (int)((base + (uint32_t)p) & (PREDEC_TAB_CAP - 1));
+        PredecEnt *e = &predec_tab[s];
+        if (e->state == PREDEC_EMPTY) break;
+        if (e->t == t && e->addr == addr && e->total == total &&
+            e->layers == layers && e->levels == levels && e->bw == bw && e->bh == bh && e->srgb == srgb) {
+            if (e->state == PREDEC_READY) {
+                rgba = e->rgba;
+                *out_full_hash = e->full_hash;
+                predec_bytes_cached -= e->rgba_total;
+                memset(e, 0, sizeof *e);
+            } else if (e->state == PREDEC_INFLIGHT) {
+                e->cancelled = true;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&predec_mu);
+    return rgba;
+}
+
+void vk_textures_init(void) {
+    pthread_once(&predec_once, predecode_init_once);
+    nvn_set_tex_register_hook(predec_enabled ? vk_astc_predecode_hint : NULL);
+}
+
 static void upload_pending(TexBackend *b) {
     pthread_mutex_lock(&pending_lock);
     void *px = b->pending_rgba;
@@ -579,7 +927,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     // Newly created textures (first 16 frames) are checked every frame so streaming planes
     // (e.g. NV12 Y and UV) promote to dynamic in lockstep instead of desyncing across & 7 slots.
     if (!cpu_dirty && b->uploaded && !b->dynamic && (frame - b->created_frame >= 16) &&
-        ((frame + ((uintptr_t)b >> 6)) & 7)) return;
+        ((frame + ((uintptr_t)b >> 6)) & 15)) return;
     const FormatInfo *fi = t->layout.fmt;
     if (!fi || !fi->bpb) return;
     VkFmt mf = fmt_of(t->format);
@@ -624,7 +972,47 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         full = true;
         if (periodic) full_hash_budget -= total;
     }
-    if (!b->uploaded && !b->dynamic && watch && watch_ch >= 0 && !always_full) {
+    uint8_t *pre_rgba = NULL;
+    uint64_t pre_full_hash = 0;
+    uint32_t layers = t->layout.layers ? t->layout.layers : 1;
+    if (layers > b->layers && b->depth == 1) layers = b->layers;
+    uint64_t layer_size = tegra_layer_size(&t->layout);
+    uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
+    if (!b->uploaded && !b->dynamic && !restyle && b->astc_bw && b->tp <= 0 && !linear && !(t->flags & 6)) {
+        pre_rgba = predecode_take(t, t->addr, total, layers, levels, b->astc_bw, b->astc_bh, b->astc_srgb, &pre_full_hash);
+        if (pre_rgba) {
+            uint64_t cur_h = hash_full(mem, total);
+            if (!cur_h) cur_h = 1;
+            if (cur_h != pre_full_hash) {
+                free(pre_rgba);
+                pre_rgba = NULL;
+                prof_predec_sync++;
+            } else {
+                prof_predec_hits++;
+                b->full_frame = frame;
+                b->sample_hash = fnv_sample(mem, total);
+                b->data_hash = pre_full_hash;
+                if (b->tp > 0) b->tp_gen = texpatch_generation();
+                b->uploaded = true;
+            }
+        } else {
+            prof_predec_sync++;
+        }
+        static uint64_t last_log_frame;
+        if (getenv("LARECOMP_TEX_PROF") && frame != last_log_frame && (prof_predec_hits + prof_predec_sync) > 0 &&
+            ((prof_predec_hits + prof_predec_sync) % 50 == 0 || frame >= 1370)) {
+            static uint64_t last_h, last_s;
+            if (prof_predec_hits != last_h || prof_predec_sync != last_s) {
+                last_log_frame = frame;
+                last_h = prof_predec_hits;
+                last_s = prof_predec_sync;
+                LOG("[predec] f%llu hits=%llu sync=%llu drop=%llu cached=%.1fMB\n", (unsigned long long)frame,
+                    (unsigned long long)prof_predec_hits, (unsigned long long)prof_predec_sync,
+                    (unsigned long long)prof_predec_drop, predec_bytes_cached / 1048576.0);
+            }
+        }
+    }
+    if (!pre_rgba && !b->uploaded && !b->dynamic && watch && watch_ch >= 0 && !always_full) {
         // First mandatory upload of a static texture with page-write tracking active:
         // capture only the 4 KB sample hash now instead of full-hashing 600-1000 MB on scene entry.
         b->full_frame = frame;
@@ -632,7 +1020,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         b->data_hash = 0;
         if (b->tp > 0) b->tp_gen = texpatch_generation();
         b->uploaded = true;
-    } else {
+    } else if (!pre_rgba) {
         uint64_t prev_sample = b->sample_hash;
         if (!full && !restyle && !page_written) {
             prof_tex_samples++;
@@ -655,39 +1043,44 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 b->data_hash = h;
                 return;
             } else {
-                b->dynamic = true;
+                // False-sharing 4 KB dirty page before a baseline data_hash existed: record data_hash and
+                // re-upload once without prematurely promoting a static texture to dynamic.
+                b->data_hash = h;
             }
         }
         if (b->tp > 0) b->tp_gen = texpatch_generation();
         b->data_hash = h;
         b->uploaded = true;
     }
-    if (b->format != mf.vf && !b->astc_bw) return;  // unsupported format: nothing sensible to copy
+    if (b->format != mf.vf && !b->astc_bw) { free(pre_rgba); return; }  // unsupported format: nothing sensible to copy
     VkCommandBuffer cb = vk_upload_cmd();
-    uint32_t layers = t->layout.layers ? t->layout.layers : 1;
-    if (layers > b->layers && b->depth == 1) layers = b->layers;
-    uint64_t layer_size = tegra_layer_size(&t->layout);
-    uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
     static uint8_t *astc_scratch;
     static size_t astc_scratch_cap;
+    uint64_t pre_off = 0;
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
             if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
-                const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
-                size_t blk_bytes = (size_t)l.wb * l.hb * 16;
-                if (blk_bytes > astc_scratch_cap) {
-                    uint8_t *nb = realloc(astc_scratch, blk_bytes);
-                    if (!nb) return;
-                    astc_scratch = nb;
-                    astc_scratch_cap = blk_bytes;
-                }
-                uint8_t *blocks = astc_scratch;
-                if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
-                else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
-                if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * 16);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
-                astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
+                if (pre_rgba) {
+                    size_t sz = (size_t)l.w * l.h * 4;
+                    memcpy(s.ptr, pre_rgba + pre_off, sz);
+                    pre_off += sz;
+                } else {
+                    const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
+                    size_t blk_bytes = (size_t)l.wb * l.hb * 16;
+                    if (blk_bytes > astc_scratch_cap) {
+                        uint8_t *nb = realloc(astc_scratch, blk_bytes);
+                        if (!nb) return;
+                        astc_scratch = nb;
+                        astc_scratch_cap = blk_bytes;
+                    }
+                    uint8_t *blocks = astc_scratch;
+                    if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
+                    else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
+                    if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * 16);
+                    astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
+                }
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
                                         .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
@@ -731,6 +1124,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
         }
     }
+    free(pre_rgba);
 }
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {

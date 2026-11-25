@@ -1752,6 +1752,7 @@ static NvnDescPool *desc_pool_init(uint64_t guest, uint64_t pool, uint64_t off, 
         pthread_mutex_unlock(&g_dpool_alloc_lock);
         FATAL("NVN descriptor pool entries allocation failed\n");
     }
+    atomic_store_explicit(&d->gen, 1u, memory_order_release);
     atomic_store_explicit(&s->state, TEX_SLOT_ALIVE, memory_order_release);
     uint16_t ep = atomic_load_explicit(&g_dpool_epoch, memory_order_relaxed);
     pthread_mutex_unlock(&g_dpool_alloc_lock);
@@ -1776,6 +1777,7 @@ static void desc_pool_finalize(uint64_t guest, uint64_t lr) {
     if (s && atomic_load_explicit(&s->generation, memory_order_relaxed) == h.generation &&
         atomic_load_explicit(&s->state, memory_order_relaxed) == TEX_SLOT_ALIVE) {
         atomic_store_explicit(&s->state, TEX_SLOT_RETIRED, memory_order_release);
+        atomic_fetch_add_explicit(&s->pool.gen, 1u, memory_order_release);
         // Keep backing entries memory alive until reset (in-flight command lists may still hold NvnDescPool*).
         dpool_retire_entries_locked(s->pool.entries);
         s->pool.entries = NULL;
@@ -1804,6 +1806,11 @@ NVN(nvnTexturePoolSetDebugLabel) { (void)c; }
 NVN(nvnTexturePoolGetMemoryPool) { NvnDescPool *d = HOST(NvnDescPool, A(0)); RET(d ? d->guest_pool : 0); }
 NVN(nvnTexturePoolGetMemoryOffset) { NvnDescPool *d = HOST(NvnDescPool, A(0)); RET(d ? d->pool_offset : 0); }
 NVN(nvnTexturePoolGetSize) { NvnDescPool *d = HOST(NvnDescPool, A(0)); RET(d ? (uint32_t)d->count : 0); }
+static _Atomic NvnTexRegisterHook g_tex_register_hook;
+void nvn_set_tex_register_hook(NvnTexRegisterHook fn) {
+    atomic_store_explicit(&g_tex_register_hook, fn, memory_order_release);
+}
+
 static void register_texture(Cpu *c) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
@@ -1825,11 +1832,14 @@ static void register_texture(Cpu *c) {
     atomic_store_explicit(&e->seq, seq + 1u, memory_order_release);
     for (int k = 0; k < 4; k++) atomic_store_explicit(&e->words[k], w[k], memory_order_relaxed);
     atomic_store_explicit(&e->seq, seq + 2u, memory_order_release);
+    atomic_fetch_add_explicit(&d->gen, 1u, memory_order_release);
     pthread_mutex_unlock(&d->write_lock);
 
     if (t) {
         nvn_diag_record(NVN_EV_DESC_REGISTER, NVN_OBJ_TEXTURE, (uint8_t)lk.state, A(2),
                         lk.hdr.slot_index, lk.hdr.generation, lk.hdr.rt_epoch, (uint16_t)id, c->x[30], false, 0, 0);
+        NvnTexRegisterHook hook = atomic_load_explicit(&g_tex_register_hook, memory_order_acquire);
+        if (hook) hook(t);
     }
 }
 NVN(nvnTexturePoolRegisterTexture) { register_texture(c); }
@@ -1856,6 +1866,7 @@ static void register_sampler_desc(NvnDescPool *d, int id, const NvnSamplerDesc *
     atomic_store_explicit(&e->seq, seq + 1u, memory_order_release);
     for (int k = 0; k < NW; k++) atomic_store_explicit(&e->words[k], w[k], memory_order_relaxed);
     atomic_store_explicit(&e->seq, seq + 2u, memory_order_release);
+    atomic_fetch_add_explicit(&d->gen, 1u, memory_order_release);
     pthread_mutex_unlock(&d->write_lock);
 }
 NVN(nvnSamplerPoolRegisterSampler) {
@@ -2021,13 +2032,16 @@ static void set_shaders(Cpu *c, int stride) {
         free(p->stages[stage].const_snap);
         p->stages[stage].const_snap = NULL;
         p->stages[stage].const_snap_size = 0;
+        p->stages[stage].const_snap_id = 0;
         if (csz > 0 && csz <= 4096 &&
             guest_mem_validate_range(code + coff, csz, 1, GMEM_PERM_R) == GMEM_OK) {
             uint8_t *snap = malloc(csz);
             if (snap) {
+                static _Atomic uint64_t next_csnap_id = 1;
                 memcpy(snap, (const void *)(uintptr_t)(code + coff), csz);
                 p->stages[stage].const_snap = snap;
                 p->stages[stage].const_snap_size = csz;
+                p->stages[stage].const_snap_id = atomic_fetch_add_explicit(&next_csnap_id, 1u, memory_order_relaxed);
             }
         }
         p->stage_mask |= 1u << stage;

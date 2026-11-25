@@ -640,3 +640,17 @@ void astc_decode_ldr(const uint8_t *blocks, uint32_t width, uint32_t height, uin
     }
     if (row_buf != stack_row) free(row_buf);
 }
+
+void astc_decode_ldr_single(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh,
+                            bool srgb, uint8_t *rgba_out) {
+    if (bw < 4 || bh < 4 || bw > 12 || bh > 12 || !width || !height) return;
+    uint32_t bx = (width + bw - 1) / bw, by = (height + bh - 1) / bh;
+    size_t row_need = (size_t)bh * width * 4;
+    uint8_t stack_row[16384];
+    uint8_t *row_buf = row_need <= sizeof stack_row ? stack_row : malloc(row_need);
+    if (!row_buf) return;
+    for (uint32_t j = 0; j < by; j++) {
+        astc_decode_row(blocks, width, height, bw, bh, srgb, rgba_out, bx, j, row_buf);
+    }
+    if (row_buf != stack_row) free(row_buf);
+}

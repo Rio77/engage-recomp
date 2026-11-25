@@ -590,25 +590,84 @@ static bool nv_descriptor_word(uint64_t w, uint32_t index_bit, uint32_t offset_b
     return false;
 }
 
-static bool resolve_texture_operand(Ctx *, uint32_t, int, unsigned, TextureOperand *);
+static bool resolve_texture_operand(Ctx *, uint32_t, int, uint8_t, unsigned, TextureOperand *);
 
-static bool texture_definition(Ctx *c, uint32_t index, int reg, unsigned depth,
+static bool insn_is_pred_setter(uint64_t w) {
+    uint64_t op = w & 0xfff8000000000000ull;
+    uint64_t class12 = w & 0xfff0000000000000ull;
+    uint64_t imm12 = w & 0xfef0000000000000ull;
+    uint32_t op16 = (uint32_t)(w >> 48);
+    return class12 == 0x5bb0000000000000ull || class12 == 0x4bb0000000000000ull ||
+           imm12 == 0x36b0000000000000ull ||  // FSETP
+           class12 == 0x5b60000000000000ull || class12 == 0x4b60000000000000ull ||
+           imm12 == 0x3660000000000000ull ||  // ISETP
+           op == 0x5090000000000000ull ||     // PSETP
+           op == 0x50a0000000000000ull ||     // CSETP
+           (op16 & 0xfe80u) == 0x7e00u || (op16 & 0xfe80u) == 0x7e80u ||
+           (op16 & 0xfff8u) == 0x5d20u;       // HSETP2
+}
+
+// Instructions whose low 8 bits hold predicate destinations, source operands, or barriers:
+// they do not write a general-purpose register with the same number.
+static bool insn_has_no_gpr_dest(uint64_t w) {
+    if (insn_is_pred_setter(w)) return true;
+    uint64_t op = w & 0xfff8000000000000ull;
+    uint64_t class12 = w & 0xfff0000000000000ull;
+    uint64_t imm13 = w & 0xfef8000000000000ull;
+    return class12 == 0xe330000000000000ull ||  // KIL
+           op == 0xf0f0000000000000ull ||       // DEPBAR
+           op == 0x50b0000000000000ull ||       // NOP
+           op == 0xef98000000000000ull ||       // MEMBAR
+           op == 0xf0a8000000000000ull ||       // BAR
+           op == 0xeff0000000000000ull ||       // ST a[]
+           op == 0xeed8000000000000ull ||       // STG
+           op == 0xef50000000000000ull ||       // STL
+           op == 0xef58000000000000ull ||       // STS
+           (w & 0xffe0000000000000ull) == 0xeb20000000000000ull ||  // SUST
+           op == 0xebf8000000000000ull ||       // RED
+           op == 0x5cf0000000000000ull || op == 0x4cf0000000000000ull ||
+           imm13 == 0x38f0000000000000ull;      // R2P
+}
+
+static bool insn_writes_pred(uint64_t w, uint8_t pred) {
+    if (pred >= PT) return false;
+    uint64_t op = w & 0xfff8000000000000ull;
+    uint64_t imm13 = w & 0xfef8000000000000ull;
+    if (insn_is_pred_setter(w))
+        return bits(w, 3, 3) == pred || bits(w, 0, 3) == pred;
+    if (op == 0x5c40000000000000ull || op == 0x4c40000000000000ull ||
+        imm13 == 0x3840000000000000ull ||  // LOP
+        op == 0xef10000000000000ull)       // SHFL
+        return bits(w, 48, 3) == pred;
+    if (op == 0xefa0000000000000ull)       // AL2P
+        return bits(w, 44, 3) == pred;
+    if (op == 0x50d8000000000000ull)       // VOTE
+        return bits(w, 45, 3) == pred;
+    if (op == 0x5cf0000000000000ull || op == 0x4cf0000000000000ull ||
+        imm13 == 0x38f0000000000000ull)    // R2P (writes P0..P6 unless .CC)
+        return !bits(w, 40, 1);
+    return false;
+}
+
+static bool texture_definition(Ctx *c, uint32_t index, int reg, uint8_t guard, unsigned depth,
                                TextureOperand *out) {
     uint64_t w = ((const uint64_t *)c->code)[index];
     uint64_t op = w & 0xfff8000000000000ull;
-    if ((int)bits(w, 0, 8) != reg || bits(w, 16, 4) != PT) return false;
+    uint8_t def_guard = (uint8_t)bits(w, 16, 4);
+    if ((int)bits(w, 0, 8) != reg) return false;
+    if (def_guard != PT && def_guard != guard) return false;
     if (op == 0x4c98000000000000ull)
         return nv_descriptor_word(w, 34, 20, 14, out);
     if (op == 0xef90000000000000ull && bits(w, 8, 8) == RZ)
         return nv_descriptor_word(w, 36, 20, 16, out);
     if (op == 0x5c98000000000000ull)
-        return resolve_texture_operand(c, index * 8, (int)bits(w, 20, 8), depth - 1, out);
+        return resolve_texture_operand(c, index * 8, (int)bits(w, 20, 8), guard, depth - 1, out);
     if ((op == 0x4c40000000000000ull || op == 0x5c40000000000000ull) && bits(w, 39, 4) == 4) {
         TextureOperand a = {0}, b = {0};
-        if (!resolve_texture_operand(c, index * 8, (int)bits(w, 8, 8), depth - 1, &a)) return false;
+        if (!resolve_texture_operand(c, index * 8, (int)bits(w, 8, 8), guard, depth - 1, &a)) return false;
         bool ok = op == 0x4c40000000000000ull
             ? nv_descriptor_word(w, 34, 20, 14, &b)
-            : resolve_texture_operand(c, index * 8, (int)bits(w, 20, 8), depth - 1, &b);
+            : resolve_texture_operand(c, index * 8, (int)bits(w, 20, 8), guard, depth - 1, &b);
         if (!ok || (a.texture && b.texture) || (a.sampler && b.sampler)) return false;
         out->texture = a.texture | b.texture;
         out->sampler = a.sampler | b.sampler;
@@ -622,8 +681,10 @@ typedef struct {
     const ScfCfg *cfg;
     const ScfDom *dom;
     int reg;
+    uint8_t guard;
+    bool edge_guarded;  // guard came from an SCF_COND branch edge, not the TEX instruction itself
     unsigned depth;
-    uint8_t *visited;
+    uint16_t *visited;
     bool found;
     TextureOperand value;
 } TextureFlow;
@@ -635,26 +696,25 @@ static bool texture_block(TextureFlow *flow, int block, uint32_t before) {
     const ScfBlock *b = &flow->cfg->b[block];
     const uint64_t *code = (const uint64_t *)flow->context->code;
     uint32_t end = before < b->last + 1 ? before : b->last + 1;
+    uint8_t pred_reg = (uint8_t)(flow->guard & 7u);
     for (uint32_t i = end; i > b->first;) {
         --i;
         if (i % 4 == 0 || scf_insn_is_flow(code[i])) continue;
         uint64_t w = code[i], op = w & 0xfff8000000000000ull;
-        // Predicate destinations occupy the low instruction bits too, but do
-        // not overwrite a general-purpose register with the same number.
-        uint64_t class12 = w & 0xfff0000000000000ull;
-        uint64_t immediate = w & 0xfef0000000000000ull;
-        if (class12 == 0x5bb0000000000000ull || class12 == 0x4bb0000000000000ull ||
-            immediate == 0x36b0000000000000ull ||
-            class12 == 0x5b60000000000000ull || class12 == 0x4b60000000000000ull ||
-            immediate == 0x3660000000000000ull ||
-            op == 0x5090000000000000ull || op == 0x50a0000000000000ull)
+        if (pred_reg != PT && insn_writes_pred(w, pred_reg)) {
+            if (!flow->edge_guarded) return false;
+            flow->guard = PT;
+            flow->edge_guarded = false;
+            pred_reg = PT;
+        }
+        if (insn_has_no_gpr_dest(w))
             continue;
         bool wide = op == 0xef90000000000000ull && bits(w, 48, 3) == 5;
         uint32_t dest = (uint32_t)bits(w, 0, 8);
         if (dest != (uint32_t)flow->reg && !(wide && dest + 1 == (uint32_t)flow->reg))
             continue;
         TextureOperand value = {0};
-        if (!texture_definition(flow->context, i, flow->reg, flow->depth, &value)) return false;
+        if (!texture_definition(flow->context, i, flow->reg, flow->guard, flow->depth, &value)) return false;
         if (flow->found && (flow->value.texture != value.texture || flow->value.sampler != value.sampler))
             return false;
         flow->value = value;
@@ -666,21 +726,38 @@ static bool texture_block(TextureFlow *flow, int block, uint32_t before) {
 
 static bool texture_predecessors(TextureFlow *flow, int block) {
     if (block == 0) return false; // Register has no definition on an entry path.
-    if (flow->visited[block]) return true; // A cycle contributes no new definition here.
-    flow->visited[block] = 1;
+    uint16_t vbit = (uint16_t)(1u << (flow->guard & 15u));
+    if (flow->visited[block] & vbit) return true; // A cycle contributes no new definition here.
+    flow->visited[block] |= vbit;
     bool predecessor = false;
+    uint8_t saved_guard = flow->guard;
+    bool saved_edge = flow->edge_guarded;
     for (int p = 0; p < flow->cfg->n; ++p) {
         const ScfBlock *b = &flow->cfg->b[p];
         if (flow->dom->rpo[p] < 0) continue;
         if (b->succ[0] == block || (b->term == SCF_COND && b->succ[1] == block)) {
             predecessor = true;
-            if (!texture_block(flow, p, b->last + 1)) return false;
+            flow->guard = saved_guard;
+            flow->edge_guarded = saved_edge;
+            if (saved_guard == PT && b->term == SCF_COND && b->pred < PT && b->succ[0] != b->succ[1]) {
+                // In ScfCfg: succ[0] is the taken branch (condition holds), succ[1] is fallthrough.
+                bool want_neg = (b->succ[0] == block) ? b->pred_neg : !b->pred_neg;
+                flow->guard = (uint8_t)(b->pred | (want_neg ? 8u : 0u));
+                flow->edge_guarded = true;
+            }
+            if (!texture_block(flow, p, b->last + 1)) {
+                flow->guard = saved_guard;
+                flow->edge_guarded = saved_edge;
+                return false;
+            }
         }
     }
+    flow->guard = saved_guard;
+    flow->edge_guarded = saved_edge;
     return predecessor;
 }
 
-static bool resolve_texture_operand(Ctx *c, uint32_t pc, int reg, unsigned depth,
+static bool resolve_texture_operand(Ctx *c, uint32_t pc, int reg, uint8_t guard, unsigned depth,
                                     TextureOperand *out) {
     if (reg == RZ || depth == 0) return false;
     ScfCfg cfg = {0};
@@ -692,8 +769,8 @@ static bool resolve_texture_operand(Ctx *c, uint32_t pc, int reg, unsigned depth
     int block = -1;
     for (int i = 0; i < cfg.n; ++i)
         if (pc / 8 >= cfg.b[i].first && pc / 8 <= cfg.b[i].last) { block = i; break; }
-    TextureFlow flow = {.context=c, .cfg=&cfg, .dom=&dom, .reg=reg, .depth=depth};
-    flow.visited = calloc((size_t)cfg.n, 1);
+    TextureFlow flow = {.context=c, .cfg=&cfg, .dom=&dom, .reg=reg, .guard=guard, .depth=depth};
+    flow.visited = calloc((size_t)cfg.n, sizeof *flow.visited);
     bool ok = flow.visited && block >= 0 && texture_block(&flow, block, pc / 8) && flow.found;
     if (ok) *out = flow.value;
     free(flow.visited);
@@ -1016,9 +1093,9 @@ static void emit_texs(Ctx *c, uint64_t w, bool fetch) {
     write_tex_result(c, slot, call, mask, d0, d1, true, !bits(w, 59, 1));  // 0xd0/0xd2: .F16 results
 }
 
-static bool bindless_descriptor(Ctx *c, uint32_t pc, int reg,
+static bool bindless_descriptor(Ctx *c, uint32_t pc, int reg, uint8_t guard,
                                 TextureOperand *descriptor) {
-    if (c->glsl && resolve_texture_operand(c, pc, reg, 8, descriptor) &&
+    if (c->glsl && resolve_texture_operand(c, pc, reg, guard, 8, descriptor) &&
         descriptor->texture && (!descriptor->sampler || descriptor->texture >= 0x168))
         return true;
     if (getenv("ENGAGE_TRACE_BINDLESS")) {
@@ -1045,7 +1122,7 @@ static void emit_bindless_texel_read(Ctx *c, uint64_t w, uint32_t pc, bool gathe
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
     if (d == RZ) return;
     TextureOperand descriptor = {0};
-    if (!bindless_descriptor(c, pc, b, &descriptor)) return;
+    if (!bindless_descriptor(c, pc, b, (uint8_t)bits(w, 16, 4), &descriptor)) return;
     int slot = tex_slot_with_sampler(c, descriptor.texture / 4, descriptor.sampler,
                                      bits(w, 50, 1) ? TEXTYPE_2D_MS : TEXTYPE_2D, false, false);
     const char *x = R(a), *y = R(a < RZ ? a + 1 : RZ);
@@ -1071,7 +1148,7 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless, uint32_t pc) {
     int lod_mode = bindless ? (int)bits(w, 37, 3) : (int)bits(w, 55, 3);  // 0 none, 1 lz, 2 lb, 3 ll, 6 lba, 7 lla
     TextureOperand descriptor = {0};
     if (bindless) {
-        if (!bindless_descriptor(c, pc, b, &descriptor)) return;
+        if (!bindless_descriptor(c, pc, b, (uint8_t)bits(w, 16, 4), &descriptor)) return;
         index = descriptor.texture / 4;
         ++b;  // Bindless TEX.B takes its handle before other extra operands.
     }

@@ -197,7 +197,10 @@ int ipc_handle_request(Cpu *c, uint32_t handle) {
         target->handler(target, &req, &resp);
     } else if (req.type == 5 || req.type == 7) {  // control
         req.cmd = *(uint32_t *)(payload + 8);
-        LOG("[ipc] control %u on %s (handle %x)\n", req.cmd, sess->svc->name, handle);
+        static int ctrl_audio_log;
+        if ((strcmp(sess->svc->name, "audren:u") != 0 && strcmp(sess->svc->name, "IAudioDevice") != 0) ||
+            ctrl_audio_log++ < 8 || trace_ipc)
+            LOG("[ipc] control %u on %s (handle %x)\n", req.cmd, sess->svc->name, handle);
         switch (req.cmd) {
         case 0:  // ConvertCurrentObjectToDomain
             sess->domain = calloc(1, sizeof(Domain));

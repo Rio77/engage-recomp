@@ -172,9 +172,17 @@ struct NvnDescPool {
     uint64_t pool_offset;
     int count;
     bool is_sampler;
+    _Atomic uint32_t gen;  // bumped on init, finalize, or entry registration
     pthread_mutex_t write_lock;
     void *entries;  // NvnTexEntry[] or NvnSamplerEntry[]
 };
+
+static inline uint32_t nvn_desc_pool_gen(const NvnDescPool *d) {
+    return d ? atomic_load_explicit(&d->gen, memory_order_acquire) : 0;
+}
+
+typedef void (*NvnTexRegisterHook)(NvnTexture *t);
+void nvn_set_tex_register_hook(NvnTexRegisterHook fn);
 
 static inline bool nvn_tex_pool_read(const NvnDescPool *d, uint32_t id, NvnTexEntry *out) {
     if (!d || !d->entries || id >= (uint32_t)d->count) return false;
@@ -225,6 +233,7 @@ typedef struct NvnShaderStage {
     uint32_t const_offset, const_size;  // compiler constants (bound as c1), within the code blob
     uint8_t *const_snap;      // host snapshot of compiler constants (c1) taken at SetShaders time
     uint32_t const_snap_size;
+    uint64_t const_snap_id;   // monotonic snapshot id for O(1) GPU slab lookup
     void *backend;
 } NvnShaderStage;
 
