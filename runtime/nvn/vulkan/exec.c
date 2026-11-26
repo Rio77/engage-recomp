@@ -324,6 +324,7 @@ void vk_full_barrier(VkCommandBuffer cb) {
 static bool g_pass_wrote_shader;
 static bool g_pass_wrote_color = true;
 static bool g_pass_wrote_depth = true;
+static bool g_pass_read_depth;  // the pass sampled its depth attachment (depth EQUAL variant)
 static bool g_pass_wrote_clear = true;
 static void vk_pass_barrier(VkCommandBuffer cb) {
     static int force_full = -1;
@@ -333,6 +334,7 @@ static void vk_pass_barrier(VkCommandBuffer cb) {
         g_pass_wrote_shader = false;
         g_pass_wrote_color = true;
         g_pass_wrote_depth = true;
+        g_pass_read_depth = false;
         g_pass_wrote_clear = true;
         return;
     }
@@ -346,6 +348,7 @@ static void vk_pass_barrier(VkCommandBuffer cb) {
         src_stages |= VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
         src_access |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     }
+    if (g_pass_read_depth) src_stages |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     if (g_pass_wrote_clear) src_stages |= VK_PIPELINE_STAGE_2_CLEAR_BIT;
     if (g_pass_wrote_shader) {
         src_stages |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
@@ -354,6 +357,7 @@ static void vk_pass_barrier(VkCommandBuffer cb) {
     g_pass_wrote_shader = false;
     g_pass_wrote_color = false;
     g_pass_wrote_depth = false;
+    g_pass_read_depth = false;
     g_pass_wrote_clear = false;
     if (!src_stages) return;
     VkMemoryBarrier2 mb = {
@@ -1519,6 +1523,7 @@ static uint32_t tex_wh[2][64][2];
 
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
+static VkImageView pass_depth_eq_view;  // the depth attachment as sampled by the depth EQUAL variants (0: none)
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
 static int debug_pass_no;
 
@@ -1603,8 +1608,8 @@ static void vk_end_pass_at(int line) {
 
 static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v : 1; }
 
-static void begin_pass(void) {
-    if (in_pass && !st.rt_dirty) return;
+static void begin_pass_mode(VkImageView depth_eq_view) {
+    if (in_pass && !st.rt_dirty && depth_eq_view == pass_depth_eq_view) return;
     vk_end_pass();
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
     st.rt_dirty = false;
@@ -1656,6 +1661,7 @@ static void begin_pass(void) {
         pass_samples = b->samples;
     }
     pass_depth = pass_stencil = VK_FORMAT_UNDEFINED;
+    pass_depth_eq_view = depth_eq_view;
     bool has_d = false, has_s = false;
     if (st.rt.depth) {
         renderer_mark_gpu_owned(st.rt.depth);
@@ -1664,7 +1670,8 @@ static void begin_pass(void) {
         if (v && renderer_format_is_depth(st.rt.depth->format)) {
             VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
                                            .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-                                           .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+                                           // (a sampled attachment must have no writes, the store included)
+                                           .storeOp = depth_eq_view ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE};
             if (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
                 da = a;
                 if (st.clear_depth) {
@@ -1704,11 +1711,14 @@ static void begin_pass(void) {
     in_pass = true;
     st.pass_gen++;
     g_pass_wrote_color = pass_ncolor > 0;
-    g_pass_wrote_depth = has_d || has_s;
+    g_pass_wrote_depth = (has_d || has_s) && !depth_eq_view;
+    g_pass_read_depth = depth_eq_view != VK_NULL_HANDLE;
     g_pass_wrote_clear = (st.clear_color_mask != 0) || st.clear_depth || st.clear_stencil;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
 }
+
+static void begin_pass(void) { begin_pass_mode(VK_NULL_HANDLE); }
 
 static void flush_pending_clears(void) {
     if (st.clear_color_mask || st.clear_depth || st.clear_stencil) begin_pass();
@@ -1935,7 +1945,7 @@ typedef struct Prog {
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
     VkPipelineLayout half_layout[2];
-    bool vs_uses_vid;
+    bool vs_uses_vid, has_depth_eq;
     uint64_t xh[2];     // the translations' cache hashes (cache/xlat): the program by content, 0 when not cached
     bool warm;          // prebuilt at launch (prewarm below)
     uint8_t fi_1d_checked;
@@ -1945,6 +1955,10 @@ typedef struct Prog {
 } Prog;
 
 static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, VkShaderStageFlags s1) {
+    for (int i = 0; i < p->nbinds; i++)
+        if (p->binds[i].set == 1 && p->binds[i].binding == DEPTH_EQ_BINDING &&
+            p->binds[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+            p->has_depth_eq = true;
     p->set_layout[0] = vk_set_layout(p->binds, p->nbinds, 0, s0);
     if (nsets > 1) p->set_layout[1] = vk_set_layout(p->binds, p->nbinds, 1, s1);
     bool indep = (nsets > 1 && g_vk.gpl);
@@ -2184,7 +2198,7 @@ static void translate_program(void *arg) {
     run_job(compile_program, p);
 }
 
-#define PROG_TAB 4096
+#define PROG_TAB 8192  // (each program may also have a depth EQUAL variant)
 static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
 
 static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_);
@@ -2212,6 +2226,7 @@ static uint64_t program_key(NvnProgram *np, const ShaderKey *vkey, const ShaderK
         uint32_t m = key_buf_mask(fkey);
         for (int i = 0; i < 4; i++) { h ^= (m >> (i * 8)) & 0xFF; h *= 0x100000001B3ull; }
     }
+    if (fkey->glsl & SHADER_KEY_GLSL_DEPTH_EQ) h = (h ^ SHADER_KEY_GLSL_DEPTH_EQ) * 0x100000001B3ull;
     return h ? h : 1;
 }
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
@@ -2323,6 +2338,43 @@ static VkCompareOp compare_fn(uint8_t f) {
     case 7: return VK_COMPARE_OP_GREATER_OR_EQUAL;
     default: return VK_COMPARE_OP_ALWAYS;
     }
+}
+
+// A DEPTH24 target standing in as float depth (0x33 always, 0x35 where the GPU has no D24S8, like AMD RADV / Metal).
+static bool emulated_d24(uint32_t guest_format, VkFormat host_format) {
+    return (guest_format == 0x33 && host_format == VK_FORMAT_D32_SFLOAT) ||
+           (guest_format == 0x35 && host_format == VK_FORMAT_D32_SFLOAT_S8_UINT);
+}
+
+// Depth EQUAL on an emulated D24 target. The game's depth pre-pass and colour pass use vertex shaders its compiler
+// contracted differently (bending grass: fma(a, p, a) in one, a * fma(x, y, 1) in the other), a few ULPs apart. 24-bit
+// depth hid that; float depth needs a tolerance on both sides. The hardware test is GEQUAL / LEQUAL with a small bias
+// (below), which keeps early depth rejection of everything hidden; the fragment shader variant returned for here also
+// samples the depth attachment and drops what is clearly in front of it (the pre-pass' alpha-tested holes, which the
+// one-sided test alone paints as opaque edges). Returns that attachment's sampled view, or 0: draw without the variant.
+// ENGAGE_VK_EQUAL_BILATERAL=0: off (one-sided tolerance only).
+static VkImageView depth_equal_view(const ShaderInfo *fs) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *b = getenv("ENGAGE_VK_EQUAL_BILATERAL"), *t = getenv("LARECOMP_VK_EQUAL_TOL");
+        enabled = !(b && !atoi(b)) && !(t && !atoi(t));
+    }
+    NvnTexture *depth = st.rt.depth;
+    // depth tested for EQUAL and nothing written to depth or stencil: the attachment can be sampled in the same pass
+    if (!enabled || !depth || !st.ds[0] || st.ds[1] || st.ds[3] || compare_fn(st.ds[2]) != VK_COMPARE_OP_EQUAL) return VK_NULL_HANDLE;
+    if (st.clear_depth || st.clear_stencil) return VK_NULL_HANDLE;
+    if ((st.poly[3] & 4) && (st.poly_offset[0] != 0.0f || st.poly_offset[1] != 0.0f)) return VK_NULL_HANDLE;
+    if (fs->writes_depth || fs->uses_gmem_store) return VK_NULL_HANDLE;
+    for (int i = 0; i < st.rt.ncolor; i++)
+        if (st.rt.color[i] && st.rt.color[i]->samples > 1) return VK_NULL_HANDLE;
+    TexBackend *b = vk_tex(depth, true);
+    if (!emulated_d24(depth->format, b->format) || b->samples != 1 || b->base_type == VK_IMAGE_VIEW_TYPE_3D ||
+        !(b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return VK_NULL_HANDLE;
+    uint32_t level = st.rt.has_dview && (st.rt.dview.setmask & 1) ? st.rt.dview.base_level : 0;
+    uint32_t layer = st.rt.has_dview && (st.rt.dview.setmask & 2) ? st.rt.dview.min_layer : 0;
+    if (level >= b->levels || layer >= b->layers) return VK_NULL_HANDLE;
+    return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, level, 1, layer, 1, (VkComponentMapping){0},
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
 }
 
 static VkStencilOp stencil_op(uint8_t o) {
@@ -4452,7 +4504,16 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     for (int i = 0; i < p->nbinds; i++) {
         VkBindingInfo *b = &p->binds[i];
         if (b->set != set) continue;
-        if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) {
+        if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && stage == 1 && b->binding == DEPTH_EQ_BINDING) {
+            ii[n] = (VkDescriptorImageInfo){vk_default_sampler(false), pass_depth_eq_view, VK_IMAGE_LAYOUT_GENERAL};
+            w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b->binding,
+                                          .descriptorCount = 1, .descriptorType = b->type, .pImageInfo = &ii[n]};
+            meta[n] = (b->binding << 8) | ((uint32_t)b->type & 0xFFu);
+            val[n][0] = (uint64_t)(uintptr_t)ii[n].sampler;
+            val[n][1] = (uint64_t)(uintptr_t)ii[n].imageView;
+            val[n][2] = (uint64_t)ii[n].imageLayout;
+            n++;
+        } else if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) {
             w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b->binding,
                                           .descriptorCount = 1, .descriptorType = b->type, .pImageInfo = &ii[n]};
             int ti = (int)b->binding - 32;
@@ -5298,6 +5359,7 @@ static void draw_(CmdRec *r, bool indexed) {
         }
         if (mirror_draw(composite)) {
             if (!have_var_keys) { var_vkey = st.last_vkey; var_fkey = st.last_fkey; }
+            have_var_keys = true;
             var_vkey.flip_x = var_fkey.flip_x = true;
             flip_x = true;
             pr = get_program(st.program, &var_vkey, &var_fkey);
@@ -5344,12 +5406,21 @@ static void draw_(CmdRec *r, bool indexed) {
     if (ct_on()) ct_draw(pr, "draw");
     alias_draw_check();
     resolve_feedback(pr);
+    VkImageView depth_eq_view = depth_equal_view(pr->fi);
+    Prog *plain_pr = pr;
+    if (depth_eq_view) {  // (never waited for: until it is built the draw uses the one-sided tolerance alone)
+        if (!have_var_keys) { var_vkey = st.last_vkey; var_fkey = st.last_fkey; }
+        var_fkey.glsl |= SHADER_KEY_GLSL_DEPTH_EQ;
+        Prog *eq = get_program(st.program, &var_vkey, &var_fkey);
+        if (eq && atomic_load(&eq->state) == 1 && eq->has_depth_eq) pr = eq;
+        else depth_eq_view = VK_NULL_HANDLE;
+    }
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
-    begin_pass();
+    begin_pass_mode(depth_eq_view);
     VkCommandBuffer cb = vk_cmd();
 
     uint32_t mode = (uint32_t)r->x[0];
@@ -5363,6 +5434,7 @@ static void draw_(CmdRec *r, bool indexed) {
     // ---- pipeline
     Pipe *pp;
     DynViState dvi;
+select_pipeline:
     if (st.last_pp && st.last_pipe_pr == pr && st.last_pipe_cls == cls && st.last_pass_gen == st.pass_gen &&
         !(st.dirty & (ST_PIPE | ST_VI))) {
         pp = (Pipe *)st.last_pp;
@@ -5436,6 +5508,13 @@ static void draw_(CmdRec *r, bool indexed) {
             } else {
                 run_job(build_pipeline, pp);
             }
+        }
+        if (depth_eq_view && atomic_load(&pp->state) != 1) {  // (the variant's pipeline: not waited for either)
+            depth_eq_view = VK_NULL_HANDLE;
+            pr = plain_pr;
+            begin_pass();
+            cb = vk_cmd();
+            goto select_pipeline;
         }
         if (!wait_built(&pp->state, &pp->waited_ns)) SKIP(SK_PIPE, "state %d\n", atomic_load(&pp->state));
         st.last_pipe_pr = pr;
@@ -5520,6 +5599,12 @@ static void draw_(CmdRec *r, bool indexed) {
     bool rev_z = depth_b && depth_b->depth_reversed;
     if (equal_tol) dop = rev_z ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_LESS_OR_EQUAL;
     if (ss_need(SS_DOP, ss.dop == dop)) { ss.dop = dop; vkCmdSetDepthCompareOp(cb, dop); }
+    if (depth_eq_view) {
+        static bool reported;
+        if (!reported) { reported = true; LOG("[vk] two-sided depth EQUAL active for emulated D24\n"); }
+    }
+    if (g_debug_frame && dop != VK_COMPARE_OP_ALWAYS && compare_fn(st.ds[2]) == VK_COMPARE_OP_EQUAL)
+        LOG("[draw]   depth EQUAL: two-sided %d\n", depth_eq_view != VK_NULL_HANDLE);
     bool sten = st.ds[3] && pass_stencil;
     if (ss_need(SS_STEN, ss.sten == (VkBool32)sten)) { ss.sten = sten; vkCmdSetStencilTestEnable(cb, sten); }
     if (sten) {
@@ -5971,6 +6056,26 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         LOG(" | strides:");
         for (int s = 0; s < st.nstream && s < 16; s++) if (st.stream[s][0]) LOG(" s%d=%u", s, st.stream[s][0]);
         LOG("\n");
+    }
+    if (getenv("LARECOMP_DEBUG_VSCB")) {  // (test, read by build/vseval) vertex uniform blocks c1, c3-c8 as raw bits
+        for (int c = 0; c < 6; c++) {
+            if (!st.ubuf[0][c].addr) continue;
+            const uint32_t *u = (const uint32_t *)(uintptr_t)st.ubuf[0][c].addr;
+            LOG("[draw]   vcb%d %llx:", c + 3, (unsigned long long)st.ubuf[0][c].addr);
+            for (int k = 0; k < 1024 && k * 4 < (int)st.ubuf[0][c].size; k++) LOG(" %08x", u[k]);
+            LOG("\n");
+        }
+        {   // c1: the compiler constants stored with the shader code (as cbuf_info binds them)
+            const NvnShaderStage *ss = &st.program->stages[0];
+            uint32_t n = ss->const_size ? ss->const_size : (pr->vi->cbuf_size[1] ? pr->vi->cbuf_size[1] : 16);
+            const uint32_t *u = ss->const_snap && n <= ss->const_snap_size ? (const uint32_t *)ss->const_snap
+                              : (const uint32_t *)(uintptr_t)(ss->code_addr + ss->const_offset);
+            LOG("[draw]   vcb1 const:");
+            for (uint32_t k = 0; k < 256 && k * 4 < n; k++) LOG(" %08x", u[k]);
+            LOG("\n");
+        }
+        LOG("[draw]   ib %llx count %llu base %lld vb0 %llx\n", (unsigned long long)(indexed ? r->x[3] : 0),
+            (unsigned long long)r->x[2], (long long)(indexed ? (int64_t)r->x[4] : 0), (unsigned long long)st.vbuf[0].addr);
     }
     if (getenv("LARECOMP_DEBUG_DATA")) {  // vertex streams 0-1 and fragment cbufs: the first floats
         for (int s = 0; s < 2; s++) {

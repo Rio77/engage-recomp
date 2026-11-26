@@ -16,6 +16,8 @@ import sys
 import time
 from collections import Counter
 
+import capstone
+from capstone import arm64_const as ARM64
 import unicorn as uc
 from unicorn import arm64_const as A
 
@@ -24,6 +26,10 @@ from lifter import Insn, Lifter, Unsupported, bits, emit_asm_batch, hx, sext
 from nso import Nso, R_AARCH64_RELATIVE
 
 SCRATCH_MEM = 0x7300000000
+GPR_ALIASES = tuple(
+    frozenset((getattr(ARM64, f'ARM64_REG_X{i}'), getattr(ARM64, f'ARM64_REG_W{i}')))
+    for i in range(31)
+)
 
 
 def sext26(w):
@@ -283,12 +289,23 @@ class Module:
     def computed_target(self, br_pc, entry):
         """True if the br register comes from address arithmetic (a table) rather than a load."""
         rn = bits(self.word(br_pc), 5, 5)
+        if rn == 31:
+            return False
+        decoder = getattr(self, '_branch_decoder', None)
+        if decoder is None:
+            decoder = self._branch_decoder = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+            decoder.detail = True
         a = br_pc - 4
         while a >= entry and br_pc - a <= 4 * 16:
             w = self.word(a)
             if self.lift(a).kind not in ('op', 'asm'):
                 return False
-            if (w & 31) == rn:
+            # Operand bits alone also name sources, SIMD registers and secondary
+            # destinations. Stop only at an actual write to the branch register.
+            insn = next(decoder.disasm(struct.pack('<I', w), a), None)
+            if insn is None:
+                return False
+            if GPR_ALIASES[rn].intersection(insn.regs_access()[1]):
                 if (w & 0x1F000000) == 0x0B000000:  # ADD/SUB (shifted or extended register)
                     return True
                 if (w & 0x9F000000) == 0x10000000:  # ADR
@@ -378,6 +395,13 @@ class Module:
         need_dispatch = all_labels or bool(resolved_targets)
         if all_labels:
             labels = set(range(entry, end, 4))
+            for site, targets in tables.items():
+                if targets == 'all':
+                    continue
+                for target in targets:
+                    if target not in labels:
+                        raise ValueError(f'{self.name}: switch {site:#x} in [{entry:#x}, {end:#x}) '
+                                         f'has no local label for {target:#x}')
         elif resolved_targets:
             labels = set(labels) | {t for t in resolved_targets if entry <= t < end}
         rando_here = [a for a in range(entry, end, 4) if a - self.base in VARIANTS]

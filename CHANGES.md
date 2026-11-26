@@ -1,5 +1,27 @@
 # Engage Recomp
 
+## 0.3.3
+
+- Césped y follaje: la comparación de profundidad `EQUAL` sobre `D24` emulado
+  en `D32_SFLOAT` pasa a tener tolerancia por los dos lados. La prueba de
+  hardware de 0.3.1 (`GEQUAL`/`LEQUAL` con sesgo) sigue descartando antes del
+  shader lo que queda oculto, y una variante del fragment shader consulta la
+  profundidad del píxel y descarta lo que queda claramente por delante
+  (`exec.c`, `translate.c`, `shader.h`). Corrige las copas opacas de Somniel
+  que dejaba 0.3.1 sin recuperar las briznas negras de Florra. El desajuste
+  está en los propios shaders: el pase de profundidad y el de color del césped
+  que se dobla redondean distinto (`fma(a, p, a)` frente a `a * fma(x, y, 1)`).
+  `ENGAGE_VK_EQUAL_BILATERAL=0` desactiva la variante.
+- Sommie: el generador clasifica los saltos indirectos según los registros que
+  cada instrucción escribe de verdad (Capstone), valida los destinos de cada
+  tabla y reemite los rangos grandes verificados, lo que corrige el cierre al
+  cuidar a Sommie (`gen.py`, `reemit_main_functions.py`).
+- El instalador y el lanzador comprueban el identificador de la biblioteca del
+  juego (`engage-031-switch-v2`) y la recompilan si no es compatible.
+- Pruebas: `make test-maxwell-depth-equal`, regresiones del generador y del
+  instalador, y grabación de la entrada del mando para repetir una sesión
+  (`ENGAGE_TEST_RECORD_FILE`).
+
 ## 0.3.1
 
 - Corrige el parpadeo negro en campos de flores y follaje con Reversed-Z

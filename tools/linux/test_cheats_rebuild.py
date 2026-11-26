@@ -121,11 +121,143 @@ class CheatsAndRebuildTests(unittest.TestCase):
             self.assertEqual((ws / 'engagegame.so.cheats').read_text(), '01a39f74 0b0107e0\n')
             self.assertTrue(out.is_file())
 
+    def test_resume_rebuilds_completed_legacy_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / 'bundle'
+            headers = bundle / 'gamelib-src'
+            headers.mkdir(parents=True)
+            (headers / 'gamelib_entry.c').write_text('int new_entry;')
+            exefs = root / 'exefs'
+            exefs.mkdir()
+            (exefs / 'main').write_bytes(b'NSO0')
+            workspace = root / 'cache'
+            generated = workspace / 'generated/main'
+            generated.mkdir(parents=True)
+            (generated / 'main_table.c').touch()
+            (workspace / 'build-meta.json').write_text('{"format": 1, "gamelib_id": "engage-030-perf"}')
+            entry = workspace / 'objects/entry.o'
+            entry.parent.mkdir()
+            entry.write_bytes(b'old')
+            generated_new = generated / 'main_new.c'
+
+            def run_tool(cmd, **kwargs):
+                if '--workspace' in cmd:
+                    generated_new.touch()
+                elif '-c' in cmd:
+                    Path(cmd[cmd.index('-o') + 1]).write_bytes(b'new')
+                elif '-shared' in cmd:
+                    Path(cmd[cmd.index('-o') + 1]).write_bytes(_dummy_elf64_so())
+
+            with mock.patch.dict('os.environ', ENGAGE_GAMELIB_RESUME='1'):
+                with mock.patch.object(engage_build.subprocess, 'run', side_effect=run_tool):
+                    engage_build.build(bundle, workspace, exefs, incremental=True)
+
+            self.assertTrue(generated_new.is_file())
+            self.assertEqual(entry.read_bytes(), b'new')
+
+    def test_install_worker_rebuilds_legacy_library(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / 'stage'
+            (stage / 'data/extracted').mkdir(parents=True)
+            exefs = root / 'exefs'
+            romfs = root / 'romfs'
+            exefs.mkdir()
+            romfs.mkdir()
+            old = root / 'old/engagegame.so'
+            old.parent.mkdir()
+            old.write_bytes(b'old library')
+            old.with_suffix('.so.id').write_text('engage-030-perf\n')
+            rebuilt = root / 'new/engagegame.so'
+            rebuilt.parent.mkdir()
+            rebuilt.write_bytes(b'new library')
+            rebuilt.with_suffix('.so.id').write_text(engage_build.GAMELIB_ID + '\n')
+
+            with mock.patch.object(app, 'build', return_value=rebuilt):
+                with mock.patch('sys.argv', ['app.py', '--worker', str(stage),
+                                             '--exefs', str(exefs), '--romfs', str(romfs),
+                                             '--reuse-gamelib', str(old)]):
+                    app.main()
+
+            installed = stage / 'data/extracted/engagegame.so'
+            self.assertEqual(installed.read_bytes(), b'new library')
+            self.assertEqual(installed.with_suffix('.so.id').read_text().strip(), engage_build.GAMELIB_ID)
+
+    def test_play_rebuilds_legacy_library_once_before_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'install'
+            library = root / 'extracted/engagegame.so'
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b'old')
+            id_file = library.with_suffix('.so.id')
+            id_file.write_text('engage-030-perf\n')
+            events = []
+
+            def fake_rebuild(install, *, interactive, launch_after):
+                self.assertEqual(install.root, root)
+                self.assertFalse(interactive)
+                self.assertTrue(launch_after)
+                events.append('rebuild')
+                id_file.write_text(engage_build.GAMELIB_ID + '\n')
+
+            def fake_popen(cmd, **kwargs):
+                self.assertEqual(cmd[-1], '--play')
+                self.assertTrue(engage_build.reusable_gamelib(library))
+                events.append('play')
+                proc = mock.Mock()
+                proc.wait.return_value = 0
+                return proc
+
+            with mock.patch.object(app, 'rebuild_gamelib', side_effect=fake_rebuild), \
+                 mock.patch.object(app.subprocess, 'Popen', side_effect=fake_popen), \
+                 mock.patch('sys.argv', ['app.py', '--play', '--noninteractive', '--root', str(root)]):
+                app.main()
+                app.main()
+
+            self.assertEqual(events, ['rebuild', 'play', 'play'])
+
+    def test_play_does_not_launch_after_failed_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'install'
+            library = root / 'extracted/engagegame.so'
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b'old')
+            library.with_suffix('.so.id').write_text('engage-030-perf\n')
+
+            error = RuntimeError('fixture build failed')
+            with mock.patch.object(app, 'rebuild_gamelib', side_effect=error), \
+                 mock.patch.object(app.subprocess, 'Popen') as popen, \
+                 mock.patch('sys.argv', ['app.py', '--play', '--noninteractive', '--root', str(root)]):
+                with self.assertRaisesRegex(RuntimeError, 'fixture build failed'):
+                    app.main()
+            popen.assert_not_called()
+
+    def test_play_keeps_compatible_symlinked_game_library(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            library = base / 'library.so'
+            library.write_bytes(b'shared')
+            root = base / 'install'
+            path = root / 'extracted/engagegame.so'
+            path.parent.mkdir(parents=True)
+            path.symlink_to(library)
+            path.with_suffix('.so.id').write_text(engage_build.GAMELIB_ID + '\n')
+            with mock.patch.object(app, 'rebuild_gamelib') as rebuild, \
+                 mock.patch.object(app.subprocess, 'Popen') as popen, \
+                 mock.patch('sys.argv', ['app.py', '--play', '--noninteractive', '--root', str(root)]):
+                popen.return_value.wait.return_value = 0
+                app.main()
+            rebuild.assert_not_called()
+            self.assertEqual(popen.call_args.args[0][-1], '--play')
+            self.assertTrue(path.is_symlink())
+
     def test_play_handles_exit_42_rebuild_and_stays_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'install'
             (root / 'extracted').mkdir(parents=True)
             (root / 'extracted/engagegame.so').write_bytes(b'SO')
+            (root / 'extracted/engagegame.so.id').write_text(engage_build.GAMELIB_ID + '\n')
             (root / 'cache').mkdir(parents=True)
 
             popens = []

@@ -25,6 +25,7 @@ def _setup_fake_extracted(root: Path):
     (extracted / 'romfs/Data/data.unity3d').write_bytes(b'unity3d')
     (extracted / 'romfs/Data/Managed/Metadata/global-metadata.dat').write_bytes(b'meta')
     (extracted / 'engagegame.so').write_bytes(b'so')
+    (extracted / 'engagegame.so.id').write_text(app.GAMELIB_ID + '\n')
     (extracted / 'mods').mkdir(exist_ok=True)
     (extracted / 'mods/test_mod.txt').write_text('keep-mod')
     (extracted / 'dlc/0100A6301214F001/romfs').mkdir(parents=True, exist_ok=True)

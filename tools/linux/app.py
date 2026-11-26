@@ -17,11 +17,11 @@ import textwrap
 import time
 import traceback
 import uuid
-from engage_build import build, save_incremental_cache
+from engage_build import GAMELIB_ID, build, reusable_gamelib, save_incremental_cache
 from install_core import Installation, atomic_json, digest, sync_dir
 from processes import stop_session
 
-VERSION = '0.3.1'
+VERSION = '0.3.3'
 BUNDLE = Path(__file__).resolve().parents[2] / 'bin'
 ES = os.environ.get('LANG', '').startswith('es')
 SHADER_CACHE_RESERVE = 512 * 1024**2
@@ -528,10 +528,8 @@ def install(args):
         if (installation.root / 'cheats.txt').is_file():
             command += ['--cheats', str(installation.root / 'cheats.txt')]
         existing_lib = installation.root / 'extracted/engagegame.so'
-        existing_id = installation.root / 'extracted/engagegame.so.id'
         if (not args.force and not (installation.root / 'cheats.txt').is_file()
-                and existing_lib.is_file() and not existing_lib.is_symlink()
-                and existing_id.is_file() and existing_id.read_text(encoding='ascii', errors='ignore').strip() == 'engage-030-perf'):
+                and reusable_gamelib(existing_lib)):
             command += ['--reuse-gamelib', str(existing_lib)]
         with log.open('w') as stream:
             process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
@@ -623,8 +621,8 @@ def _run_rebuild_worker(installation: Installation):
     save_incremental_cache(cache_build, cache_build)
 
 
-def rebuild_gamelib(installation: Installation, interactive: bool = True):
-    """Rebuild engagegame.so incrementally with cheats.txt and notify when finished (game stays closed)."""
+def rebuild_gamelib(installation: Installation, interactive: bool = True, *, launch_after: bool = False):
+    """Rebuild the local game library, optionally as part of starting the game."""
     log = installation.root / 'rebuild.log'
     command = [sys.executable, str(Path(__file__).resolve()), '--rebuild-worker', '--root', str(installation.root)]
     with log.open('w', encoding='utf-8') as stream:
@@ -632,8 +630,11 @@ def rebuild_gamelib(installation: Installation, interactive: bool = True):
         progress = None
         qdbus = shutil.which('qdbus6') or shutil.which('qdbus')
         if interactive:
-            message = tr('Recompilando el código del juego con cheats.txt. Registro: ',
-                         'Rebuilding game code with cheats.txt. Log: ') + str(log)
+            message = (tr('Actualizando el código del juego para esta versión. ',
+                          'Updating the game code for this version. ') if launch_after else
+                       tr('Recompilando el código del juego con cheats.txt. ',
+                          'Rebuilding game code with cheats.txt. '))
+            message += tr('Registro en ', 'Log at ') + str(log)
             progress = dialog('--progressbar', textwrap.fill(message, 72), '0').stdout.strip()
             if progress and qdbus:
                 subprocess.run([qdbus, *shlex.split(progress), 'showCancelButton', 'true'], capture_output=True)
@@ -646,7 +647,7 @@ def rebuild_gamelib(installation: Installation, interactive: bool = True):
                     with log.open('rb') as tail:
                         tail.seek(max(0, log.stat().st_size - 1024))
                         lines = tail.read().decode(errors='replace').splitlines()
-                    label = (lines[-1][:240] if lines else tr('Analizando cheats.txt…', 'Checking cheats.txt…'))
+                    label = lines[-1][:240] if lines else tr('Preparando la compilación…', 'Preparing the build…')
                     subprocess.run([qdbus, *shlex.split(progress), 'setLabelText',
                         textwrap.fill(label, 72) + '\n' + textwrap.fill(str(log), 72)], capture_output=True)
                 time.sleep(0.5)
@@ -657,7 +658,7 @@ def rebuild_gamelib(installation: Installation, interactive: bool = True):
                 stop_session(process)
             if progress and qdbus:
                 subprocess.run([qdbus, *shlex.split(progress), 'close'], capture_output=True)
-    if interactive:
+    if interactive and not launch_after:
         dialog('--msgbox', tr(
             'Compilación finalizada. Se aplicaron los cheats de cheats.txt. Ya podés volver a abrir Engage Recomp.',
             'Compilation finished. Cheats from cheats.txt were applied. You can launch Engage Recomp again now.'
@@ -682,10 +683,10 @@ def main():
             print('Copying DLC', flush=True)
             copy_dlc(validate_dlc(args.dlc), staged / 'dlc')
         reuse = getattr(args, 'reuse_gamelib', None)
-        if reuse and reuse.is_file() and not reuse.is_symlink():
+        if reuse and reusable_gamelib(reuse):
             print('Reusing verified game library', flush=True)
             shutil.copy2(reuse, staged / 'engagegame.so')
-            (staged / 'engagegame.so.id').write_text('engage-030-perf\n')
+            (staged / 'engagegame.so.id').write_text(GAMELIB_ID + '\n')
         else:
             print('Generating and compiling game library', flush=True)
             cheats_path = getattr(args, 'cheats', None)
@@ -714,8 +715,14 @@ def main():
                 'Choose FPS in game: F1 → Video → Frame rate.'))
             return
         extracted = installation.root / 'extracted'
-        if not (extracted / 'engagegame.so').is_file():
+        library = extracted / 'engagegame.so'
+        if not library.is_file():
             raise ValueError(tr('Primero ejecutá el instalador para esta carpeta.', 'Run the installer for this folder first.'))
+        if not reusable_gamelib(library, allow_symlink=True):
+            rebuild_gamelib(installation, interactive=not args.noninteractive, launch_after=True)
+            if not reusable_gamelib(library, allow_symlink=True):
+                raise RuntimeError(tr('La compilación no produjo una biblioteca compatible. Consultá rebuild.log.',
+                                      'The build did not produce a compatible library. See rebuild.log.'))
         rebuild_marker = installation.root / '.rebuild-requested'
         rebuild_marker.unlink(missing_ok=True)
         env = _mesa_cache_env(installation.root)

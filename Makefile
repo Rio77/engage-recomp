@@ -327,7 +327,7 @@ appimages:
 smoketest:
 	tools/linux/smoketest.sh
 
-.PHONY: dmg all gen gen-main gen-helper gen-objs runtime-objs deps deps-windows app dist rando-helper appimage appimages smoketest test-nvn test-nvn-sanitizers
+.PHONY: dmg all gen gen-main gen-helper gen-objs runtime-objs deps deps-windows app dist rando-helper appimage appimages smoketest test-nvn test-nvn-sanitizers test-maxwell-depth-equal
 
 NVN_TEST_PHASE ?= 5
 NVN_TEST_CFLAGS := -O2 -g -fno-strict-aliasing -ffunction-sections -fdata-sections -Iruntime -Iruntime/nvn $(OSFLAGS) -DNVN_TEST_PHASE=$(NVN_TEST_PHASE)
@@ -351,6 +351,11 @@ test-nvn:
 	$(B)/nvn-tests/test_texture_identity
 	$(B)/nvn-tests/fuzz_nvn_lifecycle
 	$(B)/nvn-tests/test_nvn_stress_threads
+
+test-maxwell-depth-equal:
+	@mkdir -p $(B)/nvn-tests
+	$(CC) $(NVN_TEST_CFLAGS) -Iruntime/nvn/maxwell tools/test_maxwell_depth_equal.c runtime/nvn/maxwell/translate.c $(wildcard runtime/nvn/maxwell/scf*.c) -Wl,--gc-sections -lm -o $(B)/nvn-tests/test_maxwell_depth_equal
+	$(B)/nvn-tests/test_maxwell_depth_equal
 
 test-nvn-sanitizers:
 	@mkdir -p $(B)/nvn-san

@@ -279,7 +279,7 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
             int a = (addr - 0x80) >> 4, comp = (addr >> 2) & 3;
             // (MSL: a mask of 0 means unknown. GLSL: the renderer always passes the vertex shader's outputs, and
             // Vulkan requires every fragment input to be a vertex output, so 0 means none.)
-            if (c->key && (c->key->vs_out_mask || c->key->glsl) && !(c->key->vs_out_mask & (1u << a))) {
+            if (c->key && (c->key->vs_out_mask || c->glsl) && !(c->key->vs_out_mask & (1u << a))) {
                 strcpy(e, comp == 3 ? "0x3f800000u" : "0u");  // not provided by the vertex shader
             } else {
                 c->in_attr_mask |= 1u << a;
@@ -1956,6 +1956,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int size = (int)bits(w, 48, 3);
         int64_t off = sbits(w, 20, 24);
         c->info->uses_gmem = true;
+        if (c->glsl && store) c->uses_gmem_store = c->info->uses_gmem_store = true;
         char addr[256];
         if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
         else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
@@ -1994,8 +1995,6 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                         }
                 }
             } else {
-                c->uses_gmem_store = true;
-                c->info->uses_gmem_store = true;
                 if (size < 4) {
                     uint32_t m = size < 2 ? 0xFFu : 0xFFFFu;
                     const char *bm = size < 2 ? "3ul" : "2ul";
@@ -2025,7 +2024,6 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                         }
                 }
             } else {
-                c->uses_gmem_store = true;
                 if (size < 4)
                     sp(&c->body, "      if (ok) { uint wi = uint(ga >> 2); uint sh = uint(ga & %s) * 8u; atomicAnd(gmem_.w[wi], ~(0x%xu << sh)); "
                        "atomicOr(gmem_.w[wi], (%s & 0x%xu) << sh); }\n", size < 2 ? "3ul" : "2ul", size < 2 ? 0xFFu : 0xFFFFu, R(d),
@@ -2592,6 +2590,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     ShaderInfo *info = c->info;
     const ShaderKey *key = c->key;
     int stage = c->stage;
+    bool depth_eq = stage == STAGE_FRAGMENT && key && (key->glsl & SHADER_KEY_GLSL_DEPTH_EQ);
+    if (depth_eq && c->omap_depth) fail(c, "bilateral depth test requires an unmodified fragment depth");
+    if (depth_eq && c->uses_gmem_store) fail(c, "bilateral depth test cannot preserve guest memory writes");
     Str body = {0};
     glsl_rewrite(c, &body, c->body.buf ? c->body.buf : "");
     if (info->uses_gmem && (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX))) fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
@@ -2602,7 +2603,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};
     sp(&s, "%s", glsl_prelude);
-    if (c->uses_demote) sp(&s, "#extension GL_EXT_demote_to_helper_invocation : require\n");
+    if (c->uses_demote || depth_eq) sp(&s, "#extension GL_EXT_demote_to_helper_invocation : require\n");
     bool native_half = getenv("FE3H_NATIVE_HALF") && (stage == STAGE_FRAGMENT || stage == STAGE_COMPUTE);
     sp(&s, "%s%s", native_half ? glsl_h2f_native : getenv("FE3H_BRANCHLESS_HALF") ? glsl_h2f_branchless : glsl_h2f_exact, glsl_prelude_half);
     if (maxwell_glsl_denorm_preserve)  // (the declaration only brings in the DenormPreserve capability)
@@ -2636,6 +2637,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "layout(std140, set = %d, binding = 19) uniform Tint { vec4 ltint[2]; };\n", set);
         info->uses_tint = true;
     }
+    if (depth_eq)
+        sp(&s, "layout(set = 1, binding = %d) uniform sampler2D depth_eq_tex_;\n", DEPTH_EQ_BINDING);
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
         if (t->is_image) {  // (SUST: a storage image, written without a declared format)
@@ -2690,6 +2693,21 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (c->uses_shared) sp(&s, "shared uint smem[%d];\n", SMEM_WORDS);
     }
     sp(&s, "void main() {\n");
+    if (depth_eq) {
+        // Explicit fetch does not depend on derivatives. Demotion rejects the sample while keeping quad lanes
+        // available for the guest shader's later implicit texture LOD and gradient calculations.
+        // Tolerance: two 24-bit depth steps (the hardware test's bias, which gl_FragCoord.z includes, is one step where
+        // the guest enables polygon offset, plus the shaders' own difference) or 32 float ULPs (16 ULP bias otherwise).
+        sp(&s, "  {\n"
+               "    ivec2 pixel_ = ivec2(floor(gl_FragCoord.xy));\n"
+               "    ivec2 bounded_ = clamp(pixel_, ivec2(0), textureSize(depth_eq_tex_, 0) - ivec2(1));\n"
+               "    float z_buf_ = texelFetch(depth_eq_tex_, bounded_, 0).r;\n"
+               "    float z_ = gl_FragCoord.z;\n"
+               "    float z_eps_ = max(32.0 * min(abs(z_), 1.0) * 1.1920929e-7, 2.0 / 16777215.0);\n"
+               "    if (any(notEqual(pixel_, bounded_)) || !(abs(z_ - z_buf_) <= z_eps_)) demote;\n"
+               "  }\n");
+        info->uses_discard = true;
+    }
     if (stage == STAGE_VERTEX) {
         sp(&s, "  gl_Position = vec4(0, 0, 0, 1);\n");
         for (int i = 0; i < 32; i++)
@@ -2971,7 +2989,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     c->key = key;
     c->stage = stage;
     c->ipa_mode = -1;
-    c->glsl = key && key->glsl;
+    c->glsl = key && (key->glsl & SHADER_KEY_GLSL_BIT);
     const uint8_t *sph = blob + 0x30;
     const uint8_t *code = blob + 0x80;
     // compute programs have neither the 0x30-byte NVN header nor an SPH: code starts at the blob

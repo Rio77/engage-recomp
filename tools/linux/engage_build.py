@@ -10,7 +10,16 @@ import struct
 import re
 import time
 
-GAMELIB_ID = 'engage-030-perf'
+GAMELIB_ID = 'engage-031-switch-v2'
+
+
+def reusable_gamelib(path: Path, *, allow_symlink: bool = False) -> bool:
+    if (not allow_symlink and path.is_symlink()) or not path.is_file():
+        return False
+    try:
+        return path.with_suffix('.so.id').read_text(encoding='ascii').strip() == GAMELIB_ID
+    except (OSError, UnicodeError):
+        return False
 
 
 def _sha256_file(path: Path) -> str:
@@ -121,6 +130,9 @@ def build(bundle: Path, workspace: Path, exefs: Path, cheats_path: Path | None =
 
     main_sha = _sha256_file(exefs / 'main')
     meta_path = workspace / 'build-meta.json'
+    # Completed caches may have pruned sources and contain objects from an older generator.
+    # The manual resume path applies only to a build interrupted before writing metadata.
+    resume = resume and not meta_path.exists()
     chunks_meta_path = workspace / 'generated/main/main_chunks.json'
     variants_txt = workspace / 'generated/main/cheat_variants.txt'
     can_incremental = False
@@ -232,10 +244,7 @@ def build(bundle: Path, workspace: Path, exefs: Path, cheats_path: Path | None =
 
     t_comp = time.monotonic()
     output = workspace / 'engagegame.so'
-    if can_incremental and not jobs and existing_so and existing_so.is_file() and (
-        existing_so.with_suffix('.so.id').is_file()
-        and existing_so.with_suffix('.so.id').read_text(encoding='ascii', errors='ignore').strip() == GAMELIB_ID
-    ):
+    if can_incremental and not jobs and existing_so and reusable_gamelib(existing_so):
         output = existing_so
     elif not (can_incremental and not jobs and output.is_file()):
         temporary = output.with_suffix('.so.tmp')

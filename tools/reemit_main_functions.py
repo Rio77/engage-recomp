@@ -81,10 +81,22 @@ def split_switches(module, generated):
         next_index = bisect_right(entries, begin)
         if next_index == len(entries) or entries[next_index] >= end:
             continue
+        branches = (pc for pc in range(begin, end, 4)
+                    if (module.word(pc) & 0xFFFFFC1F) == 0xD61F0000)
         if end - begin >= module.SPLIT_AT and start not in LARGE_EXTENTS:
-            continue
-        if any((module.word(pc) & 0xFFFFFC1F) == 0xD61F0000 and module.computed_target(pc, begin)
-               for pc in range(begin, end, 4)):
+            # Re-emitting a large extent can duplicate code. Require a verified
+            # table with a target that cannot be reached through its current slice.
+            if entries[next_index] - begin >= module.SPLIT_ALL_LABELS_AT:
+                continue
+            for pc in branches:
+                owner_index = bisect_right(entries, pc)
+                owner_end = entries[owner_index] if owner_index < len(entries) else module.hi
+                owner_begin = entries[owner_index - 1]
+                targets = module.jump_table(pc, begin, end)
+                if targets and any(t not in entry_set and not owner_begin <= t < owner_end for t in targets):
+                    switches[begin] = end
+                    break
+        elif any(module.computed_target(pc, begin) or module.jump_table(pc, begin, end) for pc in branches):
             switches[begin] = end
     if not {BASE + start for start in KNOWN_EXTENTS} <= switches.keys():
         raise ValueError("Expected split switch was not discovered")

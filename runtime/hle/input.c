@@ -6,6 +6,7 @@
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -433,6 +434,69 @@ static void host_test_frame(uint64_t frame) {
     }
 }
 
+// ENGAGE_TEST_RECORD_FILE=<path>: record what the player does on the controller / keyboard (the host input, not the
+// test script) as an ENGAGE_TEST_INPUT_FILE / LARECOMP_INPUT script: "frame:BUTTON:length,..." on one line, frames
+// counted like the replay (presented frames). The file is rewritten each time an input ends, so it is complete
+// whenever the game is closed. Sticks are kept as directions: the left stick as STICK_<angle> (15 degree steps, full
+// tilt), the right stick as RSTICK_UP/DOWN/LEFT/RIGHT. Input while the overlay menu has the controls is not recorded.
+extern bool menu_input_captured(void);  // runtime/ui/menu.mm
+static void record_frame(uint64_t frame) {
+    static const char *path;
+    static int init;
+    if (!init) { init = 1; path = getenv("ENGAGE_TEST_RECORD_FILE"); if (path) LOG("[input] recording to %s\n", path); }
+    if (!path) return;
+    static const char *const names[] = {"A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R", "ZL", "ZR", "PLUS",
+                                        "MINUS", "LEFT", "UP", "RIGHT", "DOWN"};
+    enum { NCH = 18 };
+    static char cur[NCH][24];
+    static uint64_t since[NCH];
+    static char *out;
+    static size_t len, cap;
+    char now[NCH][24];
+    memset(now, 0, sizeof now);
+    if (!menu_input_captured()) {
+        uint64_t b = (key_buttons | pad_buttons | mouse_buttons) & 0xFFFF;
+        for (int i = 0; i < 16; i++) if (b >> i & 1) snprintf(now[i], sizeof now[i], "%s", names[i]);
+        int32_t lx = key_lx + pad_lx, ly = key_ly + pad_ly, rx = key_rx + pad_rx, ry = key_ry + pad_ry;
+        if ((int64_t)lx * lx + (int64_t)ly * ly > 12000ll * 12000) {
+            int deg = (int)lround(atan2(ly, lx) * 180 / 3.14159265358979 / 15) * 15;
+            snprintf(now[16], sizeof now[16], "STICK_%d", (deg + 360) % 360);
+        }
+        if (abs(rx) > 12000 || abs(ry) > 12000)
+            snprintf(now[17], sizeof now[17], "%s", abs(rx) > abs(ry) ? (rx > 0 ? "RSTICK_RIGHT" : "RSTICK_LEFT")
+                                                                       : (ry > 0 ? "RSTICK_UP" : "RSTICK_DOWN"));
+    }
+    bool wrote = false;
+    for (int i = 0; i < NCH; i++) {
+        if (!strcmp(now[i], cur[i])) continue;
+        if (cur[i][0]) {
+            char tok[64];
+            int n = snprintf(tok, sizeof tok, "%s%llu:%s:%llu", len ? "," : "", (unsigned long long)since[i], cur[i],
+                             (unsigned long long)(frame - since[i]));
+            if (len + (size_t)n + 1 > cap) {
+                size_t ncap = cap ? cap * 2 : 4096;
+                char *no = realloc(out, ncap);
+                if (!no) return;
+                out = no, cap = ncap;
+            }
+            memcpy(out + len, tok, (size_t)n + 1);
+            len += (size_t)n;
+            wrote = true;
+        }
+        memcpy(cur[i], now[i], sizeof cur[i]);
+        since[i] = frame;
+    }
+    if (wrote) {
+        char tmp[1024];
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        FILE *f = fopen(tmp, "w");
+        if (f) {
+            fprintf(f, "%s\n", out);
+            if (fclose(f) == 0) rename(tmp, path);
+        }
+    }
+}
+
 static uint64_t g_pad_obj;
 volatile int g_inject_plus;  // frames to hold Plus for the game (movie.c: A/B skip the opening on rando seeds)
 RT_ON_RESET(input_reboot_reset) { g_pad_obj = 0; g_inject_plus = 0; }  // (reboot: the controller object was guest memory)
@@ -453,10 +517,11 @@ void input_frame(uint64_t frame) {
     extern void watch_arm(void);
     watch_arm();
     host_test_frame(frame);
+    record_frame(frame);
     const char *spec = getenv("LARECOMP_INPUT");
     const char *script_path = getenv("ENGAGE_TEST_INPUT_FILE");
     if (script_path) {
-        static char live_script[4096];
+        static char live_script[65536];  // (recorded sessions: record_frame below)
         if (frame % 15 == 0) {
             FILE *file = fopen(script_path, "r");
             live_script[0] = 0;
@@ -472,7 +537,7 @@ void input_frame(uint64_t frame) {
                                         "MINUS", "LEFT", "UP", "RIGHT", "DOWN"};
     uint64_t b = 0;
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
-    static char buf[16384];  // (long scripted sessions: the perf walk is ~4 KB)
+    static char buf[65536];  // (long scripted sessions: the perf walk is ~4 KB, recorded sessions more)
     snprintf(buf, sizeof buf, "%s", spec);
     for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
         unsigned long start = 0, len = 10;

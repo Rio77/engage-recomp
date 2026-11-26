@@ -36,6 +36,10 @@ enum { STAGE_VERTEX = 0, STAGE_FRAGMENT = 1, STAGE_GEOMETRY = 2, STAGE_TESS_CTRL
 enum { TEXTYPE_1D, TEXTYPE_2D, TEXTYPE_3D, TEXTYPE_CUBE, TEXTYPE_2D_ARRAY, TEXTYPE_CUBE_ARRAY, TEXTYPE_1D_ARRAY,
        TEXTYPE_BUFFER, TEXTYPE_2D_MS };
 
+#define SHADER_KEY_GLSL_BIT      0x01u
+#define SHADER_KEY_GLSL_DEPTH_EQ 0x02u
+#define DEPTH_EQ_BINDING 22
+
 typedef struct {
     uint8_t attr_kind[32];  // vertex inputs: 0 float, 1 signed int, 2 unsigned int
     uint8_t rt_kind[8];     // fragment outputs: 0 float, 1 signed int, 2 unsigned int
@@ -47,7 +51,7 @@ typedef struct {
     // read from the guest heap (gmem) - see glsl_buffer_fetch. A bit mask over buf_mask0..3, in padding bytes as flip_x.
     uint8_t buf_mask0;
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
-    uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
+    uint8_t glsl;           // SHADER_KEY_GLSL_* flags; ordinary GLSL keys retain the value 1
     uint8_t buf_mask1, buf_mask2, buf_mask3;
 } ShaderKey;
 _Static_assert(sizeof(ShaderKey) == 52, "ShaderKey: new fields only in padding (cached program hashes)");
