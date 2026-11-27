@@ -21,7 +21,7 @@ from engage_build import GAMELIB_ID, build, reusable_gamelib, save_incremental_c
 from install_core import Installation, atomic_json, digest, sync_dir
 from processes import stop_session
 
-VERSION = '0.3.3'
+VERSION = '0.3.4'
 BUNDLE = Path(__file__).resolve().parents[2] / 'bin'
 ES = os.environ.get('LANG', '').startswith('es')
 SHADER_CACHE_RESERVE = 512 * 1024**2

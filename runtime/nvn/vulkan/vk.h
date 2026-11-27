@@ -92,7 +92,8 @@ typedef struct TexBackend {
     bool depth_reversed;  // depth clear/write direction inferred for D24-as-float EQUAL tolerance
     uint64_t touched_frame, frame_cleared;
     uint32_t level_gen;
-    float sx, sy;
+    float sx, sy;          // allocated size / guest size (what drawing and sampling scale by: textures.c create_image)
+    float req_sx, req_sy;  // the output scale it was made for (renderer_set_scale): a change reallocates it
     void *pending_rgba;  // host-produced pixels (video) waiting to be uploaded on the render thread
     uint32_t pending_w, pending_h, pending_stride;
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
@@ -101,6 +102,7 @@ typedef struct TexBackend {
     uint32_t tp_gen;     // texpatch_generation() it was last uploaded with
     int reg;  // slot in textures.c's live list + 1 (a reboot destroys them all)
     VkFormat storage_fmt;  // NVN image textures (compute stores): the view format for that, else VK_FORMAT_UNDEFINED
+    VkImageUsageFlags guest_usage;  // usage of the current guest image, including any allocation fallback
 } TexBackend;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)

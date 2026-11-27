@@ -36,16 +36,22 @@ static void dyn_update(double now, double gpu_ms) {
     g_dyn_dt_sum = g_dyn_gpu_sum = 0;
     g_dyn_n = g_dyn_gpu_n = 0;
     if (now < g_dyn_cool_until) return;
+    static int fps_aware = -1;
+    if (fps_aware < 0) fps_aware = !getenv("ENGAGE_DYNRES_FPS_AWARE") || atoi(getenv("ENGAGE_DYNRES_FPS_AWARE")) != 0;
+    bool is30 = fps_aware && g_settings.engage_fps == 30;
     double prev = g_dyn;
-    bool slow = avg_dt > 17.4 || (avg_gpu >= 0 && avg_gpu > 14.5);
+    bool slow = is30
+        ? (avg_dt > 34.8 || (avg_gpu >= 0 && avg_gpu > 29.0))
+        : (avg_dt > 17.4 || (avg_gpu >= 0 && avg_gpu > 14.5));
     if (slow) {
-        g_dyn = fmax(0.5, g_dyn - (avg_dt > 22 ? 0.1 : 0.05));
+        g_dyn = fmax(0.5, g_dyn - (avg_dt > (is30 ? 44.0 : 22.0) ? 0.1 : 0.05));
         g_dyn_good = 0;
         if (now - g_dyn_last_raise < 3.0) g_dyn_probe_wait = fmin(g_dyn_probe_wait * 2, 60.0);  // raised too eagerly
     } else if (g_dyn < 1.0) {
         g_dyn_good++;
         // with GPU timing: raise when there is clear headroom; without (Vulkan): probe upwards now and then
-        bool room = avg_gpu >= 0 ? avg_gpu < 10.5 && g_dyn_good >= 4 : now >= g_dyn_probe_at && g_dyn_good >= 2 * (int)g_dyn_probe_wait;
+        double gpu_room = is30 ? 21.0 : 10.5;
+        bool room = avg_gpu >= 0 ? avg_gpu < gpu_room && g_dyn_good >= 4 : now >= g_dyn_probe_at && g_dyn_good >= 2 * (int)g_dyn_probe_wait;
         if (room) { g_dyn = fmin(1.0, g_dyn + 0.05); g_dyn_good = 0; g_dyn_last_raise = now; g_dyn_probe_at = now + g_dyn_probe_wait; }
     }
     g_dyn = round(g_dyn * 20) / 20;
@@ -56,6 +62,31 @@ static void dyn_update(double now, double gpu_ms) {
 }
 
 double output_scale_dynamic_factor(void) { return g_dyn; }
+
+bool output_integer_viewport(unsigned rw, unsigned rh, float crop[4], double *vx, double *vy, double *vw, double *vh) {
+    if (g_settings.upscaler != UPSCALE_INTEGER || g_settings.res_mode == RES_DYNAMIC) return false;
+    // Select texels whose centers lie inside the intended crop, then align the UVs to their edges.
+    int x0 = (int)ceil((double)crop[0] * rw - 0.5);
+    int y0 = (int)ceil((double)crop[1] * rh - 0.5);
+    int cw = (int)ceil(((double)crop[0] + crop[2]) * rw - 0.5) - x0;
+    int ch = (int)ceil(((double)crop[1] + crop[3]) * rh - 0.5) - y0;
+    if (cw <= 0 || ch <= 0) return false;
+    // Round the viewport edges to device pixels before distributing the unused space.
+    int left = (int)lround(*vx), top = (int)lround(*vy);
+    int width = (int)lround(*vx + *vw) - left, height = (int)lround(*vy + *vh) - top;
+    int kx = width / cw, ky = height / ch;
+    int k = kx < ky ? kx : ky;
+    if (k < 1) return false;
+    *vx = left + (width - cw * k) / 2;
+    *vy = top + (height - ch * k) / 2;
+    *vw = cw * k;
+    *vh = ch * k;
+    crop[0] = (float)x0 / rw;
+    crop[1] = (float)y0 / rh;
+    crop[2] = (float)cw / rw;
+    crop[3] = (float)ch / rh;
+    return true;
+}
 
 void output_scale(double dw, double dh, bool reshape_allowed, double now, double gpu_ms, OutScale *o) {
     double fit = fmin(dw / 1920.0, dh / 1080.0);

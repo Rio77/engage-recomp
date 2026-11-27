@@ -23,6 +23,7 @@ cache/
 hosts.yml
 cheats.txt
 *.so.cheats
+Amiibo/
 .rebuild-requested
 core
 core.*

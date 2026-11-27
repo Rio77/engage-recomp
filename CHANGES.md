@@ -1,5 +1,11 @@
 # Engage Recomp
 
+## 0.3.4
+
+- Amiibo (`nfp:user` / `nfp:IUser`): evita el cierre en el altar de Somniel al no haber ningún amiibo seleccionado y añade soporte de amiibos virtuales desde la carpeta `<data_root>/Amiibo/` (auto-creada al iniciar/instalar) con selector desplegable en **F1 → Game → Amiibo**, manteniendo la selección armada hasta completarse la lectura en el altar (`ENGAGE_NFP_AMIIBO=0` desactiva la detección).
+- Mejoras portadas de FE3H Recomp (`v0.2.6`–`v0.3.0`): pre-pass de post-proceso antes del render pass de swapchain (`ENGAGE_POST_PREPASS=0`), escalado exacto de texturas (`LARECOMP_EXACT_SCALE=0`), umbrales de resolución dinámica a 30 FPS (`ENGAGE_DYNRES_FPS_AWARE=0`), restricción `VkImageViewUsageCreateInfo` en vistas sRGB (`ENGAGE_SRGB_VIEW_USAGE=0`), Integer Scaling (`UPSCALE_INTEGER`), auto-selección de PulseAudio en Game Mode con fallback SDL (`ENGAGE_AUDIO_AUTO_PULSE=0`), resolución absoluta de `cheats.txt` vía `rt_data_root()` y desactivación por defecto de la heurística `vk_pace_frame` (`LARECOMP_PACE=1`).
+- Pruebas: `make test-nfp` y `make test-settings`.
+
 ## 0.3.3
 
 - Césped y follaje: la comparación de profundidad `EQUAL` sobre `D24` emulado

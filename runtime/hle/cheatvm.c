@@ -20,6 +20,7 @@
 #include "../guest_mem.h"
 #include "cheatvm.h"
 #include "../gamebuild.h"
+#include "../paths.h"
 
 #define MAX_CHEATS 128
 #define MAX_WORDS 1024
@@ -118,8 +119,11 @@ static void load(void) {
             g_var[g_nvar].addr = 0x7000000000ull + off, g_var[g_nvar++].word = w;
         fclose(f);
     }
-    f = fopen(CHEATS_FILE, "r");
-    if (!f) { LOG("[cheats] no %s: no cheats\n", CHEATS_FILE); return; }
+    char cheats_path[1200];
+    snprintf(cheats_path, sizeof cheats_path, "%s/%s", rt_data_root(), CHEATS_FILE);
+    f = fopen(cheats_path, "r");
+    if (!f) f = fopen(CHEATS_FILE, "r");
+    if (!f) { LOG("[cheats] no %s (tried %s): no cheats\n", CHEATS_FILE, cheats_path); return; }
     char line[1024];
     Cheat *c = NULL;
     while (fgets(line, sizeof line, f)) {

@@ -7,6 +7,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#define access _access
+#define R_OK 4
+#else
+#include <unistd.h>
+#endif
 
 #include "gamelib.h"
 #include "paths.h"
@@ -318,11 +325,15 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     {   // the cheats' code patches are compiled in (tools/cheats.py): the player's cheats.txt in the data folder
         char cheats[1100];
         snprintf(cheats, sizeof cheats, "%s" SEP "cheats.txt", rt_data_root());
+        bool has_cheats = access(cheats, R_OK) == 0;
 #ifdef _WIN32
-        _putenv_s("LARECOMP_CHEATS", cheats);
+        if (has_cheats) _putenv_s("LARECOMP_CHEATS", cheats);
+        else _putenv_s("LARECOMP_CHEATS", "");
 #else
-        setenv("LARECOMP_CHEATS", cheats, 1);
+        if (has_cheats) setenv("LARECOMP_CHEATS", cheats, 1);
+        else unsetenv("LARECOMP_CHEATS");
 #endif
+        LOG("[gamebuild] cheats: %s\n", has_cheats ? cheats : "(none)");
     }
     for (int i = 0; i < NGEN && ok; i++) {
         Gen *g = &gens[i];

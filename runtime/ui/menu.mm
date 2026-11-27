@@ -27,6 +27,8 @@ extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.c
 
 extern "C" {
 #include "../hle.h"
+#include "../paths.h"
+#include "../services/nfp.h"
 #include "../settings.h"
 #include "../engage_timing.h"
 #include "menu.h"
@@ -81,6 +83,7 @@ static void set_open(bool open) {
     input_reset();  // nothing held while the menu had focus leaks into the game
     bind_capture_cancel();
     if (open) {
+        nfp_rescan_amiibos();
         save_editor_on_open();
         static bool opened;  // the controller's cursor: the first tab (Controls) the first time this session, later the
         menu_tabs_focus(!opened);  // selected one
@@ -496,24 +499,32 @@ static void tab_display(void) {
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
         if (opt_choice("Internal resolution", &ri, res, NRES, RES_MATCH_AT, d, false)) g_settings.res_mode = res_mode[ri];
     }
-    {   // each OS's own upscaler next to bilinear (UPSCALE_SHARP: MetalFX on macOS, AMD FSR 1 on Windows)
+    {   // The default is MetalFX on macOS and AMD FSR 1 elsewhere.
+        constexpr int up_default = 2;
 #ifdef __APPLE__
-        static const char *ups[] = {"Bilinear", "MetalFX"};
+        static const char *ups[] = {"None - Bilinear", "Integer Scaling", "MetalFX"};
+        static const int upv[] = {UPSCALE_BILINEAR, UPSCALE_INTEGER, UPSCALE_METALFX};
         const char *ud = "How the image is scaled up to the window when it renders at a lower resolution. MetalFX: Apple's "
-                         "upscaler, sharper. Bilinear: plain and soft.";
+                         "upscaler, sharper. Integer Scaling: whole-number zoom with black borders for sharp pixels. "
+                         "Bilinear: smooths between pixels.";
 #else
-        static const char *ups[] = {"Bilinear", "AMD FSR 1"};
+        static const char *ups[] = {"None - Bilinear", "Integer Scaling", "AMD FSR 1"};
+        static const int upv[] = {UPSCALE_BILINEAR, UPSCALE_INTEGER, UPSCALE_FSR1};
         const char *ud = "How the image is scaled up to the window when it renders at a lower resolution. AMD FSR 1: "
-                         "edge-aware upscaling and sharpening, sharper. Bilinear: plain and soft.";
+                         "edge-aware upscaling and sharpening. Integer Scaling: whole-number zoom with black borders for "
+                         "sharp, even pixels (falls back to smooth scaling with Dynamic resolution or downsampling). "
+                         "Bilinear: smooths between pixels.";
 #endif
-        int ui = g_settings.upscaler == UPSCALE_BILINEAR ? 0 : 1;
+        int ui = up_default;
+        for (int i = 0; i < 3; i++)
+            if (g_settings.upscaler == upv[i]) { ui = i; break; }
         char udm[512];
         if (g_settings.res_mode == RES_MATCH) {  // (renders at the window's size: nothing to scale up)
             snprintf(udm, sizeof udm, "%s\n\nNot used at Match display: the game already renders at your display's resolution.", ud);
             ud = udm;
             opt_disable_next();
         }
-        if (opt_choice("Upscaler", &ui, ups, 2, 1, ud)) g_settings.upscaler = ui ? UPSCALE_SHARP : UPSCALE_BILINEAR;
+        if (opt_choice("Upscaler", &ui, ups, 3, up_default, ud)) g_settings.upscaler = upv[ui];
     }
     static const char *aa[] = {"Off", "SMAA"};
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
@@ -606,6 +617,45 @@ static void tab_game(void) {
                    "The console language the game is told, which picks its text language (the voice language is in "
                    "the game's own settings). Restart the game after changing."))
         settings_save();
+    // Amiibo (Amiibo/ folder next to the game): runtime/services/nfp.c
+    opt_section("Amiibo");
+    {
+        static NfpAmiiboInfo amiibos[NFP_MAX_ENTRIES];
+        static uint64_t amiibo_gen = 0;
+        NfpUiState ast;
+        nfp_ui_snapshot(amiibos, NFP_MAX_ENTRIES, &amiibo_gen, &ast);
+
+        const char *anames[NFP_MAX_ENTRIES + 1];
+        anames[0] = "None";
+        for (int i = 0; i < ast.count; i++) anames[1 + i] = amiibos[i].name;
+
+        char adesc[768];
+        if (ast.count == 0) {
+            snprintf(adesc, sizeof adesc,
+                     "No valid Amiibo .bin files found.\n\n"
+                     "Place compatible .bin dumps inside:\n%s/Amiibo/\n"
+                     "then reopen this menu to pick one. Visiting the Somniel gazebo with None selected is safe.",
+                     rt_data_root());
+        } else if (ast.selected_ui == 0) {
+            snprintf(adesc, sizeof adesc,
+                     "Choose a compatible Amiibo .bin from %s/Amiibo/ (%d detected).\n\n"
+                     "With None selected, visiting the Somniel Amiibo gazebo waits safely without crashing. "
+                     "After a completed gazebo scan, selection automatically returns to None.",
+                     rt_data_root(), ast.count);
+        } else {
+            uint16_t char_id = (uint16_t)((ast.active_tag.char_id[0] << 8) | ast.active_tag.char_id[1]);
+            const char *state_note = (ast.dev_state == 1 || ast.dev_state == 2 || ast.dev_state == 4)
+                ? "Gazebo active: ready for immediate read."
+                : "Armed: stays selected until read at the Somniel Amiibo gazebo (resets to None only after a completed read).";
+            snprintf(adesc, sizeof adesc,
+                     "File: %s\nCharacter ID: 0x%04X   Numbering ID: 0x%04X\n\n%s",
+                     ast.active_tag.rel_path, char_id, ast.active_tag.numbering_id, state_note);
+        }
+
+        int sel = ast.selected_ui;
+        if (opt_dropdown("Amiibo", &sel, anames, 1 + ast.count, 0, adesc)) nfp_ui_select(sel);
+    }
+
     // cheats.txt (Atmosphere's format, in the project folder): runtime/hle/cheatvm.c
     int nc = cheatvm_count();
     opt_section("Cheats");

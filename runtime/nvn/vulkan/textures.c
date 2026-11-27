@@ -165,6 +165,15 @@ static bool format_supports(VkFormat f, VkFormatFeatureFlags want) {
     return (p.optimalTilingFeatures & want) == want;
 }
 
+static VkFormat storage_view_format(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    default: return f;
+    }
+}
+
 // ================================================================== output resolution / per-frame clears
 // Same rules as metal.m (see the comments there).
 static float g_rs_x = 1, g_rs_y = 1;
@@ -188,7 +197,7 @@ static bool tex_scalable(const NvnTexture *t) {
 bool renderer_texture_first_write(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     uint64_t total_frames = renderer_present_count();
-    if (!b || !b->presented || (b->sx == b->sy) || b->touched_frame == total_frames + 1) return false;
+    if (!b || !b->presented || (b->req_sx == b->req_sy) || b->touched_frame == total_frames + 1) return false;
     b->touched_frame = total_frames + 1;
     return true;
 }
@@ -272,13 +281,23 @@ void vk_collect_dead(void) {
 
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
-    b->sx = b->scalable ? g_rs_x : 1;
-    b->sy = b->scalable ? g_rs_y : 1;
+    b->req_sx = b->sx = b->scalable ? g_rs_x : 1;
+    b->req_sy = b->sy = b->scalable ? g_rs_y : 1;
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
     if (b->scalable) {
+        uint32_t gw = tw, gh = th;
         tw = (uint32_t)lroundf(tw * b->sx); th = (uint32_t)lroundf(th * b->sy);
         if (tw < 1) tw = 1;
         if (th < 1) th = 1;
+        static int exact = -1;
+        if (exact < 0) {
+            exact = !getenv("LARECOMP_EXACT_SCALE") || atoi(getenv("LARECOMP_EXACT_SCALE")) != 0;
+            if (!exact) LOG("[vk] scaled images use the requested scale (LARECOMP_EXACT_SCALE=0)\n");
+        }
+        if (exact) {
+            b->sx = (float)tw / (float)gw;
+            b->sy = (float)th / (float)gh;
+        }
     }
     if (getenv("LARECOMP_LOG_TARGET_SIZE") && t->width >= 1280 && t->height >= 720)
         LOG("[target-size] guest %ux%u -> allocated %ux%u fmt %#x flags %#x scalable %d\n",
@@ -349,8 +368,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkFormat storage_fmt = VK_FORMAT_UNDEFINED;
     if ((t->flags & 4) && !depthfmt && samples == 1 && g_vk.storage_images &&
         (b->native_storage || !getenv("FE3H_DOCK_TARGETS") || !tex_scalable(t))) {
-        VkFormat sf = vf == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : vf == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM
-                    : vf == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ? VK_FORMAT_A8B8G8R8_UNORM_PACK32 : vf;
+        VkFormat sf = storage_view_format(vf);
         if (format_supports(sf, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
             storage_fmt = sf;
             usage |= VK_IMAGE_USAGE_STORAGE_BIT;
@@ -379,6 +397,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     }
     b->format = vf;
     b->storage_fmt = storage_fmt;
+    b->guest_usage = ci.usage;
     b->width = tw; b->height = th; b->depth = depth; b->layers = layers; b->levels = levels; b->samples = samples;
     b->aspect = depthfmt ? aspect_of(t->format) : VK_IMAGE_ASPECT_COLOR_BIT;
     b->base_type = type == VK_IMAGE_TYPE_1D ? (layers > 1 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)
@@ -471,7 +490,7 @@ static void live_remove(TexBackend *b) {
 static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
-        if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
+        if (b->scalable && (b->req_sx != g_rs_x || b->req_sy != g_rs_y)) {  // output resolution changed: reallocate
             destroy_image(b);
             create_image(t, b);
         }
@@ -1215,6 +1234,14 @@ VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uin
     prof_views_created++;
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = b->image, .viewType = type,
                                 .format = fmt, .components = sw, .subresourceRange = {aspect, lv0, nlv, ly0, nly}};
+    static int srgb_view_usage = -1;
+    if (srgb_view_usage < 0) srgb_view_usage = !getenv("ENGAGE_SRGB_VIEW_USAGE") || atoi(getenv("ENGAGE_SRGB_VIEW_USAGE")) != 0;
+    VkImageViewUsageCreateInfo usage = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    if (srgb_view_usage && (b->guest_usage & VK_IMAGE_USAGE_STORAGE_BIT) && storage_view_format(fmt) != fmt &&
+        !format_supports(fmt, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+        usage.usage = b->guest_usage & ~VK_IMAGE_USAGE_STORAGE_BIT;
+        vi.pNext = &usage;
+    }
     VkImageView v;
     if (vkCreateImageView(g_vk.dev, &vi, NULL, &v) != VK_SUCCESS) {
         static int nfail;
